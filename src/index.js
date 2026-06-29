@@ -158,7 +158,7 @@ async function main() {
   //    This split eliminates idle-Brave: a session that connects but never
   //    calls a tool stays at ~50MB total (1 relay node + 1 upstream node,
   //    no Brave).
-  const port = 9333 + slotIdx - 1; // 9333..9340 for slots 1-8
+  let port = 9333 + slotIdx - 1; // 9333..9340 for slots 1-8 (may be remapped below if taken)
 
   // -- Upstream lifecycle (spawned on first tools/list or tools/call) --
   let upstreamChild = null;
@@ -263,6 +263,41 @@ async function main() {
               e.message += `\n\nOriginal detection error at config-load time:\n${original.message}`;
             }
             throw e;
+          }
+        }
+        // F1-21 (2026-06-29): port-collision guard. The slot→port map
+        // (9333+slot-1) is shared by BOTH legacy pool relays AND the
+        // per-project isolated-profile wrapper (which sets
+        // BROWSER_RELAY_POOL_SLOT). Two relays assigned the same slot number —
+        // e.g. a legacy pool slot-1 Brave and an isolated profile mapped to
+        // slot 1 — race for the same CDP port. The loser's Brave launches
+        // pipe-only (no HTTP CDP endpoint), so anything that discovers Brave by
+        // scanning the 9333..9339 HTTP ports (ghl-jwt.mjs JWT capture, tab
+        // enumeration) attaches to the WRONG Brave. Our own user-data-dir
+        // differs from the squatter's, so launchPersistentContext itself
+        // succeeds — the collision is silent. Probe our assigned port; if
+        // another Brave already owns it, walk to the first FREE port in the
+        // scan range. ghl-jwt scans the whole range and picks by JWT-location
+        // match, and own-tools read globalThis.__relayBridge.port, so any free
+        // in-range port works for every consumer.
+        const SCAN_END = 9339;
+        const cdpBound = async (p) => {
+          try {
+            const r = await fetch(`http://127.0.0.1:${p}/json/version`, { signal: AbortSignal.timeout(400) });
+            return r.ok;
+          } catch { return false; }
+        };
+        if (await cdpBound(port)) {
+          let freePort = null;
+          for (let p = 9333; p <= SCAN_END; p++) {
+            if (p === port) continue;
+            if (!(await cdpBound(p))) { freePort = p; break; }
+          }
+          if (freePort) {
+            process.stderr.write(`[mcp-relay] CDP port ${port} already owned by another relay; remapping this session to free port ${freePort}\n`);
+            port = freePort;
+          } else {
+            process.stderr.write(`[mcp-relay] WARN CDP port ${port} taken and no free port in 9333..${SCAN_END}; launch may be pipe-only\n`);
           }
         }
         process.stderr.write(`[mcp-relay] launching Brave (port=${port}, exe=${bravePath})...\n`);
