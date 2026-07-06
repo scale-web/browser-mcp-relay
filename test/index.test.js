@@ -177,9 +177,13 @@ test("G0-3: shutdown uses killUpstreamTree (taskkill /F /T on Windows)", () => {
   // Must define a killUpstreamTree helper.
   assert.ok(/function\s+killUpstreamTree\s*\(/.test(src),
     "expected killUpstreamTree helper");
-  // Helper must use taskkill /F /T on win32.
-  assert.ok(/taskkill\s+\/F\s+\/T\s+\/PID\s+\$\{upstreamChild\.pid\}/.test(src),
-    "killUpstreamTree must call `taskkill /F /T /PID ${upstreamChild.pid}` on win32");
+  // Helper must use taskkill /F /T on win32. The helper takes the child as
+  // a parameter (default = current upstreamChild) so the port-change restart
+  // path can kill the OLD child after replacing the module-level reference.
+  assert.ok(/taskkill\s+\/F\s+\/T\s+\/PID\s+\$\{child\.pid\}/.test(src),
+    "killUpstreamTree must call `taskkill /F /T /PID ${child.pid}` on win32");
+  assert.ok(/function\s+killUpstreamTree\s*\(child = upstreamChild\)/.test(src),
+    "killUpstreamTree must default its child param to upstreamChild");
   // Both shutdown paths must call it (not bare upstreamChild.kill()).
   // Strip comments first since the change-rationale comment mentions the bug.
   const code = src

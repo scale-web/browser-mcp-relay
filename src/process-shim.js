@@ -219,9 +219,73 @@ function isPidAlive(pid, opts = {}) {
   }
 }
 
+/**
+ * Best-effort process start-time probe, used to defeat PID reuse in lock
+ * staleness checks: the same pid with a different start time is a recycled
+ * pid, not the lock's original owner.
+ *
+ * Returns an opaque string that is stable for the lifetime of the process
+ * (POSIX: `ps -p PID -o lstart=`; Win: Win32_Process.CreationDate), or null
+ * when the probe fails or the process is gone. Callers must treat null as
+ * "unknown" — never as evidence of death or of a mismatch.
+ *
+ * @param {number} pid
+ * @param {object} [opts]
+ * @param {NodeJS.Platform} [opts._platform=process.platform]
+ * @param {typeof spawnSync} [opts._spawnSync=spawnSync] — test seam
+ * @returns {string|null}
+ */
+// Own-pid start-time cache (see getPidStartTime). undefined = not probed yet.
+let ownStartTimeCache;
+function cacheOwnStartTime(pid, opts, value) {
+  if (pid === process.pid && !opts._spawnSync && value !== null) {
+    ownStartTimeCache = value;
+  }
+  return value;
+}
+
+function getPidStartTime(pid, opts = {}) {
+  if (!Number.isFinite(pid) || pid <= 0) return null;
+  const platform = opts._platform || process.platform;
+  const spawn = opts._spawnSync || spawnSync;
+
+  // Our own start time never changes — cache it so every lock write doesn't
+  // pay a subprocess spawn (PowerShell on Windows is 1-2s). Other pids are
+  // NEVER cached: a recycled pid must produce a fresh (different) answer.
+  if (pid === process.pid && !opts._spawnSync && ownStartTimeCache !== undefined) {
+    return ownStartTimeCache;
+  }
+
+  if (platform === "win32") {
+    const psScript =
+      `(Get-CimInstance Win32_Process -Filter 'ProcessId = ${Math.floor(pid)}').CreationDate.ToFileTimeUtc()`;
+    const result = spawn(
+      "powershell",
+      ["-NoProfile", "-Command", psScript],
+      { encoding: "utf8", windowsHide: true, timeout: 5000, maxBuffer: 1024 * 1024 },
+    );
+    if (!result || result.error || result.status !== 0) return null;
+    const out = String(result.stdout || "").trim();
+    return cacheOwnStartTime(pid, opts, out.length > 0 ? out : null);
+  }
+
+  // POSIX: lstart is the full, second-resolution start timestamp — stable
+  // across calls for the same process, unlike etime (which is a countdown).
+  const result = spawn("ps", ["-p", String(Math.floor(pid)), "-o", "lstart="], {
+    encoding: "utf8",
+    timeout: 5000,
+    maxBuffer: 1024 * 1024,
+    env: { ...process.env, LC_ALL: "C" },
+  });
+  if (!result || result.error || result.status !== 0) return null;
+  const out = String(result.stdout || "").trim();
+  return cacheOwnStartTime(pid, opts, out.length > 0 ? out : null);
+}
+
 module.exports = {
   listProcessesByCommand,
   isPidAlive,
+  getPidStartTime,
   // Exposed for unit tests of the parser.
   parsePidPipeOutput,
 };

@@ -127,12 +127,46 @@ async function launchBrave({
 }
 
 /**
+ * Attach to an ALREADY-RUNNING Brave via its CDP HTTP endpoint instead of
+ * launching a new one. Used when a previous relay died uncleanly and left
+ * its Brave orphaned on our profile dir — attaching preserves the user's
+ * open tabs; the old reap-and-relaunch path destroyed them.
+ *
+ * The returned handle is shaped like launchBrave's ({ context,
+ * cdpConnectUrl }) plus { attached: true, browser } so closeBrave and the
+ * entrypoint's bridge-invalidation listeners can tell the two apart.
+ *
+ * @param {object} opts
+ * @param {number} opts.port — the running Brave's --remote-debugging-port
+ * @param {number} [opts.timeoutMs=5000]
+ */
+async function attachBrave({ port, timeoutMs = 5000 }) {
+  const cdpConnectUrl = `http://127.0.0.1:${port}`;
+  const browser = await chromium.connectOverCDP(cdpConnectUrl, { timeout: timeoutMs });
+  // A persistent-context Brave always exposes its default context. A brand-
+  // new context here would NOT see the profile's cookies/tabs, so only fall
+  // back to creating one if contexts() is somehow empty.
+  const context = browser.contexts()[0] || (await browser.newContext());
+  return { context, cdpConnectUrl, attached: true, browser };
+}
+
+/**
  * Graceful close. Best-effort — never throws. The caller's relay shutdown
  * handler invokes this even on signal-driven exits, so it must be quiet.
+ *
+ * Attached handles (from attachBrave) are DISCONNECTED, not closed: we
+ * didn't launch that Brave, and killing the user's window on relay exit is
+ * the exact behavior the attach path exists to avoid. Playwright's
+ * browser.close() on a connectOverCDP browser only severs the connection;
+ * the browser process keeps running and the next relay re-attaches to it.
  */
 async function closeBrave(handle) {
   if (!handle) return;
   try {
+    if (handle.attached && handle.browser) {
+      await handle.browser.close();
+      return;
+    }
     await handle.context.close();
   } catch (e) {
     process.stderr.write(`[mcp-relay] cdp-bridge close failed: ${e.message}\n`);
@@ -162,4 +196,4 @@ async function waitForCdpReady(port, timeoutMs) {
   );
 }
 
-module.exports = { launchBrave, closeBrave, waitForCdpReady };
+module.exports = { launchBrave, attachBrave, closeBrave, waitForCdpReady };
