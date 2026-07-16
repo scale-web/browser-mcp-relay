@@ -31,7 +31,7 @@ const {
 const pool = require("./pool-shared.js");
 const { UpstreamClient } = require("./upstream-client.js");
 const { RelayServer } = require("./relay-server.js");
-const { launchBrave, attachBrave, closeBrave } = require("./cdp-bridge.js");
+const { launchBrave, attachBrave, closeBrave, closeBraveHard } = require("./cdp-bridge.js");
 const { tools: ownTools } = require("./own-tools/index.js");
 const { applyLocalConfigToEnv } = require("./local-config.js");
 const { loadVaultFromEnv } = require("./vault.js");
@@ -474,6 +474,89 @@ async function main() {
     return await braveLaunchPromise;
   }
 
+  // -- Idle reaper (2026-07-16) --------------------------------------------
+  // Brave (200MB–2.5GB) and the upstream child (~40-90MB) previously lived
+  // for the FULL life of the host window — a session browsed once and its
+  // Brave sat resident for days. Real-world cost observed: ~8GB across 8
+  // idle Braves. The reaper closes both after BROWSER_RELAY_IDLE_MINUTES
+  // (default 45, fractional ok, 0/unparseable-negative disables) with no
+  // tool call. Both relaunch lazily on the next call: profiles persist on
+  // disk so logins survive; only stale tabs are lost. closeBraveHard is
+  // used (not closeBrave) so ATTACHED Braves are actually terminated —
+  // reclaiming RAM is the whole point here, unlike shutdown where the
+  // disconnect-only semantics preserve tabs for the next session.
+  let lastActivityAt = Date.now();
+  // In-flight request counter: the reaper must never fire while a call is
+  // running, even one that outlives the idle threshold (a lighthouse run
+  // with a small custom BROWSER_RELAY_IDLE_MINUTES would otherwise get its
+  // Brave killed mid-flight).
+  let inFlightRequests = 0;
+  function bumpActivity() { lastActivityAt = Date.now(); }
+
+  function idleReapUpstream() {
+    if (!upstreamChild) return;
+    // Same deliberate-kill pattern as restartUpstreamIfPortChanged: clear
+    // state BEFORE the kill so the child's exit handler sees a replacement,
+    // not a fatal upstream death.
+    const oldChild = upstreamChild;
+    const oldClient = upstreamClient;
+    upstreamChild = null;
+    upstreamClient = null;
+    upstreamSpawnPromise = null;
+    upstreamPort = null;
+    try { if (oldClient) oldClient.close(); } catch { /* best-effort */ }
+    killUpstreamTree(oldChild);
+  }
+
+  async function idleReapBrave() {
+    if (!bridge) return;
+    const b = bridge;
+    bridge = null;
+    braveLaunchPromise = null;
+    if (globalThis.__relayBridge && globalThis.__relayBridge.context === b.context) {
+      globalThis.__relayBridge = null;
+    }
+    await closeBraveHard(b);
+  }
+
+  const idleMinutesRaw = RELAY_ENV.BROWSER_RELAY_IDLE_MINUTES;
+  const idleMinutes = (idleMinutesRaw === undefined || idleMinutesRaw === "")
+    ? 45
+    : parseFloat(idleMinutesRaw);
+  if (Number.isFinite(idleMinutes) && idleMinutes > 0) {
+    const idleMs = idleMinutes * 60_000;
+    const tick = setInterval(async () => {
+      if (inFlightRequests > 0) return;
+      if (Date.now() - lastActivityAt < idleMs) return;
+      if (!bridge && !upstreamChild) return;
+      process.stderr.write(
+        `[mcp-relay] idle ${idleMinutes}min — reaping Brave + upstream to reclaim RAM (both relaunch on next tool call; logins persist)\n`,
+      );
+      // Upstream FIRST: if it happened to exit on its own while we awaited
+      // the Brave close, its exit handler would still see itself as the
+      // current child and treat that as a fatal upstream death (full relay
+      // shutdown). Clearing upstream state before the await closes that
+      // window.
+      try { idleReapUpstream(); } catch (e) {
+        process.stderr.write(`[mcp-relay] idle upstream reap failed: ${e.message}\n`);
+      }
+      try {
+        // Cap like shutdown does (G0-7): a wedged renderer can hang
+        // context.close() forever; state is already nulled, so on timeout
+        // the pre-launch reap or attach-invalidate path cleans up later.
+        const r = await withTimeout(idleReapBrave(), 8000, "idleReapBrave");
+        if (r.status === "timeout") {
+          process.stderr.write(`[mcp-relay] idle Brave reap timed out — orphan will be reaped pre-launch\n`);
+        }
+      } catch (e) {
+        process.stderr.write(`[mcp-relay] idle Brave reap failed: ${e.message}\n`);
+      }
+    }, Math.min(60_000, idleMs));
+    // unref: the reaper must never be what keeps the relay process alive.
+    tick.unref();
+    process.stderr.write(`[mcp-relay] idle reaper armed (${idleMinutes}min)\n`);
+  }
+
   // Expose getUpstream to own-tool handlers via globalThis. The tabs_new /
   // tabs_select handlers use this to call upstream's `navigation_go-to` so
   // upstream's tracked `_page` follows our intended active tab. Upstream's
@@ -535,8 +618,19 @@ async function main() {
     { name: "browser-mcp-relay", version: "0.1.0" },
     { capabilities: { tools: {} } },
   );
-  server.setRequestHandler(ListToolsRequestSchema, async () => relay.handleToolsList());
-  server.setRequestHandler(CallToolRequestSchema, async (req) => relay.handleToolsCall(req.params));
+  // bumpActivity on entry AND exit of every request so a long-running call
+  // (lighthouse can take minutes) never has the reaper fire mid-flight or
+  // immediately after it returns.
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    bumpActivity();
+    inFlightRequests++;
+    try { return await relay.handleToolsList(); } finally { inFlightRequests--; bumpActivity(); }
+  });
+  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+    bumpActivity();
+    inFlightRequests++;
+    try { return await relay.handleToolsCall(req.params); } finally { inFlightRequests--; bumpActivity(); }
+  });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
@@ -659,6 +753,21 @@ async function main() {
   // Stash on the closure so the upstream-exit handler in spawnUpstream() can
   // await the same promise. (It captures `shutdownAsync` lexically already,
   // so this works without explicit hoisting — keep this comment as a marker.)
+  // (2026-07-16) Exit when the MCP client goes away without a signal. The
+  // stdio pipe closing (host window killed, client crashed, extension host
+  // reloaded) is the only notification we get in that case — without this,
+  // the relay lingers as a zombie holding its lock, upstream child, and
+  // possibly a multi-hundred-MB Brave (the pre-2026-06 "16 orphans across
+  // 3 sessions" failure mode). The SDK transport's 'data' listeners keep
+  // stdin in flowing mode, so 'end'/'close' reliably fire on pipe close.
+  const onStdioGone = async (why) => {
+    process.stderr.write(`[mcp-relay] stdin ${why} — MCP client gone, shutting down\n`);
+    try { await shutdownAsync(); } catch { /* best-effort */ }
+    process.exit(0);
+  };
+  process.stdin.on("end", () => onStdioGone("ended"));
+  process.stdin.on("close", () => onStdioGone("closed"));
+
   process.on("exit", shutdownSync);
   process.on("SIGINT", async () => {
     try { await shutdownAsync(); } catch {}

@@ -151,6 +151,38 @@ async function attachBrave({ port, timeoutMs = 5000 }) {
 }
 
 /**
+ * HARD close — actually terminates the Brave process, including for
+ * attached handles (where plain closeBrave only disconnects). Used by the
+ * idle reaper, whose whole point is reclaiming the browser's RAM: an
+ * idle-for-an-hour Brave's tabs are stale, its profile persists on disk,
+ * and the next tool call relaunches it with logins intact.
+ *
+ * For attached browsers, Playwright's browser.close() only severs the CDP
+ * connection — the real kill is the CDP `Browser.close` command sent over
+ * a browser-level session. Falls back to disconnect if that fails.
+ * Best-effort — never throws.
+ */
+async function closeBraveHard(handle) {
+  if (!handle) return;
+  if (handle.attached && handle.browser) {
+    try {
+      const cdp = await handle.browser.newBrowserCDPSession();
+      await cdp.send("Browser.close");
+      return;
+    } catch (e) {
+      process.stderr.write(`[mcp-relay] CDP Browser.close failed (${e.message}); disconnecting only\n`);
+    }
+    try { await handle.browser.close(); } catch { /* already gone */ }
+    return;
+  }
+  try {
+    await handle.context.close();
+  } catch (e) {
+    process.stderr.write(`[mcp-relay] cdp-bridge hard close failed: ${e.message}\n`);
+  }
+}
+
+/**
  * Graceful close. Best-effort — never throws. The caller's relay shutdown
  * handler invokes this even on signal-driven exits, so it must be quiet.
  *
@@ -196,4 +228,4 @@ async function waitForCdpReady(port, timeoutMs) {
   );
 }
 
-module.exports = { launchBrave, attachBrave, closeBrave, waitForCdpReady };
+module.exports = { launchBrave, attachBrave, closeBrave, closeBraveHard, waitForCdpReady };
