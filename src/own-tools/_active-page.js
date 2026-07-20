@@ -12,6 +12,11 @@
 let activePage = null;
 
 function setActivePage(page) {
+  // Re-setting the SAME page is a no-op — tab reuse makes repeated
+  // setActivePage(page) on one Page object the mainline path, and
+  // re-attaching the close listener each time would accumulate one-shot
+  // closures until MaxListenersExceededWarning.
+  if (activePage === page) return;
   activePage = page;
   // G1-1 (2026-05-10): if the page closes externally (Brave UI close, page
   // crash, navigation that destroys the page object), null out the
