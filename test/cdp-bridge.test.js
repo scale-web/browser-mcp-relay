@@ -284,3 +284,50 @@ test("V0-3: launchBrave closes context if waitForCdpReady throws", async () => {
     global.fetch = origFetch;
   }
 });
+
+// ── the session-restore fix must be WIRED IN, not merely present ────────────
+// Regression guard added after review: session-restore.test.js exercises
+// clearSessionRestore() directly, so deleting the CALL SITE in launchBrave left
+// all of its tests passing (demonstrated by mutation — 9/9 green with the fix
+// removed). These two assert on launchBrave's observable effect instead, so a
+// revert of the call site fails the suite.
+
+test("launchBrave: deletes the profile's session store before launching", async () => {
+  await withMockChromium(async (fresh, captured) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "launch-clears-"));
+    const sessions = path.join(dir, "Default", "Sessions");
+    fs.mkdirSync(sessions, { recursive: true });
+    fs.writeFileSync(path.join(sessions, "Session_1"), "tabstate");
+    fs.writeFileSync(path.join(dir, "Default", "Cookies"), "COOKIE-SENTINEL");
+    try {
+      await fresh.launchBrave({ userDataDir: dir, port: 9999 });
+      assert.strictEqual(captured.userDataDir, dir, "sanity: launch actually happened");
+      assert.strictEqual(fs.existsSync(sessions), false, "launchBrave must clear Default/Sessions");
+      assert.strictEqual(
+        fs.readFileSync(path.join(dir, "Default", "Cookies"), "utf8"), "COOKIE-SENTINEL",
+        "launchBrave must not touch credential files",
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("launchBrave: BROWSER_RELAY_KEEP_TABS=1 in the process env preserves the session store", async () => {
+  await withMockChromium(async (fresh) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "launch-keeps-"));
+    const sessions = path.join(dir, "Default", "Sessions");
+    fs.mkdirSync(sessions, { recursive: true });
+    fs.writeFileSync(path.join(sessions, "Session_1"), "tabstate");
+    const orig = process.env.BROWSER_RELAY_KEEP_TABS;
+    process.env.BROWSER_RELAY_KEEP_TABS = "1";
+    try {
+      await fresh.launchBrave({ userDataDir: dir, port: 9999 });
+      assert.ok(fs.existsSync(sessions), "opt-out must survive a real launchBrave call");
+    } finally {
+      if (orig === undefined) delete process.env.BROWSER_RELAY_KEEP_TABS;
+      else process.env.BROWSER_RELAY_KEEP_TABS = orig;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

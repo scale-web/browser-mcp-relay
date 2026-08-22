@@ -6,6 +6,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { chromium } = require("playwright-core");
+const { applyLocalConfigToEnv } = require("./local-config.js");
 
 /**
  * Delete the profile's session store so Brave starts with one tab instead of
@@ -34,11 +35,20 @@ const { chromium } = require("playwright-core");
  *
  * Must run BEFORE launchPersistentContext, while no Brave holds the profile.
  */
-function clearSessionRestore(userDataDir, env = process.env) {
+function clearSessionRestore(userDataDir, env = applyLocalConfigToEnv(process.env)) {
+  // Default to the relay's RESOLVED env (process.env overlaid with
+  // local-config.json), never bare process.env. This opt-out is the documented
+  // mitigation for an idle reap catching a human mid-flow, and it is now written
+  // into two operator runbooks — if someone sets it in local-config.json (the
+  // obvious place, since every other relay knob lives there) it MUST work.
+  // Reading process.env directly is precisely the bug the sibling commit fixes
+  // for BROWSER_RELAY_MAX_TABS; it was reintroduced here in the same branch.
   const keep = env.BROWSER_RELAY_KEEP_TABS;
   if (keep && keep !== "0" && keep !== "false") return { cleared: false, reason: "BROWSER_RELAY_KEEP_TABS" };
-  const dir = path.join(userDataDir, "Default", "Sessions");
   try {
+    // Inside the try: a nullish userDataDir would otherwise throw
+    // ERR_INVALID_ARG_TYPE out of a function whose contract is "never fails a launch".
+    const dir = path.join(userDataDir, "Default", "Sessions");
     if (!fs.existsSync(dir)) return { cleared: false, reason: "absent" };
     fs.rmSync(dir, { recursive: true, force: true });
     return { cleared: true, reason: null };
