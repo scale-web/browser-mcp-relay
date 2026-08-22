@@ -30,6 +30,7 @@
 //   • accept `waitUntil` parameter — SPA-heavy sites need 'networkidle'.
 
 const { propagateActivePageToUpstream } = require("./_propagate-active-page.js");
+const { applyLocalConfigToEnv } = require("../local-config.js");
 const { setActivePage, getActivePageRaw } = require("./_active-page.js");
 
 /** Host of an http(s) URL, else null (about:blank, chrome://, bad URLs). */
@@ -84,7 +85,14 @@ async function pruneOldestTabs(pages, cap, keep) {
   return closed;
 }
 
-function maxTabsFromEnv(env = process.env) {
+// Default to the relay's resolved env (process.env OVERLAID with local-config),
+// not bare process.env. Before this, BROWSER_RELAY_MAX_TABS in local-config.json
+// was silently ignored — index.js builds RELAY_ENV = applyLocalConfigToEnv(...)
+// as a NEW object and never mutates process.env, so the cap only ever saw a real
+// env var while the idle reaper (which reads RELAY_ENV) honored the file. Two
+// keys in the same file behaving differently is the kind of thing you debug for
+// an hour. Callers may still pass an explicit env; tests rely on that.
+function maxTabsFromEnv(env = applyLocalConfigToEnv(process.env)) {
   const raw = env.BROWSER_RELAY_MAX_TABS;
   if (raw === undefined || raw === "") return 8;
   const n = parseInt(raw, 10);

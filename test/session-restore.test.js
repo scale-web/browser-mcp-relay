@@ -139,3 +139,42 @@ test("clearSessionRestore: an unremovable store degrades to the old behaviour, n
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── BROWSER_RELAY_MAX_TABS: local-config.json must drive the cap ────────────
+// Before this fix the cap read bare process.env, which applyLocalConfigToEnv
+// never mutates (it returns a copy), so the key was silently ignored in
+// local-config.json — while the idle reaper, reading RELAY_ENV, honored the same
+// file. Two keys in one file behaving differently.
+const { _maxTabsFromEnv: maxTabsFromEnv } = require("../src/own-tools/tabs-new.js");
+const { applyLocalConfigToEnv } = require("../src/local-config.js");
+
+test("maxTabsFromEnv: a value in local-config.json is honored", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "maxtabs-lc-"));
+  const cfg = path.join(dir, "local-config.json");
+  try {
+    fs.writeFileSync(cfg, JSON.stringify({ BROWSER_RELAY_MAX_TABS: "3" }));
+    const merged = applyLocalConfigToEnv({}, { path: cfg });
+    assert.strictEqual(merged.BROWSER_RELAY_MAX_TABS, "3");
+    assert.strictEqual(maxTabsFromEnv(merged), 3, "local-config value must reach the cap");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("maxTabsFromEnv: a real env var still overrides local-config", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "maxtabs-env-"));
+  const cfg = path.join(dir, "local-config.json");
+  try {
+    fs.writeFileSync(cfg, JSON.stringify({ BROWSER_RELAY_MAX_TABS: "3" }));
+    const merged = applyLocalConfigToEnv({ BROWSER_RELAY_MAX_TABS: "5" }, { path: cfg });
+    assert.strictEqual(maxTabsFromEnv(merged), 5, "env must win over the file");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("maxTabsFromEnv: default is 8, and 0 is preserved as an explicit disable", () => {
+  assert.strictEqual(maxTabsFromEnv({}), 8);
+  assert.strictEqual(maxTabsFromEnv({ BROWSER_RELAY_MAX_TABS: "0" }), 0);
+  assert.strictEqual(maxTabsFromEnv({ BROWSER_RELAY_MAX_TABS: "garbage" }), 8);
+});
