@@ -48,6 +48,13 @@ function clearSessionRestore(userDataDir, env = applyLocalConfigToEnv(process.en
   try {
     // Inside the try: a nullish userDataDir would otherwise throw
     // ERR_INVALID_ARG_TYPE out of a function whose contract is "never fails a launch".
+    // Absolute-only: path.join("", "Default", "Sessions") is RELATIVE and would
+    // resolve against process.cwd(), so an empty userDataDir from a hand-written
+    // or corrupt wrapper config would delete <cwd>/Default/Sessions. tryClaimDir("")
+    // succeeds, so this is reachable rather than theoretical.
+    if (typeof userDataDir !== "string" || !path.isAbsolute(userDataDir)) {
+      return { cleared: false, reason: `refusing non-absolute userDataDir: ${JSON.stringify(userDataDir)}` };
+    }
     const dir = path.join(userDataDir, "Default", "Sessions");
     if (!fs.existsSync(dir)) return { cleared: false, reason: "absent" };
     fs.rmSync(dir, { recursive: true, force: true });
@@ -155,6 +162,10 @@ async function launchBrave({
     process.stderr.write("[mcp-relay] cleared session restore — Brave starts with a fresh tab set\n");
   } else if (sessionClear.reason === "BROWSER_RELAY_KEEP_TABS") {
     process.stderr.write("[mcp-relay] BROWSER_RELAY_KEEP_TABS set — restoring previous tabs (RAM grows across relaunches)\n");
+  } else if (sessionClear.reason && sessionClear.reason !== "absent") {
+    // Never silent. The point of this change is a RAM bound; if the delete starts
+    // failing, the whole tab set comes back with no other signal that it did.
+    process.stderr.write(`[mcp-relay] could NOT clear session restore (${sessionClear.reason}) — Brave will restore its previous tabs\n`);
   }
 
   const context = await chromium.launchPersistentContext(userDataDir, launchOpts);

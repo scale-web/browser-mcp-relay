@@ -6,6 +6,12 @@ const os = require("node:os");
 
 const { launchBrave, closeBrave, waitForCdpReady } = require("../src/cdp-bridge.js");
 
+// launchBrave really deletes <udd>/Default/Sessions, so unit tests must not point
+// it at a shared literal path like /tmp/x — that is an unstubbed destructive side
+// effect in a test whose browser is fully mocked.
+const SAFE_UDD = fs.mkdtempSync(path.join(os.tmpdir(), "cdp-bridge-udd-"));
+process.on("exit", () => { try { fs.rmSync(SAFE_UDD, { recursive: true, force: true }); } catch {} });
+
 // ─────────────────── Unit tests via chromium mock ────────────────────
 //
 // Captures the launchOpts that launchBrave passes to launchPersistentContext.
@@ -53,7 +59,7 @@ async function withMockChromium(fn) {
 test("launchBrave: ignoreDefaultArgs always includes --use-mock-keychain", async () => {
   await withMockChromium(async (fresh, captured) => {
     await fresh.launchBrave({
-      userDataDir: "/tmp/x",
+      userDataDir: SAFE_UDD,
       port: 9999,
       headless: false,
       executablePath: "/fake/brave",
@@ -69,7 +75,7 @@ test("launchBrave: ignoreDefaultArgs always includes --use-mock-keychain", async
 test("launchBrave: when extensionPath is set, ignoreDefaultArgs also includes --disable-extensions", async () => {
   await withMockChromium(async (fresh, captured) => {
     await fresh.launchBrave({
-      userDataDir: "/tmp/x",
+      userDataDir: SAFE_UDD,
       port: 9999,
       executablePath: "/fake/brave",
       extensionPath: "/fake/ext",
@@ -82,7 +88,7 @@ test("launchBrave: when extensionPath is set, ignoreDefaultArgs also includes --
 test("launchBrave: ignoreHTTPSErrors is true on launchOpts", async () => {
   await withMockChromium(async (fresh, captured) => {
     await fresh.launchBrave({
-      userDataDir: "/tmp/x",
+      userDataDir: SAFE_UDD,
       port: 9999,
       executablePath: "/fake/brave",
     });
@@ -114,7 +120,7 @@ test("W0-7: launchBrave with proxyUrl=null still strips BROWSER_RELAY_* from env
   try {
     await withMockChromium(async (fresh, captured) => {
       await fresh.launchBrave({
-        userDataDir: "/tmp/x",
+        userDataDir: SAFE_UDD,
         port: 9999,
         executablePath: "/fake/brave",
         proxyUrl: null,
@@ -136,7 +142,7 @@ test("W0-7: launchBrave with proxyUrl=null still strips BROWSER_RELAY_* from env
 test("launchBrave: proxyUrl set → HTTP_PROXY + HTTPS_PROXY in launchOpts.env", async () => {
   await withMockChromium(async (fresh, captured) => {
     await fresh.launchBrave({
-      userDataDir: "/tmp/x",
+      userDataDir: SAFE_UDD,
       port: 9999,
       executablePath: "/fake/brave",
       proxyUrl: "http://127.0.0.1:8888",
@@ -160,7 +166,7 @@ test("V2-7: launchBrave with proxyUrl strips BROWSER_RELAY_* env from spawned Br
   try {
     await withMockChromium(async (fresh, captured) => {
       await fresh.launchBrave({
-        userDataDir: "/tmp/x",
+        userDataDir: SAFE_UDD,
         port: 9999,
         executablePath: "/fake/brave",
         proxyUrl: "http://127.0.0.1:8888",
@@ -267,7 +273,7 @@ test("V0-3: launchBrave closes context if waitForCdpReady throws", async () => {
     const fresh = require("../src/cdp-bridge.js");
     await assert.rejects(
       fresh.launchBrave({
-        userDataDir: "/tmp/x",
+        userDataDir: SAFE_UDD,
         port: 9990,
         executablePath: "/fake/brave",
       }),
@@ -300,7 +306,18 @@ test("launchBrave: deletes the profile's session store before launching", async 
     fs.writeFileSync(path.join(sessions, "Session_1"), "tabstate");
     fs.writeFileSync(path.join(dir, "Default", "Cookies"), "COOKIE-SENTINEL");
     try {
-      await fresh.launchBrave({ userDataDir: dir, port: 9999 });
+      // Pin a REAL env var: clearSessionRestore now reads local-config.json, and a
+      // developer who sets BROWSER_RELAY_KEEP_TABS there — which docs/REFERENCE.md
+      // explicitly tells operators to do — would otherwise fail this test.
+      // applyLocalConfigToEnv only fills absent keys, so process.env wins.
+      const origKeep = process.env.BROWSER_RELAY_KEEP_TABS;
+      process.env.BROWSER_RELAY_KEEP_TABS = "0";
+      try {
+        await fresh.launchBrave({ userDataDir: dir, port: 9999 });
+      } finally {
+        if (origKeep === undefined) delete process.env.BROWSER_RELAY_KEEP_TABS;
+        else process.env.BROWSER_RELAY_KEEP_TABS = origKeep;
+      }
       assert.strictEqual(captured.userDataDir, dir, "sanity: launch actually happened");
       assert.strictEqual(fs.existsSync(sessions), false, "launchBrave must clear Default/Sessions");
       assert.strictEqual(
