@@ -3,7 +3,50 @@
 // chromium.connectOverCDP. See docs/probe-cdp-access.js for the standalone
 // probe used to verify this architecture.
 
+const fs = require("node:fs");
+const path = require("node:path");
 const { chromium } = require("playwright-core");
+
+/**
+ * Delete the profile's session store so Brave starts with one tab instead of
+ * restoring the whole accumulated set.
+ *
+ * WHY: Brave persists every open tab to <profile>/Default/Sessions and restores
+ * them on each relaunch. That made the idle reaper a temporary dip rather than a
+ * bound — reap frees the RAM, the next tool call relaunches, and all 20-40 tabs
+ * come back at once. Measured 2026-08-21: 18.4 GB across 3 profiles, 88 tabs.
+ *
+ * WHY NOT Preferences: setting `session.restore_on_startup` (and
+ * `profile.exit_type`) in Default/Preferences DOES NOT WORK — measured on a
+ * throwaway profile with production launch opts. The pref read back intact after
+ * launch (so Playwright is not clobbering it) and Brave restored the tabs anyway:
+ * control 3 tabs, Preferences 6, delete 0. Do not "simplify" this back to a pref.
+ *
+ * SCOPE IS LOAD-BEARING — exactly `Default/Sessions`, nothing wider. That
+ * directory holds only Session_* / Tabs_* files and is a SIBLING of Cookies,
+ * Local Storage and IndexedDB, which is where every login actually lives (GHL =
+ * cookies + IndexedDB firebaseLocalStorageDb; iClosed = localStorage, no auth
+ * cookie at all). Widening this to the profile root, or globbing "Session*",
+ * would cost client-account re-logins that may not be self-serve recoverable.
+ *
+ * Escape hatch: BROWSER_RELAY_KEEP_TABS=1 restores the old restore-on-relaunch
+ * behaviour for anyone who wants it back.
+ *
+ * Must run BEFORE launchPersistentContext, while no Brave holds the profile.
+ */
+function clearSessionRestore(userDataDir, env = process.env) {
+  const keep = env.BROWSER_RELAY_KEEP_TABS;
+  if (keep && keep !== "0" && keep !== "false") return { cleared: false, reason: "BROWSER_RELAY_KEEP_TABS" };
+  const dir = path.join(userDataDir, "Default", "Sessions");
+  try {
+    if (!fs.existsSync(dir)) return { cleared: false, reason: "absent" };
+    fs.rmSync(dir, { recursive: true, force: true });
+    return { cleared: true, reason: null };
+  } catch (e) {
+    // Never fail a launch over this — worst case is the old restore behaviour.
+    return { cleared: false, reason: e.message };
+  }
+}
 
 /**
  * Launch Brave for the slot. Returns a handle the caller passes back to
@@ -95,6 +138,14 @@ async function launchBrave({
     );
   }
   launchOpts.env = sanitizedEnv;
+
+  // Start clean: drop the restored tab set (see clearSessionRestore above).
+  const sessionClear = clearSessionRestore(userDataDir);
+  if (sessionClear.cleared) {
+    process.stderr.write("[mcp-relay] cleared session restore — Brave starts with a fresh tab set\n");
+  } else if (sessionClear.reason === "BROWSER_RELAY_KEEP_TABS") {
+    process.stderr.write("[mcp-relay] BROWSER_RELAY_KEEP_TABS set — restoring previous tabs (RAM grows across relaunches)\n");
+  }
 
   const context = await chromium.launchPersistentContext(userDataDir, launchOpts);
 
@@ -228,4 +279,4 @@ async function waitForCdpReady(port, timeoutMs) {
   );
 }
 
-module.exports = { launchBrave, attachBrave, closeBrave, closeBraveHard, waitForCdpReady };
+module.exports = { launchBrave, attachBrave, closeBrave, closeBraveHard, waitForCdpReady, _clearSessionRestore: clearSessionRestore };
