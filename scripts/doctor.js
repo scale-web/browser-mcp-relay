@@ -7,9 +7,23 @@
 //                                          (graceful CDP Browser.close, kill
 //                                          fallback). Profiles persist on
 //                                          disk — logins survive; open tabs
-//                                          are lost; every live session
-//                                          relaunches its Brave on the next
-//                                          tool call.
+//                                          are lost.
+//
+//     ** DO NOT RUN THIS WHILE ANY LANE IS MID-WORK. ** Corrected 2026-08-22:
+//     this used to claim "every live session relaunches its Brave on the next
+//     tool call". That is only HALF true, and the half that is false is the
+//     expensive one. `invalidateBridge` (src/index.js:442) nulls `bridge`, so
+//     the relay's OWN tools (tabs_*) do relaunch and self-heal — but it never
+//     touches `upstreamChild`, and upstream (browser-devtools-mcp) holds a
+//     SEPARATE connectOverCDP connection. Upstream is respawned only by
+//     restartUpstreamIfPortChanged() or the idle reaper; the relaunched Brave
+//     reuses the same pool slot and therefore the same port, so the port never
+//     changes and upstream is never restarted. Result: page tools stay dead
+//     against a closed endpoint, unbounded, while tabs_* keep answering — so
+//     the session looks healthy and you debug the wrong layer.
+//
+//     Recovery without a code change: wait for the idle reaper (45 min
+//     default), or reconnect the relay. Safe when every lane is idle.
 //   node scripts/doctor.js --reap-orphans  close only ORPHANED relay Braves
 //                                          (root Brave whose parent relay is
 //                                          gone, ppid=1) + zombie relays.
