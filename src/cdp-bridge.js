@@ -108,22 +108,44 @@ async function launchBrave({
     args.push(`--disable-extensions-except=${extensionPath}`);
     ignoreDefaultArgs.push("--disable-extensions");
   }
+  // TLS-cert acceptance is opt-in: a configured proxy implies a MITM cert,
+  // and BROWSER_RELAY_INSECURE_TLS is the explicit override for a transparent
+  // corporate proxy. Anything else gets normal certificate validation.
+  const insecureTlsEnv = process.env.BROWSER_RELAY_INSECURE_TLS;
+  const insecureTlsForced = Boolean(insecureTlsEnv) && insecureTlsEnv !== "0" && insecureTlsEnv !== "false";
+  const allowInsecureTls = Boolean(proxyUrl) || insecureTlsForced;
+  if (insecureTlsForced && !proxyUrl) {
+    process.stderr.write(
+      "[mcp-relay] BROWSER_RELAY_INSECURE_TLS set with no proxy — this Brave accepts ANY TLS cert; only do this on a network you trust\n",
+    );
+  }
+
   const launchOpts = {
     headless,
     args,
     ignoreDefaultArgs,
-    // Accept any TLS cert. Useful when Brave is routed through a debug proxy
-    // (see proxyUrl below) that presents its own MITM cert, or behind a
-    // corporate proxy with a private CA. Chromium's built-in cert verifier
-    // under Playwright doesn't reliably honor user-installed Windows roots,
-    // so navigation through a MITM cert can throw ERR_CERT_AUTHORITY_INVALID
-    // even with the CA trusted at the OS level.
+    // Accept any TLS cert — ONLY when the operator has opted in. Needed when
+    // Brave is routed through a debug proxy (see proxyUrl below) that presents
+    // its own MITM cert, or behind a corporate proxy with a private CA:
+    // Chromium's cert verifier under Playwright doesn't reliably honor
+    // user-installed roots, so navigation through a MITM cert can throw
+    // ERR_CERT_AUTHORITY_INVALID even with the CA trusted at the OS level.
+    //
+    // 2026-08-25: this was previously `true` UNCONDITIONALLY, which meant every
+    // relay browser silently accepted forged certificates even with no proxy
+    // configured — while docs/REFERENCE.md claimed the relay "accepts any TLS
+    // cert WHEN A PROXY IS SET". The code now matches that documented contract.
+    // It matters because these contexts drive authenticated sessions; on a
+    // hostile network an always-on bypass is a standing silent-MITM exposure.
+    //
+    // Escape hatch for a transparent corporate proxy (no proxyUrl set but a
+    // private CA in play): BROWSER_RELAY_INSECURE_TLS=1.
     //
     // Scoped to this BrowserContext only — does not affect the user's main
     // browser. Preferred over `--ignore-certificate-errors` because that flag
     // requires `--test-type=webdriver`, which suppresses Brave's password-
     // manager UI.
-    ignoreHTTPSErrors: true,
+    ignoreHTTPSErrors: allowInsecureTls,
     handleSIGINT: false,
     handleSIGTERM: false,
   };

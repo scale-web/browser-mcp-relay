@@ -85,14 +85,19 @@ test("launchBrave: when extensionPath is set, ignoreDefaultArgs also includes --
   });
 });
 
-test("launchBrave: ignoreHTTPSErrors is true on launchOpts", async () => {
+// SUPERSEDED 2026-08-25. This asserted `ignoreHTTPSErrors === true` with no
+// proxy — encoding the always-on TLS bypass as intended behaviour, which is why
+// the exposure survived review. The contract is now opt-in; see the
+// "TLS-cert acceptance is OPT-IN" block at the end of this file for the
+// default-validates / proxy / env-override / falsy-string cases.
+test("launchBrave: ignoreHTTPSErrors is NOT enabled without opt-in", async () => {
   await withMockChromium(async (fresh, captured) => {
     await fresh.launchBrave({
       userDataDir: SAFE_UDD,
       port: 9999,
       executablePath: "/fake/brave",
     });
-    assert.strictEqual(captured.launchOpts.ignoreHTTPSErrors, true);
+    assert.strictEqual(captured.launchOpts.ignoreHTTPSErrors, false);
   });
 });
 
@@ -348,3 +353,62 @@ test("launchBrave: BROWSER_RELAY_KEEP_TABS=1 in the process env preserves the se
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// TLS-cert acceptance is OPT-IN (2026-08-25).
+// Regression guard: ignoreHTTPSErrors was `true` UNCONDITIONALLY, so every relay
+// browser silently accepted forged certs with no proxy configured — while
+// docs/REFERENCE.md claimed it applied only "when a proxy is set". These
+// contexts drive authenticated sessions, so an always-on bypass is a standing
+// silent-MITM exposure. The first test is the security property; the rest keep
+// the legitimate MITM-debug and corporate-CA paths working.
+// ---------------------------------------------------------------------------
+
+async function launchWithEnv(fresh, captured, { proxyUrl = null, insecure } = {}) {
+  const prev = process.env.BROWSER_RELAY_INSECURE_TLS;
+  if (insecure === undefined) delete process.env.BROWSER_RELAY_INSECURE_TLS;
+  else process.env.BROWSER_RELAY_INSECURE_TLS = insecure;
+  try {
+    await fresh.launchBrave({
+      userDataDir: SAFE_UDD, port: 9999, headless: false,
+      executablePath: "/fake/brave", proxyUrl,
+    });
+    return captured.launchOpts.ignoreHTTPSErrors;
+  } finally {
+    if (prev === undefined) delete process.env.BROWSER_RELAY_INSECURE_TLS;
+    else process.env.BROWSER_RELAY_INSECURE_TLS = prev;
+  }
+}
+
+test("launchBrave: TLS certs are VALIDATED by default (no proxy, no override)", async () => {
+  await withMockChromium(async (fresh, captured) => {
+    const v = await launchWithEnv(fresh, captured);
+    assert.strictEqual(v, false, "default must NOT accept arbitrary TLS certs");
+  });
+});
+
+test("launchBrave: a configured proxy opts into accepting its MITM cert", async () => {
+  await withMockChromium(async (fresh, captured) => {
+    const v = await launchWithEnv(fresh, captured, { proxyUrl: "http://127.0.0.1:8888" });
+    assert.strictEqual(v, true, "proxy implies a MITM cert — must accept");
+  });
+});
+
+test("launchBrave: BROWSER_RELAY_INSECURE_TLS=1 overrides with no proxy (corporate CA)", async () => {
+  await withMockChromium(async (fresh, captured) => {
+    const v = await launchWithEnv(fresh, captured, { insecure: "1" });
+    assert.strictEqual(v, true);
+  });
+});
+
+// "0" and "false" are TRUTHY strings in JS. A naive Boolean(env) gate would
+// silently enable the bypass for someone explicitly disabling it — the same
+// class of bug as DISABLE_AUTOUPDATER="false" reading as ON.
+for (const off of ["0", "false", ""]) {
+  test(`launchBrave: BROWSER_RELAY_INSECURE_TLS=${JSON.stringify(off)} does NOT enable the bypass`, async () => {
+    await withMockChromium(async (fresh, captured) => {
+      const v = await launchWithEnv(fresh, captured, { insecure: off });
+      assert.strictEqual(v, false, `${JSON.stringify(off)} must read as OFF`);
+    });
+  });
+}

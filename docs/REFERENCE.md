@@ -485,7 +485,9 @@ Both can be alive simultaneously. The relay's safety net (claim-time + pre-launc
 
 Set `BROWSER_RELAY_PROXY_URL=http://127.0.0.1:8888` (or wherever your debug proxy listens) to route the relay's Brave traffic through an HTTP proxy you control. Combined with the relay's per-context `ignoreHTTPSErrors`, this lets you inspect the relay's HTTP traffic via Charles, mitmproxy, powhttp, etc. without affecting your main browser. Your system proxy stays untouched — only this launched Brave opts in.
 
-> ⚠️ **Security:** Only point this at HTTP proxies you control on **localhost**. The relay accepts any TLS cert when a proxy is set (so MITM debug proxies "just work"), which means a hostile or compromised remote proxy can transparently MITM all of the relay's traffic — including pages you're authenticated to. If you don't fully control the proxy, leave this unset.
+> ⚠️ **Security:** Only point this at HTTP proxies you control on **localhost**. Setting a proxy also makes the relay accept **any TLS cert** (so MITM debug proxies "just work"), which means a hostile or compromised remote proxy can transparently MITM all of the relay's traffic — including pages you're authenticated to. If you don't fully control the proxy, leave this unset.
+>
+> **Corrected 2026-08-25:** until then this sentence described an intent the code did not implement — `ignoreHTTPSErrors` was hardcoded `true`, so **every** relay browser accepted forged certs even with no proxy configured. Cert validation is now ON by default and the bypass is opt-in: setting `BROWSER_RELAY_PROXY_URL` enables it, or `BROWSER_RELAY_INSECURE_TLS=1` for a *transparent* corporate proxy with a private CA and no proxy URL (that one logs a warning on launch). `0`, `false` and empty read as OFF.
 
 ### Credential vault + autofill
 
@@ -547,6 +549,8 @@ For sites with sophisticated detection (Akamai, DataDome, advanced PerimeterX de
 
 - **Real-Brave-attach** (Tier 3, deferred — see BACKLOG): connect to a Brave instance the user is already running interactively, never spawn one. Eliminates the entire "Playwright launched it" fingerprint surface. Already used in the maintainer's Walmart sidecar.
 - **Residential proxies** (Bright Data, IPRoyal): TLS handshake from a residential IP gets a much higher trust score than data-center IPs. Set `BROWSER_RELAY_PROXY_URL`.
+  > ⚠️ **Read the proxy-whitelist security note above before doing this.** Setting that variable also turns OFF TLS cert validation, so a third-party proxy can transparently MITM every authenticated session the relay drives. These two recommendations sit ~60 lines apart and directly contradict each other: the note says never point it at a proxy you don't control, and this line recommends exactly that. Treat third-party proxying as an explicit decision, not a config tweak.
+  > Also note (measured 2026-08-25): a Cloudflare challenge that renders *"Verification successful"* is **not** a TLS/JA3 rejection — JA3 is evaluated before any JS runs. Confirm the block is actually TLS-layer before reaching for a proxy at all.
 - **Warm session reuse** (`cookies_export` / `cookies_import` + the credential vault): a session with N days of authentic browsing history scores higher than a fresh login.
 
 For the full deferred-work catalog (Tiers 2/3 + anti-patterns NOT to implement), see [`BACKLOG.md`](./BACKLOG.md).
