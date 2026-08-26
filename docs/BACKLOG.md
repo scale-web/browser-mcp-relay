@@ -68,17 +68,46 @@ Big lifts. Different scope from JS patches.
 
 **Why this is the real win:** No JS-side patches can defeat detection of CDP-injected runtime artifacts. Detached-CDP-attach (where Brave was started by the user with `--remote-debugging-port=N` themselves) avoids those artifacts entirely.
 
-**Why deferred:** Big architectural pivot. Requires:
-- New mode in `index.js` that skips `launchBrave` and just connects via CDP
-- User must launch Brave themselves with the right flags + a fresh user-data-dir (or accept profile-lock contention with their main browsing session)
-- New documentation explaining the trade-off (no auto-launch convenience, no auto-cleanup on shutdown)
-- The Walmart sidecar already does this — code patterns exist to copy
+**STATUS CORRECTED 2026-08-25 — the CDP plumbing is NOT deferred; it already ships.**
 
-**Already exists where:** `~/Documents/GitHub/Washed-Command-Center/washed-web-app-v2-test/walmart_search.py` — uses CloakBrowser to attach to a manually-launched Brave with Walmart+ session auth. Pattern is proven.
+`attachBrave()` (`src/cdp-bridge.js:215`) already performs exactly the `chromium.connectOverCDP`
+described above, returns a handle shaped like `launchBrave`'s plus `{attached:true, browser}`, and is
+**in production use** at `src/index.js:320` for orphan recovery ("live Brave pid=N already owns DIR —
+attaching, tabs preserved"). `closeBrave` / `closeBraveHard` are already attach-aware, and
+`src/pool-shared.js:777` already parses `--remote-debugging-port=N` off a command line, so port
+discovery exists too. Anyone reading the old text below would have rebuilt working code.
 
-**Ship gate:** A specific use case where Tier 1+2 stealth is provably insufficient AND attached-mode provides relief. Walmart B2C-authed scraping is the canonical example.
+**⚠️ THE ACTUAL BLOCKER — the idle reaper will kill a user-owned browser.**
 
-**Effort:** ~200 LOC + new docs. Probably 1 focused session.
+`closeBraveHard` (`src/cdp-bridge.js:237`) deliberately *terminates* attached browsers: when
+`handle.attached && handle.browser` it opens a browser CDP session and sends `Browser.close`
+(`:239-243`). Plain `closeBrave` only disconnects, so the hard path exists precisely to send a real
+kill. The idle reaper calls `closeBraveHard` (`src/index.js:519`) after
+`BROWSER_RELAY_IDLE_MINUTES` — **default 45** — with no tool call.
+
+**So pointing an attach mode at a Brave the user is actively using means the relay kills their real
+browser out from under them.** Any attach-to-user-Brave work MUST exempt user-owned browsers from
+BOTH the idle reaper and shutdown cleanup. That exemption — not the CDP connection — is where the
+design effort goes. Note the existing orphan-recovery attach at `index.js:320` is *relay-owned* and
+therefore correctly reapable; the distinction the code needs is **ownership**, not attachment.
+
+**Remaining real work:**
+- An ownership flag on the handle (`userOwned`) that both reaper and shutdown honour
+- A mode/flag to opt into attaching to a user-launched Brave, with port discovery (already available)
+- Docs on the trade-off (no auto-launch, no auto-cleanup) and on what the relay will NOT clean up
+
+**Prior-art citation REMOVED — it was unverifiable.** The previous text cited
+`~/Documents/GitHub/Washed-Command-Center/washed-web-app-v2-test/walmart_search.py` as proof the
+pattern works. **That path does not exist**, and no `walmart_search.py` exists anywhere under
+`~/Documents` or `~/GitHub` (checked 2026-08-25). Treat "pattern is proven" as unsupported; the
+working prior art is this repo's own `attachBrave`.
+
+**Ship gate:** unchanged in spirit — a case where Tier 1+2 stealth is provably insufficient AND
+attach provides relief. **Capture the detection signal first:** a hard block with a RayID can be IP
+reputation rather than TLS/JA3 fingerprinting, and attach mode does nothing for the former.
+
+**Effort:** the old "~200 LOC" assumed building the CDP layer. The connection is done; the ownership
+/ reaper-exemption work plus docs is the remaining cost.
 
 ### `rebrowser-patches` integration
 
