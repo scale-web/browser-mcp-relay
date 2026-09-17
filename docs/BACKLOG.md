@@ -9,6 +9,7 @@ This file is the canonical source for "what's known but not yet shipped." Items 
 - [Stealth — Tier 2 (opinionated)](#stealth--tier-2-opinionated)
 - [Stealth — Tier 3 (architectural)](#stealth--tier-3-architectural)
 - [Stealth — Tier 4 (anti-patterns)](#stealth--tier-4-anti-patterns)
+- [Field reports — not yet reproduced](#field-reports--not-yet-reproduced)
 - [Tooling / DX](#tooling--dx)
 - [Documentation](#documentation)
 - [Distribution](#distribution)
@@ -150,6 +151,39 @@ If we want broader coverage, copy specific evasions selectively into our stealth
 **Impossible.** Synthetic events from CDP fundamentally have `isTrusted=false`. Any patch that tries to fake this gets caught the moment it's proxy-detected. **Press-and-hold CAPTCHAs and similar will detect us regardless** — this is by browser design. The only solution is real hardware events (out of scope) or routing the user through them manually.
 
 Per the LightningATC dossier (`recon_lightningatc_session_2026_05_10_pickup.md`): *"never auto-solve captchas/press-and-hold (`event.isTrusted=false` = instant flag)."* This is a known wall.
+
+---
+
+## Field reports — not yet reproduced
+
+Real-use defects reported by a session that hit them. Recorded as reported; the relay has not reproduced them yet, so every
+cause below is a hypothesis until it has.
+
+### `download_capture`: `saveAs` ENOENT, and the wrong page after a new tab (reported 2026-09-17)
+
+Hit on an ephemeral clone session (`launch-project-isolated.js`). The reporter worked around all four.
+
+1. **`saveAs` fails with ENOENT.** With `clickSelector`, the download started, then
+   `download.saveAs: ENOENT … copyfile …/T/playwright-artifacts-<A>/<guid> -> <savePath>` — while a file with the SAME guid
+   existed under a different `playwright-artifacts-<B>/`. *Hypothesis:* two Playwright CDP clients on one browser (the
+   relay's own-tools connection and the upstream server's) each set Chrome's download directory, the last one wins, and
+   `saveAs` (`src/own-tools/download-capture.js:147`) then copies from the other client's empty artifacts dir.
+   *Workaround:* take the guid from the error, find it under `$TMPDIR/playwright-artifacts-*/`, copy it out before that
+   process exits.
+2. **`download_capture` acts on a different page than `execute`.** After a login flow opened the app in a new tab,
+   `execute`'s `page` was the new tab, but `download_capture` clicked the relay's tracked active page (the old
+   `about:blank`) and timed out — the tool runs through `withActivePage` (`download-capture.js:79`), which in this case
+   still pointed at the old tab (not yet checked against `_propagate-active-page.js`). *Workaround:* `tabs_select` the
+   new tab first.
+3. **`tabs_select`'s refocus re-rendered a React SPA** and dropped a `data-*` attribute that had been injected via
+   `execute`, so a second locator timed out. Probably page behaviour rather than a relay defect. *Workaround:* an XPath
+   `clickSelector` that resolves at click time.
+4. **`callTool('download_capture')` inside `execute` returns "Tool not found"**; it works only as a top-level tool.
+   *Hypothesis:* `execute`'s `callTool` sees the upstream server's tools, not the relay's own-tools.
+
+**When picked up:** reproduce 1 with two CDP clients attached to one clone before changing anything; then decide whether
+`download_capture` should own the download directory for its trigger, and whether a page-opened tab should move the
+tracked active page.
 
 ---
 
