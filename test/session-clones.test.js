@@ -368,10 +368,10 @@ test("ensureBrave probes findAttachableBrave BEFORE the reap+launch path", () =>
   assert.ok(attachIdx < reapIdx, "attach probe must run before the reap");
 });
 
-test("index.js restarts upstream when the CDP port changes after spawn", () => {
+test("index.js restarts upstream when the CDP port changes after spawn (or Brave is replaced)", () => {
   const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
-  assert.ok(/function\s+restartUpstreamIfPortChanged\s*\(/.test(src));
-  assert.ok(/restartUpstreamIfPortChanged\(\);/.test(src), "ensureBrave must invoke the restart check");
+  assert.ok(/function\s+restartUpstreamIfStale\s*\(/.test(src));
+  assert.ok(/restartUpstreamIfStale\(\);/.test(src), "ensureBrave must invoke the restart check");
   assert.ok(/upstreamPort\s*=\s*port/.test(src), "spawnUpstream must record the port it was spawned with");
 });
 

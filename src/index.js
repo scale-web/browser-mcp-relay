@@ -186,8 +186,19 @@ async function main() {
   // later attaches/remaps to a different port, the upstream child must be
   // restarted — otherwise forwarded tools connectOverCDP to whatever Brave
   // owns the ORIGINAL port (another project's browser). See
-  // restartUpstreamIfPortChanged().
+  // restartUpstreamIfStale().
   let upstreamPort = null;
+  // Brave generation: bumped every time ensureBrave() installs a NEW Brave
+  // handle (launch or attach). upstreamBraveGeneration is the value when the
+  // current upstream child was spawned. BDMCP caches its browser context +
+  // page for the life of the child and never rebuilds them, so a child that
+  // may have attached to an older Brave is wedged on "Target page, context
+  // or browser has been closed" even when the new Brave reuses the same
+  // port (field report 2026-10-06). Generation 0 = spawned before this relay
+  // had ANY Brave (tools/list at connect): it cannot have attached yet, so
+  // the first Brave adopts it instead of paying a respawn.
+  let braveGeneration = 0;
+  let upstreamBraveGeneration = null;
 
   async function spawnUpstream() {
     const bdmcpEntry = resolveBdmcpEntry();
@@ -232,11 +243,12 @@ async function main() {
     });
     upstreamChild = child;
     upstreamPort = port;
+    upstreamBraveGeneration = braveGeneration;
     child.on("exit", async (code, signal) => {
-      // Deliberate restart (restartUpstreamIfPortChanged replaced/cleared
+      // Deliberate restart (restartUpstreamIfStale replaced/cleared
       // upstreamChild before killing this one): not fatal, don't shut down.
       if (upstreamChild !== child) {
-        process.stderr.write(`[mcp-relay] old upstream child exited after port-change restart code=${code} signal=${signal}\n`);
+        process.stderr.write(`[mcp-relay] old upstream child exited after deliberate restart code=${code} signal=${signal}\n`);
         return;
       }
       process.stderr.write(`[mcp-relay] upstream child exited code=${code} signal=${signal}\n`);
@@ -258,17 +270,29 @@ async function main() {
   }
 
   /**
-   * Kill + forget the upstream child when the CDP port it was spawned with
-   * no longer matches the port Brave actually runs on (F1-21 remap landed
-   * after upstream spawn, or ensureBrave attached to an existing Brave).
+   * Kill + forget the upstream child when it is stale for the Brave that
+   * ensureBrave() just installed: either the CDP port it was spawned with
+   * no longer matches (F1-21 remap landed after upstream spawn, or
+   * ensureBrave attached to an existing Brave), or it may have attached to
+   * a previous Brave that has since died (see braveGeneration).
    * The next getUpstream() respawns it lazily with the correct
    * BROWSER_CDP_ENDPOINT_URL. Synchronous: state is cleared BEFORE the kill
    * so the child's exit handler recognizes a deliberate restart.
    */
-  function restartUpstreamIfPortChanged() {
-    if (!upstreamChild || upstreamPort === port) return;
+  function restartUpstreamIfStale() {
+    if (!upstreamChild) return;
+    const portChanged = upstreamPort !== port;
+    const braveReplaced = upstreamBraveGeneration !== 0 && upstreamBraveGeneration !== braveGeneration;
+    if (!portChanged && !braveReplaced) {
+      // Adopt: from here on this child may attach to THIS Brave, so the
+      // next relaunch must replace it.
+      upstreamBraveGeneration = braveGeneration;
+      return;
+    }
     process.stderr.write(
-      `[mcp-relay] CDP port changed ${upstreamPort} → ${port} after Brave attach/remap; restarting upstream child so forwarded tools target OUR Brave\n`,
+      portChanged
+        ? `[mcp-relay] CDP port changed ${upstreamPort} → ${port} after Brave attach/remap; restarting upstream child so forwarded tools target OUR Brave\n`
+        : `[mcp-relay] Brave relaunched/reattached (generation ${upstreamBraveGeneration} → ${braveGeneration}); restarting upstream child so it drops its dead browser context\n`,
     );
     const oldChild = upstreamChild;
     const oldClient = upstreamClient;
@@ -355,7 +379,7 @@ async function main() {
         // another Brave already owns it, walk to the first FREE port in the
         // scan range. ghl-jwt scans the whole range and picks by JWT-location
         // match, own-tools read globalThis.__relayBridge.port, and
-        // restartUpstreamIfPortChanged() re-points the upstream child, so any
+        // restartUpstreamIfStale() re-points the upstream child, so any
         // free in-range port works for every consumer. Ephemeral session
         // clones inherit their base slot's port and rely on this remap to
         // land on a free one.
@@ -430,6 +454,7 @@ async function main() {
           // read globalThis.__relayBridge to drive CDP operations.
           globalThis.__relayBridge = { ...l, port };
           bridge = l;
+          braveGeneration++;
           // V1-5 (2026-06-01): invalidate the cached `bridge` when the
           // underlying Brave context/process dies. Without this listener, a
           // crashed/force-quit Brave leaves `bridge` pointing at a dead
@@ -461,9 +486,10 @@ async function main() {
             process.stderr.write(`[mcp-relay] could not attach browser.disconnected listener: ${e.message}\n`);
           }
           // The port Brave actually landed on may differ from the port the
-          // upstream child was spawned with (F1-21 remap, attach). Restart
-          // upstream if so — forwarded tools must target OUR Brave.
-          restartUpstreamIfPortChanged();
+          // upstream child was spawned with (F1-21 remap, attach), or this
+          // may be a relaunch after the previous Brave died. Restart
+          // upstream if so — forwarded tools must target OUR live Brave.
+          restartUpstreamIfStale();
           return bridge;
         });
       })().catch((e) => {
@@ -495,7 +521,7 @@ async function main() {
 
   function idleReapUpstream() {
     if (!upstreamChild) return;
-    // Same deliberate-kill pattern as restartUpstreamIfPortChanged: clear
+    // Same deliberate-kill pattern as restartUpstreamIfStale: clear
     // state BEFORE the kill so the child's exit handler sees a replacement,
     // not a fatal upstream death.
     const oldChild = upstreamChild;
