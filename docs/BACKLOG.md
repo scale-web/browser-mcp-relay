@@ -199,6 +199,16 @@ better than the wedge it replaced; not reproduced live.
 **When picked up:** identify the browser by the GUID in `/json/version`'s `webSocketDebuggerUrl` and skip the restart
 when it is unchanged — and keep `test/upstream-restart.test.js` green, especially the poisoned-fresh-child case.
 
+### `tabs_new` / `tabs_select` report `propagated: true` when upstream returned an error (found 2026-10-07)
+
+`src/own-tools/_propagate-active-page.js` awaits upstream's `navigation_go-to` and returns `{ propagated: true }`
+without checking `isError` — and browser-devtools-mcp reports failures as `{ isError: true }`, not by throwing. So a
+failed propagation (e.g. Brave died mid-tool) is reported as success and nothing is logged. The next call is healthy
+since the upstream-restart fix; before it, every `tabs_new`/`tabs_select` after a Brave relaunch claimed success against
+a wedged child. Pre-existing; demonstrated by review round 2 of that fix.
+
+**When picked up:** treat `response.isError` like a throw (log + `propagated: false`) and add a test.
+
 ---
 
 ## Tooling / DX

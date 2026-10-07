@@ -100,8 +100,19 @@ class RelayServer {
     // tools/list does NOT need Brave. Upstream's catalog is static (registered
     // at upstream startup), and own-tool definitions are static. We only need
     // upstream spawned to ask it for its catalog — that's it.
-    const upstream = await this.getUpstream();
-    const upstreamResponse = await upstream.request("tools/list", {});
+    let upstreamResponse;
+    try {
+      upstreamResponse = await (await this.getUpstream()).request("tools/list", {});
+    } catch (e) {
+      // A Brave relaunch restarts the upstream child (index.js
+      // restartUpstreamIfStale) and closes its client, which rejects a
+      // tools/list still in flight with "client closed". tools/list is
+      // idempotent and needs no Brave, so ask the replacement child once.
+      // During shutdown the closed client stays installed, so this retry
+      // fails fast instead of spawning a new child.
+      if (!e || e.message !== "client closed") throw e;
+      upstreamResponse = await (await this.getUpstream()).request("tools/list", {});
+    }
     const upstreamTools = upstreamResponse.tools || [];
     const ownTools = Array.from(this.ownTools.values()).map(({ name, description, inputSchema }) => ({
       name, description, inputSchema,

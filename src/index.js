@@ -249,7 +249,11 @@ async function main() {
     // deliberately. Treating such a child as generation 0 (adoptable) is
     // NOT safe: if Brave dies between ensureBrave() and this spawn, the
     // child's first call fails and BDMCP caches that failure forever, so
-    // adopting it would bring the wedge back.
+    // adopting it would bring the wedge back. The forwarded path cannot hit
+    // that (ensureBrave() and the spawn are microtask-adjacent); the own-tool
+    // path can — tabs_new / tabs_select do browser work first and then reach
+    // upstream via own-tools/_propagate-active-page.js → __relayUpstream.
+    // test/upstream-restart.test.js pins it.
     upstreamBraveGeneration = braveGeneration;
     child.on("exit", async (code, signal) => {
       // Deliberate restart (restartUpstreamIfStale replaced/cleared

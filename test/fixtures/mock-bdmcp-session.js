@@ -31,7 +31,12 @@ process.stdin.on("data", (chunk) => {
     let msg;
     try { msg = JSON.parse(line); } catch { continue; }
     let result;
-    if (msg.method === "tools/list") {
+    if (msg.method === "tools/list" && process.env.MOCK_TOOLS_LIST_DELAY_MS) {
+      // Answer later, out of order — lets a test keep a tools/list in flight.
+      const reply = { jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "navigation_go-to", description: "mock", inputSchema: { type: "object" } }] } };
+      setTimeout(() => process.stdout.write(JSON.stringify(reply) + "\n"), Number(process.env.MOCK_TOOLS_LIST_DELAY_MS));
+      continue;
+    } else if (msg.method === "tools/list") {
       result = { tools: [{ name: "navigation_go-to", description: "mock", inputSchema: { type: "object" } }] };
     } else if (msg.method === "tools/call") {
       if (attachedTo === null) attachedTo = readAlive();

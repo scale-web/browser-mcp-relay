@@ -21,6 +21,7 @@ const { spawn } = require("node:child_process");
 
 const HARNESS = path.join(__dirname, "fixtures", "relay-harness.js");
 const MOCK_BDMCP = path.join(__dirname, "fixtures", "mock-bdmcp-session.js");
+const T = { timeout: 30000 }; // a hang must fail the test, not the suite
 const SLOT = "700"; // port 9333+699 = 10032 — outside the live relay range 9333-9349
 
 function isAlive(pid) {
@@ -36,7 +37,7 @@ async function waitFor(pred, ms = 3000, what = "condition") {
   throw new Error(`timed out waiting for ${what}`);
 }
 
-async function startRelay({ attachable, idleMinutes = "0" } = {}) {
+async function startRelay({ attachable, idleMinutes = "0", extraEnv = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-upstream-restart-"));
   if (attachable) fs.writeFileSync(path.join(dir, "attachable"), JSON.stringify(attachable));
   const env = {};
@@ -48,6 +49,7 @@ async function startRelay({ attachable, idleMinutes = "0" } = {}) {
     BROWSER_RELAY_UPSTREAM_PATH: MOCK_BDMCP,
     BROWSER_RELAY_POOL_SLOT: SLOT,
     BROWSER_RELAY_IDLE_MINUTES: idleMinutes,
+    ...extraEnv,
   });
   const child = spawn(process.execPath, [HARNESS], { stdio: ["pipe", "pipe", "pipe"], env });
   let stderr = "";
@@ -66,15 +68,26 @@ async function startRelay({ attachable, idleMinutes = "0" } = {}) {
       if (p) { pending.delete(msg.id); msg.error ? p.reject(new Error(msg.error.message)) : p.resolve(msg.result); }
     }
   });
+  // A relay that dies (e.g. fails at startup) must fail the test, not hang it.
+  child.on("exit", (code, signal) => {
+    for (const [, p] of pending) p.reject(new Error(`relay exited code=${code} signal=${signal}\n${stderr}`));
+    pending.clear();
+  });
   let nextId = 1;
   const request = (method, params) => new Promise((resolve, reject) => {
     const id = nextId++;
     pending.set(id, { resolve, reject });
     child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
   });
-  await request("initialize", {
+  try {
+    await request("initialize", {
     protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "0" },
   });
+  } catch (e) {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw e;
+  }
   child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 
   const upstreamPids = () => {
@@ -108,7 +121,7 @@ async function startRelay({ attachable, idleMinutes = "0" } = {}) {
   return { child, dir, request, call, killBrave, stop, upstreamPids, braveLaunches, stderr: () => stderr };
 }
 
-test("Brave relaunched on the SAME port → upstream child replaced; next forwarded call reaches the fresh child", async () => {
+test("Brave relaunched on the SAME port → upstream child replaced; next forwarded call reaches the fresh child", T, async () => {
   const r = await startRelay();
   try {
     await r.request("tools/list", {});
@@ -136,7 +149,7 @@ test("Brave relaunched on the SAME port → upstream child replaced; next forwar
   }
 });
 
-test("first Brave launch adopts the upstream spawned by tools/list (no wasted restart)", async () => {
+test("first Brave launch adopts the upstream spawned by tools/list (no wasted restart)", T, async () => {
   const r = await startRelay();
   try {
     await r.request("tools/list", {});
@@ -151,7 +164,7 @@ test("first Brave launch adopts the upstream spawned by tools/list (no wasted re
   }
 });
 
-test("concurrent calls after Brave death share one relaunch and one upstream respawn", async () => {
+test("concurrent calls after Brave death share one relaunch and one upstream respawn", T, async () => {
   const r = await startRelay();
   try {
     await r.request("tools/list", {});
@@ -169,7 +182,7 @@ test("concurrent calls after Brave death share one relaunch and one upstream res
   }
 });
 
-test("restart triggered by an OWN-tool call (no immediate respawn) is not treated as a fatal upstream exit", async () => {
+test("restart triggered by an OWN-tool call (no immediate respawn) is not treated as a fatal upstream exit", T, async () => {
   // Own tools run ensureBrave() but never getUpstream(), so after the restart
   // nothing respawns before the old child's exit event lands. Only the
   // clear-state-BEFORE-kill ordering keeps that exit from shutting the relay down.
@@ -191,7 +204,7 @@ test("restart triggered by an OWN-tool call (no immediate respawn) is not treate
   }
 });
 
-test("attach to a Brave on a different port still restarts upstream onto that port", async () => {
+test("attach to a Brave on a different port still restarts upstream onto that port", T, async () => {
   const r = await startRelay({ attachable: { pid: 1, port: 10040 } });
   try {
     await r.request("tools/list", {}); // spawns upstream pointed at the slot port 10032
@@ -204,7 +217,7 @@ test("attach to a Brave on a different port still restarts upstream onto that po
   }
 });
 
-test("a fresh upstream whose FIRST call hits a dead Brave is replaced by the next relaunch, not adopted", async () => {
+test("a fresh upstream whose FIRST call hits a dead Brave is replaced by the next relaunch, not adopted", T, async () => {
   // BDMCP caches a failed first session (rejected promise / dead context)
   // forever, so a child that saw a dead Brave must never be carried over to
   // the next Brave. Guards against "optimising" the generation record.
@@ -230,7 +243,7 @@ test("a fresh upstream whose FIRST call hits a dead Brave is replaced by the nex
   }
 });
 
-test("after an idle reap, tools/list then a call reaches a live upstream on the relaunched Brave", async () => {
+test("after an idle reap, tools/list then a call reaches a live upstream on the relaunched Brave", T, async () => {
   const r = await startRelay({ idleMinutes: "0.01" }); // ~0.6 s
   try {
     await r.request("tools/list", {});
@@ -251,7 +264,7 @@ test("after an idle reap, tools/list then a call reaches a live upstream on the 
   }
 });
 
-test("an upstream spawned by an own-tool AFTER Brave died mid-tool is replaced, not adopted, by the next relaunch", async () => {
+test("an upstream spawned by an own-tool AFTER Brave died mid-tool is replaced, not adopted, by the next relaunch", T, async () => {
   // tabs_new / tabs_select reach upstream through __relayUpstream after their
   // own browser work. If Brave dies in between, that spawn happens with no
   // live Brave and its first call is poisoned for the child's life (BDMCP).
@@ -272,6 +285,25 @@ test("an upstream spawned by an own-tool AFTER Brave died mid-tool is replaced, 
     assert.strictEqual(healed.isError, false, `adopted a poisoned child: ${healed.text}`);
     assert.notStrictEqual(healed.body.pid, pids[1], "the child spawned with no live Brave must not be reused");
     assert.strictEqual(healed.body.brave, "brave-3");
+  } finally {
+    await r.stop();
+  }
+});
+
+test("a tools/list in flight on the old child during a Brave relaunch is answered by the replacement", T, async () => {
+  const r = await startRelay({ extraEnv: { MOCK_TOOLS_LIST_DELAY_MS: "800" } });
+  try {
+    await r.request("tools/list", {});
+    const first = await r.call();
+    assert.strictEqual(first.isError, false, first.text);
+    await r.killBrave();
+    const listing = r.request("tools/list", {}); // held 800 ms by child #1
+    await new Promise((res) => setTimeout(res, 50));
+    const call = await r.call(); // relaunch → restart kills child #1 mid-tools/list
+    assert.strictEqual(call.isError, false, call.text);
+    const tools = await listing;
+    assert.ok(tools.tools.some((t) => t.name === "navigation_go-to"), JSON.stringify(tools));
+    assert.ok(r.upstreamPids().length >= 2, "precondition: child #1 must have been replaced");
   } finally {
     await r.stop();
   }
