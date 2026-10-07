@@ -36,7 +36,7 @@ async function waitFor(pred, ms = 3000, what = "condition") {
   throw new Error(`timed out waiting for ${what}`);
 }
 
-async function startRelay({ attachable } = {}) {
+async function startRelay({ attachable, idleMinutes = "0" } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-upstream-restart-"));
   if (attachable) fs.writeFileSync(path.join(dir, "attachable"), JSON.stringify(attachable));
   const env = {};
@@ -47,7 +47,7 @@ async function startRelay({ attachable } = {}) {
     HARNESS_DIR: dir,
     BROWSER_RELAY_UPSTREAM_PATH: MOCK_BDMCP,
     BROWSER_RELAY_POOL_SLOT: SLOT,
-    BROWSER_RELAY_IDLE_MINUTES: "0",
+    BROWSER_RELAY_IDLE_MINUTES: idleMinutes,
   });
   const child = spawn(process.execPath, [HARNESS], { stdio: ["pipe", "pipe", "pipe"], env });
   let stderr = "";
@@ -105,7 +105,7 @@ async function startRelay({ attachable } = {}) {
     for (const pid of upstreamPids()) if (isAlive(pid)) { try { process.kill(pid, "SIGKILL"); } catch {} }
     fs.rmSync(dir, { recursive: true, force: true });
   };
-  return { child, request, call, killBrave, stop, upstreamPids, braveLaunches, stderr: () => stderr };
+  return { child, dir, request, call, killBrave, stop, upstreamPids, braveLaunches, stderr: () => stderr };
 }
 
 test("Brave relaunched on the SAME port → upstream child replaced; next forwarded call reaches the fresh child", async () => {
@@ -199,6 +199,53 @@ test("attach to a Brave on a different port still restarts upstream onto that po
     assert.strictEqual(res.isError, false, res.text);
     assert.strictEqual(res.body.cdp, "http://127.0.0.1:10040");
     assert.strictEqual(r.upstreamPids().length, 2);
+  } finally {
+    await r.stop();
+  }
+});
+
+test("a fresh upstream whose FIRST call hits a dead Brave is replaced by the next relaunch, not adopted", async () => {
+  // BDMCP caches a failed first session (rejected promise / dead context)
+  // forever, so a child that saw a dead Brave must never be carried over to
+  // the next Brave. Guards against "optimising" the generation record.
+  const r = await startRelay();
+  try {
+    await r.request("tools/list", {});
+    const first = await r.call();
+    assert.strictEqual(first.isError, false, first.text);
+    fs.writeFileSync(path.join(r.dir, "die-on-launch"), "2");
+    await r.killBrave();
+    const poisoned = await r.call(); // relaunch #2 dies before the call lands
+    assert.strictEqual(poisoned.isError, true, `precondition: the fresh child's first call must hit the dead Brave; got ${poisoned.text}`);
+    const p2 = r.upstreamPids()[1];
+    await waitFor(() => /brave-died-late brave-2/.test(r.stderr()), 3000, "late close event for brave-2");
+    const healed = await r.call();
+    assert.strictEqual(healed.isError, false, `still wedged: ${healed.text}`);
+    assert.strictEqual(r.braveLaunches().length, 3);
+    assert.notStrictEqual(healed.body.pid, p2, "the poisoned child must not be reused");
+    assert.strictEqual(healed.body.brave, "brave-3");
+    await waitFor(() => !isAlive(p2), 3000, "poisoned upstream child to die");
+  } finally {
+    await r.stop();
+  }
+});
+
+test("after an idle reap, tools/list then a call reaches a live upstream on the relaunched Brave", async () => {
+  const r = await startRelay({ idleMinutes: "0.01" }); // ~0.6 s
+  try {
+    await r.request("tools/list", {});
+    const first = await r.call();
+    assert.strictEqual(first.isError, false, first.text);
+    await waitFor(() => /reaping Brave \+ upstream/.test(r.stderr()), 5000, "idle reap");
+    await waitFor(() => !isAlive(first.body.pid), 3000, "reaped upstream child to die");
+    await r.request("tools/list", {});
+    const next = await r.call();
+    assert.strictEqual(next.isError, false, `wedged after idle reap: ${next.text}`);
+    assert.strictEqual(next.body.brave, "brave-2");
+    const pids = r.upstreamPids();
+    assert.strictEqual(next.body.pid, pids[pids.length - 1], "answered by the newest upstream child");
+    for (const pid of pids.slice(0, -1)) await waitFor(() => !isAlive(pid), 3000, `old upstream ${pid} to die`);
+    assert.strictEqual(r.child.exitCode, null, "relay must stay up");
   } finally {
     await r.stop();
   }

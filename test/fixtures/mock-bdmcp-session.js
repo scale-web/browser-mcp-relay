@@ -35,7 +35,9 @@ process.stdin.on("data", (chunk) => {
       result = { tools: [{ name: "navigation_go-to", description: "mock", inputSchema: { type: "object" } }] };
     } else if (msg.method === "tools/call") {
       if (attachedTo === null) attachedTo = readAlive();
-      if (attachedTo !== readAlive()) {
+      // A first call that found Brave dead poisons the child for good — BDMCP
+      // caches the failed session (rejected promise) for the process's life.
+      if (attachedTo === "dead" || attachedTo !== readAlive()) {
         result = {
           content: [{ type: "text", text: "Error: browserContext.newPage: Target page, context or browser has been closed" }],
           isError: true,

@@ -187,6 +187,20 @@ tracked active page.
 
 ---
 
+### Re-attaching to a still-alive Brave restarts the upstream child (accepted, 2026-10-07)
+
+Since the upstream-restart fix, every new Brave handle bumps a generation and replaces the upstream child, because
+browser-devtools-mcp caches its browser context forever. That includes the rare case where an ATTACHED Brave's CDP
+connection drops but the browser is still alive and `findAttachableBrave` re-attaches to it. Cost per event: one
+upstream respawn, one orphan tab left by the old child's page, and a forwarded call in flight on the old child
+rejected with "client closed". Launched Brave is driven over a pipe, so only attach mode can hit this. Accepted as far
+better than the wedge it replaced; not reproduced live.
+
+**When picked up:** identify the browser by the GUID in `/json/version`'s `webSocketDebuggerUrl` and skip the restart
+when it is unchanged — and keep `test/upstream-restart.test.js` green, especially the poisoned-fresh-child case.
+
+---
+
 ## Tooling / DX
 
 Lower-priority items not specifically about stealth.

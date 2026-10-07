@@ -36,6 +36,15 @@ function fakeBrave(port, attached) {
   const handle = { context, cdpConnectUrl: `http://127.0.0.1:${port}`, id };
   if (attached) Object.assign(handle, { attached: true, browser });
   current = handle;
+  // $HARNESS_DIR/die-on-launch = N: Brave launch N dies right after
+  // ensureBrave() returns it — before the forwarded call reaches upstream —
+  // and Playwright's close event lands only later.
+  let dieOn = null;
+  try { dieOn = Number(fs.readFileSync(path.join(dir, "die-on-launch"), "utf8")); } catch {}
+  if (dieOn === braveSeq) {
+    setImmediate(() => fs.writeFileSync(path.join(dir, "brave-alive"), "dead"));
+    setTimeout(() => { context.emit("close"); log(`brave-died-late ${id}`); }, 400);
+  }
   return handle;
 }
 

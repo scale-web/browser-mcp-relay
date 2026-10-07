@@ -243,6 +243,13 @@ async function main() {
     });
     upstreamChild = child;
     upstreamPort = port;
+    // Recorded as-is even when no Brave is live right now (after an idle
+    // reap, or a tools/list that lands mid-relaunch): the next Brave then
+    // replaces this child although it never attached — one wasted spawn,
+    // deliberately. Treating such a child as generation 0 (adoptable) is
+    // NOT safe: if Brave dies between ensureBrave() and this spawn, the
+    // child's first call fails and BDMCP caches that failure forever, so
+    // adopting it would bring the wedge back.
     upstreamBraveGeneration = braveGeneration;
     child.on("exit", async (code, signal) => {
       // Deliberate restart (restartUpstreamIfStale replaced/cleared
