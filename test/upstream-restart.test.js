@@ -319,7 +319,11 @@ test("shutdown with a tools/list in flight never spawns another upstream child",
     await Promise.race([exited, new Promise((res) => setTimeout(res, 8000))]);
     await listing;
     assert.notStrictEqual(r.child.exitCode, null, "relay must have exited");
-    assert.strictEqual(r.upstreamPids().length, 1, `a new upstream child was spawned during shutdown:\n${r.stderr()}`);
+    // Count spawns from the relay's own log, written synchronously at spawn:
+    // a child spawned during shutdown can be killed before it records its pid.
+    const spawns = (r.stderr().match(/spawning upstream child/g) || []).length;
+    assert.strictEqual(spawns, 1, `a new upstream child was spawned during shutdown:\n${r.stderr()}`);
+    assert.strictEqual(r.upstreamPids().length, 1);
   } finally {
     await r.stop();
   }
