@@ -250,3 +250,29 @@ test("after an idle reap, tools/list then a call reaches a live upstream on the 
     await r.stop();
   }
 });
+
+test("an upstream spawned by an own-tool AFTER Brave died mid-tool is replaced, not adopted, by the next relaunch", async () => {
+  // tabs_new / tabs_select reach upstream through __relayUpstream after their
+  // own browser work. If Brave dies in between, that spawn happens with no
+  // live Brave and its first call is poisoned for the child's life (BDMCP).
+  // Recording generation 0 for such a child would let the next Brave adopt it.
+  const r = await startRelay();
+  try {
+    await r.request("tools/list", {});
+    const first = await r.call();
+    assert.strictEqual(first.isError, false, first.text);
+    await r.killBrave();
+    const own = await r.request("tools/call", { name: "tabs_list", arguments: {} }); // relaunch #2 kills child #1; nothing respawns
+    assert.ok(!own.isError, JSON.stringify(own));
+    await waitFor(() => !isAlive(first.body.pid), 3000, "child #1 to die");
+    const prop = await r.request("tools/call", { name: "harness_die_then_propagate", arguments: {} });
+    const pids = r.upstreamPids();
+    assert.strictEqual(pids.length, 2, `precondition: the own-tool must spawn child #2: ${JSON.stringify(prop)}`);
+    const healed = await r.call();
+    assert.strictEqual(healed.isError, false, `adopted a poisoned child: ${healed.text}`);
+    assert.notStrictEqual(healed.body.pid, pids[1], "the child spawned with no live Brave must not be reused");
+    assert.strictEqual(healed.body.brave, "brave-3");
+  } finally {
+    await r.stop();
+  }
+});

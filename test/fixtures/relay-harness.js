@@ -82,11 +82,30 @@ stubModule(path.join(SRC, "pool-shared.js"), {
 
 stubModule(path.join(SCRIPTS, "patch-bdmcp-bundle.js"), { applyPatch: () => ({ patched: true }) });
 
-process.on("SIGUSR2", () => {
+function killCurrentBrave() {
   const h = current;
   fs.writeFileSync(path.join(dir, "brave-alive"), "dead");
   if (h) h.context.emit("close");
   log(`brave-killed ${h ? h.id : "none"}`);
+}
+process.on("SIGUSR2", killCurrentBrave);
+
+// Test-only own-tool with the shape of tabs_new / tabs_select: it passes
+// ensureBrave(), does browser work during which Brave dies, THEN reaches the
+// upstream via globalThis.__relayUpstream — so the upstream child is spawned
+// while no Brave is live and its first call hits the dead one.
+const ownIndex = require(path.join(SRC, "own-tools", "index.js"));
+const { propagateActivePageToUpstream } = require(path.join(SRC, "own-tools", "_propagate-active-page.js"));
+ownIndex.tools.push({
+  name: "harness_die_then_propagate",
+  description: "test only",
+  inputSchema: { type: "object" },
+  handler: async () => {
+    killCurrentBrave();
+    await new Promise((r) => setTimeout(r, 20));
+    const res = await propagateActivePageToUpstream("data:text/html,propagate");
+    return { content: [{ type: "text", text: JSON.stringify(res) }] };
+  },
 });
 
 require(path.join(SRC, "index.js")).main().catch((e) => {
