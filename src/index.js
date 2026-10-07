@@ -201,9 +201,10 @@ async function main() {
   let upstreamBraveGeneration = null;
   // Set first thing by shutdownAsync/shutdownSync. getUpstream() refuses to
   // spawn once it is set, so nothing — e.g. relay-server's tools/list retry —
-  // can start a new upstream child during shutdown. (A plain flag here, not
-  // a check on shutdownPromise: that `let` is declared after server.connect(),
-  // so an early tools/list would hit its temporal dead zone.)
+  // can start a new upstream child during shutdown — e.g. a call that lands
+  // while shutdown awaits closeBrave(), relaunches Brave and so restarts the
+  // upstream. A plain flag kept with the upstream state, so this guard does
+  // not depend on where shutdownPromise happens to be declared.
   let relayShuttingDown = false;
 
   async function spawnUpstream() {

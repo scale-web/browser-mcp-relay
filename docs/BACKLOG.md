@@ -209,6 +209,15 @@ a wedged child. Pre-existing; demonstrated by review round 2 of that fix.
 
 **When picked up:** treat `response.isError` like a throw (log + `propagated: false`) and add a test.
 
+### A Brave relaunched during a SIGTERM shutdown is never closed (found 2026-10-07)
+
+`shutdownAsync` captures `bridge` when it starts and closes that Brave. If a call arrives while it is still awaiting
+(stdin stays open on SIGTERM), the old Brave dies and that call relaunches a new one, the new Brave is never closed and
+stays orphaned until the next relay's pre-launch reap. Pre-existing on main; found by review round 4 of the
+upstream-restart fix (the upstream half of the same race is closed by `relayShuttingDown`). Argued, not run on real Brave.
+
+**When picked up:** have `ensureBrave()` refuse to launch once `relayShuttingDown` is set, with a test.
+
 ---
 
 ## Tooling / DX
