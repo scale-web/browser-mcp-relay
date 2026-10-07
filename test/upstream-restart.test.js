@@ -308,3 +308,19 @@ test("a tools/list in flight on the old child during a Brave relaunch is answere
     await r.stop();
   }
 });
+
+test("shutdown with a tools/list in flight never spawns another upstream child", T, async () => {
+  const r = await startRelay({ extraEnv: { MOCK_TOOLS_LIST_DELAY_MS: "800" } });
+  try {
+    const listing = r.request("tools/list", {}).catch((e) => e); // held 800 ms by child #1
+    await waitFor(() => r.upstreamPids().length === 1, 3000, "child #1 to spawn");
+    const exited = new Promise((res) => r.child.once("exit", res));
+    r.child.stdin.end(); // client gone → relay shutdown closes child #1's client mid-tools/list
+    await Promise.race([exited, new Promise((res) => setTimeout(res, 8000))]);
+    await listing;
+    assert.notStrictEqual(r.child.exitCode, null, "relay must have exited");
+    assert.strictEqual(r.upstreamPids().length, 1, `a new upstream child was spawned during shutdown:\n${r.stderr()}`);
+  } finally {
+    await r.stop();
+  }
+});

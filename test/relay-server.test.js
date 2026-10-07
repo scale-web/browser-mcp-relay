@@ -401,3 +401,23 @@ test("RelayServer.handleToolsCall: throwing subscriber on error path also doesn'
     /upstream-down/,
   );
 });
+
+test("RelayServer.handleToolsList retries ONCE on \"client closed\" (upstream restarted mid-list)", async () => {
+  let calls = 0;
+  const closed = { request: async () => { throw new Error("client closed"); } };
+  const relay = new RelayServer({ getUpstream: async () => (++calls === 1 ? closed : new FakeUpstream()) });
+  const result = await relay.handleToolsList();
+  assert.strictEqual(calls, 2);
+  assert.strictEqual(result.tools[0].name, "navigation_go-to");
+});
+
+test("RelayServer.handleToolsList does NOT retry other upstream errors", async () => {
+  for (const msg of ["upstream closed", "upstream request timed out after 180000ms: tools/list", "spawn failed"]) {
+    let calls = 0;
+    const relay = new RelayServer({
+      getUpstream: async () => { calls++; return { request: async () => { throw new Error(msg); } }; },
+    });
+    await assert.rejects(relay.handleToolsList(), new RegExp(msg.slice(0, 15)));
+    assert.strictEqual(calls, 1, `retried on "${msg}"`);
+  }
+});

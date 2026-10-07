@@ -108,8 +108,10 @@ class RelayServer {
       // restartUpstreamIfStale) and closes its client, which rejects a
       // tools/list still in flight with "client closed". tools/list is
       // idempotent and needs no Brave, so ask the replacement child once.
-      // During shutdown the closed client stays installed, so this retry
-      // fails fast instead of spawning a new child.
+      // During shutdown getUpstream() refuses to spawn (index.js
+      // relayShuttingDown), so this retry fails fast instead of starting a
+      // child. Only "client closed" is retried: a timeout, a spawn failure or
+      // "upstream closed" (the child died) must surface, not double.
       if (!e || e.message !== "client closed") throw e;
       upstreamResponse = await (await this.getUpstream()).request("tools/list", {});
     }

@@ -199,6 +199,12 @@ async function main() {
   // the first Brave adopts it instead of paying a respawn.
   let braveGeneration = 0;
   let upstreamBraveGeneration = null;
+  // Set first thing by shutdownAsync/shutdownSync. getUpstream() refuses to
+  // spawn once it is set, so nothing — e.g. relay-server's tools/list retry —
+  // can start a new upstream child during shutdown. (A plain flag here, not
+  // a check on shutdownPromise: that `let` is declared after server.connect(),
+  // so an early tools/list would hit its temporal dead zone.)
+  let relayShuttingDown = false;
 
   async function spawnUpstream() {
     const bdmcpEntry = resolveBdmcpEntry();
@@ -317,6 +323,7 @@ async function main() {
 
   async function getUpstream() {
     if (upstreamClient) return upstreamClient;
+    if (relayShuttingDown) throw new Error("relay shutting down");
     if (!upstreamSpawnPromise) {
       // W1-5: wrap spawnUpstream in Promise.resolve().then so a synchronous
       // throw from spawnUpstream() (e.g. resolveBdmcpEntry throwing because
@@ -729,6 +736,7 @@ async function main() {
     // Only path here is process.on("exit") — no async, no awaits.
     if (shutdownDone) return;
     shutdownDone = true;
+    relayShuttingDown = true;
     try { releasePool(); } catch {}
     if (upstreamClient) { try { upstreamClient.close(); } catch {} }
     killUpstreamTree();
@@ -741,6 +749,7 @@ async function main() {
 
   function shutdownAsync() {
     if (shutdownPromise) return shutdownPromise;
+    relayShuttingDown = true;
     shutdownPromise = (async () => {
       // W1-6: release the pool lock FIRST so a second Ctrl-C (which
       // process.exit's mid-await) leaves the slot reclaimable by the next
