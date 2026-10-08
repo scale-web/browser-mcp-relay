@@ -66,3 +66,34 @@ test("propagateActivePageToUpstream: upstream error returned as failure, not thr
     globalThis.__relayUpstream = prev;
   }
 });
+
+test("propagateActivePageToUpstream: upstream isError result reported as failure, not success", async () => {
+  // browser-devtools-mcp reports tool failures as a normal result with
+  // isError: true, not as a thrown JSON-RPC error.
+  const prev = globalThis.__relayUpstream;
+  globalThis.__relayUpstream = async () => ({
+    request: async () => ({
+      content: [{ type: "text", text: "Target page, context or browser has been closed" }],
+      isError: true,
+    }),
+  });
+  try {
+    const r = await propagateActivePageToUpstream("https://example.com/");
+    assert.strictEqual(r.propagated, false);
+    assert.match(r.reason, /has been closed/);
+  } finally {
+    globalThis.__relayUpstream = prev;
+  }
+});
+
+test("propagateActivePageToUpstream: isError with no text still reported as failure", async () => {
+  const prev = globalThis.__relayUpstream;
+  globalThis.__relayUpstream = async () => ({ request: async () => ({ isError: true }) });
+  try {
+    const r = await propagateActivePageToUpstream("https://example.com/");
+    assert.strictEqual(r.propagated, false);
+    assert.match(r.reason, /upstream error/);
+  } finally {
+    globalThis.__relayUpstream = prev;
+  }
+});

@@ -31,7 +31,8 @@
 // activateTarget) is either a no-op or strictly worse.
 //
 // Failure mode: if upstream isn't ready or `navigation_go-to` errors
-// (e.g. blocked file://, network failure), we LOG and CONTINUE rather
+// (e.g. blocked file://, network failure) — whether it throws or returns
+// an `isError` result — we LOG and CONTINUE rather
 // than fail the tabs_* call. The relay-side page is still created/
 // brought to front; only the upstream-propagation half failed. This
 // keeps the tabs_* tools robust for offline/file-only flows.
@@ -65,10 +66,18 @@ async function propagateActivePageToUpstream(url) {
     // snapshot/screenshot — we only care about the side effect of
     // upstream's `_page` being navigated. includeSnapshot/Screenshot
     // default true on upstream, which would double our latency.
-    await upstream.request("tools/call", {
+    const result = await upstream.request("tools/call", {
       name: "navigation_go-to",
       arguments: { url, includeSnapshot: false, includeScreenshot: false },
     });
+    // Upstream reports a failed tool as a normal result with isError: true,
+    // not by throwing — treat it exactly like a throw.
+    if (result && result.isError) {
+      const text = Array.isArray(result.content)
+        ? result.content.filter((c) => c && c.type === "text").map((c) => c.text).join(" ").trim()
+        : "";
+      throw new Error(text || "navigation_go-to returned isError");
+    }
     return { propagated: true };
   } catch (e) {
     process.stderr.write(
