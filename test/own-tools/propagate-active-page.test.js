@@ -92,7 +92,7 @@ test("propagateActivePageToUpstream: isError with no text still reported as fail
   try {
     const r = await propagateActivePageToUpstream("https://example.com/");
     assert.strictEqual(r.propagated, false);
-    assert.match(r.reason, /upstream error/);
+    assert.match(r.reason, /returned isError/);
   } finally {
     globalThis.__relayUpstream = prev;
   }
