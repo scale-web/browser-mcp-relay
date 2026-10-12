@@ -64,6 +64,9 @@ test("checkToolArgs: URL arguments of every navigating tool, and Meta cookies, a
     // Phase 1 review: an ALLOWED page's URL still sets a facebook.com session cookie.
     ["cookies_import", { cookies: [{ name: "xs", value: "x", url: "https://www.facebook.com/ads/library/" }] }],
     ["cookies_import", { cookies: [{ name: "xs", value: "x", domain: "developers.facebook.com" }] }],
+    // and a trailing dot (the FQDN spelling) does not get one past (re-review).
+    ["cookies_import", { cookies: [{ name: "xs", value: "x", url: "https://www.facebook.com./" }] }],
+    ["cookies_import", { cookies: [{ name: "xs", value: "x", domain: ".facebook.com." }] }],
   ];
   for (const [name, args] of cases) {
     const r = g.checkToolArgs(name, args);

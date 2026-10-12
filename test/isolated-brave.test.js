@@ -66,6 +66,7 @@ async function startServer() {
     const send = (code, body, headers = {}) => { res.writeHead(code, { "content-type": "text/html", ...headers }); res.end(body); };
     switch (url.pathname) {
       case "/redirect-to-fb": return send(302, "", { location: `https://m.facebook.com:${P}/` });
+      case "/relocate": return send(200, page(`<script>history.replaceState(null, "", "/ads/library/after");</script>RELOCATED-META-PAGE`));
       case "/popups": return send(200, page(`<a id="blank" target="_blank" href="https://www.instagram.com:${P}/p/x/">ig</a>`));
       case "/embeds": return send(200, page(`<img src="https://www.facebook.com:${P}/tr?ev=PageView"><iframe src="https://www.instagram.com:${P}/p/x/embed"></iframe>`));
       case "/sw.js": return send(200, SW_JS, { "content-type": "text/javascript", "service-worker-allowed": "/" });
@@ -369,6 +370,7 @@ test("Meta guard: a URL the Fetch layer just blocked, then served by a service w
     await p.goto(U("www.facebook.com", "/sw-login")).catch(() => {});   // 1. the Fetch layer blocks it
     await new Promise((r) => setTimeout(r, 800));
     assert.ok(await isGuardPage(p), `the guard's own 403 page stays (url ${p.url()})`);
+    assert.strictEqual(g.recentlyBlocked(U("www.facebook.com", "/sw-login")), false, "its 403 page consumed the block's one token");
     await p.goto(U("www.facebook.com", "/ads/library/sw-setup"));       // 2. an allowed page registers a SW
     await p.waitForFunction(() => document.title === "SW-READY", null, { timeout: 10000 });
     await p.goto(U("www.facebook.com", "/sw-login")).catch(() => {});   // 3. same URL, within seconds, from the SW
@@ -378,6 +380,53 @@ test("Meta guard: a URL the Fetch layer just blocked, then served by a service w
   } finally {
     if (g) g.close();
     await ctx.close();
+  }
+});
+
+test("Meta guard watchdog: a Meta page holding a token but not the guard's marker is still evicted (the poll's own deadline)", ISO, async () => {
+  await startServer();
+  const { h } = await launch("watchdog-token-");
+  const reported = [];
+  try {
+    guard.installWatchdog(h.context, { recentlyBlocked: () => true, onBlocked: (host) => reported.push(host) }); // a leftover token, always
+    const p = await h.context.newPage();
+    await p.goto(U("www.instagram.com", "/"));
+    await p.waitForURL("about:blank", { timeout: 6000 });
+    assert.deepStrictEqual(reported, ["www.instagram.com"]);
+  } finally {
+    await closeBrave(h);
+  }
+});
+
+test("Meta guard watchdog: a page that replaceStates itself to an allowed path while being checked is still evicted (re-review)", ISO, async () => {
+  await startServer();
+  const { h } = await launch("watchdog-relocate-");
+  const reported = [];
+  try {
+    guard.installWatchdog(h.context, { recentlyBlocked: () => true, onBlocked: (host) => reported.push(host) });
+    const p = await h.context.newPage();
+    await p.goto(U("www.facebook.com", "/relocate"));
+    await p.waitForURL("about:blank", { timeout: 6000 });
+    assert.doesNotMatch(await p.content(), /RELOCATED-META-PAGE/);
+  } finally {
+    await closeBrave(h);
+  }
+});
+
+test("Meta guard: the 403 page for a URL with a #fragment stays (tokens are keyed without it)", ISO, async () => {
+  await startServer();
+  const { h } = await launch("guard-frag-");
+  let g;
+  try {
+    g = await guard.installMetaGuard({ wsEndpoint: h.wsEndpoint });
+    guard.installWatchdog(h.context, { recentlyBlocked: g.recentlyBlocked, onBlocked: () => {} });
+    const p = await h.context.newPage();
+    await p.goto(U("www.facebook.com", "/frag#section")).catch(() => {});
+    await new Promise((r) => setTimeout(r, 3000));
+    assert.ok(await isGuardPage(p), `still the guard's page after the poll's deadline (url ${p.url()})`);
+  } finally {
+    if (g) g.close();
+    await closeBrave(h);
   }
 });
 

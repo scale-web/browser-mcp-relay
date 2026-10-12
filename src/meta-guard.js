@@ -106,7 +106,7 @@ const URL_ARG_KEYS = ["url", "navigateToUrl"];
  *  still a logged-in Meta session (Phase 1 review: `url: …/ads/library/` let
  *  an `xs` cookie in, and the next allowed load sent it). */
 function hostOnBlockList(host) {
-  const h = String(host || "").replace(/^\./, "").toLowerCase();
+  const h = String(host || "").replace(/^\.+/, "").replace(/\.+$/, "").toLowerCase(); // `.facebook.com.` too
   return !!h && COMPILED.block.some((m) => m(h));
 }
 
@@ -288,6 +288,7 @@ async function installMetaGuard({ wsEndpoint, log = () => {}, onBlocked = () => 
     // URL for a while (Phase 1 review: a URL match skipped the watchdog for
     // 30 s, so a service worker could serve the real page in that window).
     recentlyBlocked: (url) => {
+      url = noFragment(url);
       const t = recent.get(url);
       if (!t) return false;
       if (t.exp < Date.now() || t.n < 1) { recent.delete(url); return false; }
@@ -300,6 +301,13 @@ async function installMetaGuard({ wsEndpoint, log = () => {}, onBlocked = () => 
 }
 
 // ── Layer 3: framenavigated watchdog on the relay's Playwright context ──────
+
+/** Tokens are keyed without the fragment: Fetch's request.url never has one,
+ *  frame.url() keeps it (re-review: the guard's own 403 page for `…#x` was evicted). */
+function noFragment(u) {
+  const i = String(u).indexOf("#");
+  return i < 0 ? String(u) : String(u).slice(0, i);
+}
 
 /**
  * @param {import('playwright-core').BrowserContext} context
@@ -320,21 +328,39 @@ function installWatchdog(context, { recentlyBlocked = () => false, onBlocked, lo
         onBlocked(v.host);
         page.goto("about:blank").catch(() => {});
       };
-      if (!recentlyBlocked(url)) return evict();
+      const bare = noFragment(url);
+      if (!recentlyBlocked(bare)) return evict();
       // A token says the Fetch layer just served its 403 page for this URL.
-      // Confirm the page IS that page (its marker), not something else that
-      // committed the same URL. Polled: right after the commit the marker may
-      // not be parsed yet (a one-shot read evicted a real 403 page after a 302).
+      // Confirm the DOCUMENT is that page (its marker), not something else that
+      // committed the same URL. Polled (right after the commit the marker may not
+      // be parsed yet), and followed by document, not by URL (re-review: a page
+      // that replaceState'd itself to an allowed path ended the poll and stayed):
+      // the first read stamps the document, later reads stop only when a NEW
+      // document has committed (its own framenavigated judges it).
       const deadline = Date.now() + 2000;
+      const stampId = `${Date.now()}-${Math.random()}`;
+      let stamped = false;
+      const read = () => Promise.race([
+        frame.evaluate(({ id, first }) => {
+          const d = document;
+          const mark = d.documentElement ? d.documentElement.getAttribute("data-relay-meta-guard") : null;
+          if (first) { d.__relayGuardStamp = id; return { mark, same: true }; }
+          return { mark, same: d.__relayGuardStamp === id };
+        }, { id: stampId, first: !stamped }).catch(() => null),
+        new Promise((r) => setTimeout(() => r(null), 500)),           // a hung page still meets the deadline
+      ]);
       const check = () => {
-        if (frame.isDetached() || frame.url() !== url) return;        // it moved on
-        frame.evaluate(() => document.documentElement && document.documentElement.getAttribute("data-relay-meta-guard"))
-          .catch(() => null)
-          .then((mark) => {
-            if (mark === "1" || frame.isDetached() || frame.url() !== url) return;
-            if (Date.now() >= deadline) return evict();
-            setTimeout(check, 50);
-          });
+        if (frame.isDetached()) return;
+        read().then((r) => {
+          if (frame.isDetached()) return;
+          // (No URL check on the first read: the page's own script may already have
+          // replaceState'd it. A real navigation in the gap is judged fail-closed.)
+          if (r && !r.same) return;                                   // a new document committed
+          if (r) stamped = true;
+          if (r && r.mark === "1") return;                            // the guard's own 403 page
+          if (Date.now() >= deadline) return evict();
+          setTimeout(check, 50);
+        });
       };
       check();
     });
