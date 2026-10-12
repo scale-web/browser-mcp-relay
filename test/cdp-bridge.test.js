@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
 
-const { launchBrave, closeBrave, waitForCdpReady } = require("../src/cdp-bridge.js");
+const { closeBrave } = require("../src/cdp-bridge.js");
 
 // launchBrave really deletes <udd>/Default/Sessions, so unit tests must not point
 // it at a shared literal path like /tmp/x — that is an unstubbed destructive side
@@ -17,6 +17,24 @@ process.on("exit", () => { try { fs.rmSync(SAFE_UDD, { recursive: true, force: t
 // Captures the launchOpts that launchBrave passes to launchPersistentContext.
 // Bypasses the real Brave launch (too slow/flaky for unit tests) and asserts
 // the launch shape is correct. Each test isolates the require cache + restores.
+//
+// Since spec v4 §1b launchBrave reads the port back from
+// <udd>/DevToolsActivePort and proves it with /json/version, so the mock does
+// what a port-0 Brave does: writes the file at launch and answers
+// /json/version with the same browser uuid.
+const MOCK_PORT = 54321;
+const MOCK_UUID = "11111111-2222-3333-4444-555555555555";
+
+function writeMockActivePort(userDataDir, uuid = MOCK_UUID) {
+  fs.writeFileSync(path.join(userDataDir, "DevToolsActivePort"), `${MOCK_PORT}\n/devtools/browser/${uuid}`);
+}
+
+function mockJsonVersion(uuid = MOCK_UUID) {
+  return async () => ({
+    ok: true,
+    json: async () => ({ webSocketDebuggerUrl: `ws://127.0.0.1:${MOCK_PORT}/devtools/browser/${uuid}` }),
+  });
+}
 
 async function withMockChromium(fn) {
   const playwrightCorePath = require.resolve("playwright-core");
@@ -34,6 +52,7 @@ async function withMockChromium(fn) {
         launchPersistentContext: async (userDataDir, launchOpts) => {
           captured.userDataDir = userDataDir;
           captured.launchOpts = launchOpts;
+          writeMockActivePort(userDataDir);
           return { close: async () => {} };
         },
       },
@@ -41,9 +60,9 @@ async function withMockChromium(fn) {
   };
   // Reset cdp-bridge so it picks up the stubbed chromium.
   delete require.cache[cdpBridgePath];
-  // Stub fetch so waitForCdpReady resolves immediately.
+  // Stub fetch: /json/version names the uuid the mock wrote.
   const origFetch = global.fetch;
-  global.fetch = async () => ({ ok: true });
+  global.fetch = mockJsonVersion();
   try {
     const fresh = require("../src/cdp-bridge.js");
     return await fn(fresh, captured);
@@ -202,97 +221,122 @@ test("V2-7: launchBrave with proxyUrl strips BROWSER_RELAY_* env from spawned Br
   }
 });
 
-// ─────────────── Original integration test (skips if no Brave) ───────────────
-
-// playwright-core has no bundled chromium — use the system Brave install
-// resolved via the same auto-detect logic the relay uses at launch time.
-const { detectBravePath } = require("../src/detect-browser.js");
-let SYSTEM_BRAVE;
-try {
-  SYSTEM_BRAVE = detectBravePath();
-} catch {
-  SYSTEM_BRAVE = null; // tests that need it will skip
-}
-
-test("launchBrave + connectOverCDP roundtrip on a throwaway profile", { skip: !SYSTEM_BRAVE }, async () => {
-  const tmp = path.join(os.tmpdir(), `cdp-bridge-test-${Date.now()}`);
-  fs.mkdirSync(tmp, { recursive: true });
-  const handle = await launchBrave({
-    userDataDir: tmp,
-    port: 9399, // unused-port range
-    headless: false,
-    extensionPath: null,
-    executablePath: SYSTEM_BRAVE,
-  });
-  try {
-    assert.strictEqual(handle.cdpConnectUrl, "http://127.0.0.1:9399");
-    const page = await handle.context.newPage();
-    await page.goto("about:blank");
-    const title = await page.title();
-    assert.strictEqual(title, "");
-  } finally {
-    await closeBrave(handle);
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
-});
-
-test("waitForCdpReady polls /json/version until it succeeds", async () => {
-  // Brave from previous test should be down by now; this should timeout fast.
-  await assert.rejects(
-    waitForCdpReady(9399, 500),
-    /timeout|not ready/i,
-  );
-});
+// The real-Brave round trip (launch + connect + identity) lives in
+// test/isolated/real-brave.test.js: it needs the isolated harness
+// (scripts/test-harness.js) so the test Brave keeps the mock keychain.
 
 // ──────────────────────────────────────────────────────────────────
-// V0-3: launchBrave must close the BrowserContext if waitForCdpReady
-// throws. Otherwise the live context (with its file lock on
-// userDataDir) leaks until reboot, blocking any future relay from
-// claiming the slot.
+// V0-3 → spec v4 §1b: launchBrave must close the BrowserContext when it
+// cannot PROVE the CDP endpoint is this Brave (the file never appears, or
+// /json/version names a different browser). Otherwise the live context
+// (with its file lock on userDataDir) leaks, and — worse — a mismatch means
+// 127.0.0.1:<port> is somebody else's browser (F9).
 // ──────────────────────────────────────────────────────────────────
 
-test("V0-3: launchBrave closes context if waitForCdpReady throws", async () => {
+async function launchExpectingFailure({ writeFile, fetchImpl, expect }) {
   const playwrightCorePath = require.resolve("playwright-core");
   const cdpBridgePath = require.resolve("../src/cdp-bridge.js");
   const origPlaywright = require.cache[playwrightCorePath];
   const origCdpBridge = require.cache[cdpBridgePath];
   const origFetch = global.fetch;
   let closeCalls = 0;
-  // chromium stub returns a context whose close() bumps closeCalls.
   require.cache[playwrightCorePath] = {
     id: playwrightCorePath,
     filename: playwrightCorePath,
     loaded: true,
     exports: {
       chromium: {
-        launchPersistentContext: async () => ({
-          close: async () => { closeCalls++; },
-        }),
+        launchPersistentContext: async (udd) => {
+          if (writeFile) writeFile(udd);
+          return { close: async () => { closeCalls++; } };
+        },
       },
     },
   };
   delete require.cache[cdpBridgePath];
-  // fetch always 503 → waitForCdpReady will eventually time out.
-  global.fetch = async () => ({ ok: false, status: 503 });
+  global.fetch = fetchImpl;
   try {
     const fresh = require("../src/cdp-bridge.js");
-    await assert.rejects(
-      fresh.launchBrave({
-        userDataDir: SAFE_UDD,
-        port: 9990,
-        executablePath: "/fake/brave",
-      }),
-      /not ready/i,
-    );
-    // Critical assertion: context.close() was invoked exactly once on the
-    // way out, so the user-data-dir lock isn't leaked.
-    assert.strictEqual(closeCalls, 1, "expected context.close() to fire on waitForCdpReady throw");
+    await assert.rejects(fresh.launchBrave({ userDataDir: SAFE_UDD, executablePath: "/fake/brave" }), expect);
+    assert.strictEqual(closeCalls, 1, "context.close() must fire exactly once on the way out");
   } finally {
     if (origPlaywright) require.cache[playwrightCorePath] = origPlaywright;
     else delete require.cache[playwrightCorePath];
     if (origCdpBridge) require.cache[cdpBridgePath] = origCdpBridge;
     else delete require.cache[cdpBridgePath];
     global.fetch = origFetch;
+    fs.rmSync(path.join(SAFE_UDD, "DevToolsActivePort"), { force: true });
+  }
+}
+
+test("V0-3/§1b: launchBrave closes the context when /json/version names a DIFFERENT browser", async () => {
+  await launchExpectingFailure({
+    writeFile: (udd) => writeMockActivePort(udd, MOCK_UUID),
+    fetchImpl: mockJsonVersion("99999999-8888-7777-6666-555555555555"),
+    expect: /identity check failed/,
+  });
+});
+
+test("V0-3/§1b: launchBrave closes the context when /json/version does not answer", async () => {
+  await launchExpectingFailure({
+    writeFile: (udd) => writeMockActivePort(udd),
+    fetchImpl: async () => ({ ok: false, status: 503 }),
+    expect: /identity check failed/,
+  });
+});
+
+test("V0-3/§1b: launchBrave closes the context when DevToolsActivePort never appears (3 s deadline)", async () => {
+  await launchExpectingFailure({
+    writeFile: null,
+    fetchImpl: mockJsonVersion(),
+    expect: /did not appear/,
+  });
+});
+
+test("§1b: launchBrave deletes a leftover DevToolsActivePort BEFORE launching", async () => {
+  // A stale file naming a live decoy must never be read back: the mock Brave
+  // here writes nothing, so if the stale file survived, launchBrave would
+  // "verify" the decoy (fetch answers for its uuid) and succeed.
+  const stale = "22222222-3333-4444-5555-666666666666";
+  writeMockActivePort(SAFE_UDD, stale);
+  await launchExpectingFailure({
+    writeFile: null,
+    fetchImpl: mockJsonVersion(stale),
+    expect: /did not appear/,
+  });
+});
+
+test("§1b: launchBrave passes --remote-debugging-port=0 and returns the proven port + ws endpoint", async () => {
+  await withMockChromium(async (fresh, captured) => {
+    const h = await fresh.launchBrave({ userDataDir: SAFE_UDD, executablePath: "/fake/brave" });
+    assert.ok(captured.launchOpts.args.includes("--remote-debugging-port=0"));
+    assert.ok(!captured.launchOpts.args.some((a) => a.startsWith("--remote-debugging-address")));
+    assert.strictEqual(h.port, MOCK_PORT);
+    assert.strictEqual(h.wsEndpoint, `ws://127.0.0.1:${MOCK_PORT}/devtools/browser/${MOCK_UUID}`);
+    assert.strictEqual(h.cdpConnectUrl, `http://127.0.0.1:${MOCK_PORT}`);
+  });
+});
+
+test("§1b: launchBrave refuses a non-absolute userDataDir before launching", async () => {
+  await withMockChromium(async (fresh, captured) => {
+    await assert.rejects(fresh.launchBrave({ userDataDir: "relative/dir" }), /non-absolute/);
+    assert.strictEqual(captured.launchOpts, null, "must not launch");
+  });
+});
+
+test("§1e: launchBrave strips CLAUDE_CODE_MESSAGING_* from Brave's env", async () => {
+  const stash = { s: process.env.CLAUDE_CODE_MESSAGING_SOCKET, t: process.env.CLAUDE_CODE_MESSAGING_TOKEN };
+  process.env.CLAUDE_CODE_MESSAGING_SOCKET = "/tmp/fake.sock";
+  process.env.CLAUDE_CODE_MESSAGING_TOKEN = "fake-token";
+  try {
+    await withMockChromium(async (fresh, captured) => {
+      await fresh.launchBrave({ userDataDir: SAFE_UDD, executablePath: "/fake/brave" });
+      const keys = Object.keys(captured.launchOpts.env).filter((k) => k.startsWith("CLAUDE_CODE_MESSAGING_"));
+      assert.deepStrictEqual(keys, []);
+    });
+  } finally {
+    if (stash.s === undefined) delete process.env.CLAUDE_CODE_MESSAGING_SOCKET; else process.env.CLAUDE_CODE_MESSAGING_SOCKET = stash.s;
+    if (stash.t === undefined) delete process.env.CLAUDE_CODE_MESSAGING_TOKEN; else process.env.CLAUDE_CODE_MESSAGING_TOKEN = stash.t;
   }
 });
 

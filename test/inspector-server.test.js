@@ -602,17 +602,18 @@ test("inputSchemaPreview: returns comma-separated top-level field names", () => 
   assert.strictEqual(s, "url, formFactor, onlyCategories");
 });
 
-test("buildToolsCatalog: total = own + forwarded = 70 (19 + 51)", () => {
+test("buildToolsCatalog: total = own + forwarded = 71 (20 + 51)", () => {
   // Updated 2026-05-09: added storage_get-local / storage_set-local /
   // storage_clear-local own-tools (auth tokens for Discord/Notion/etc live
   // in localStorage, not HTTP cookies). 16 → 19 own-tools.
+  // Updated 2026-10-12 (spec v4 §1c): relay_status. 19 → 20.
   const c = buildToolsCatalog();
-  assert.strictEqual(c.total, 70);
-  assert.strictEqual(c.ownCount, 19);
+  assert.strictEqual(c.total, 71);
+  assert.strictEqual(c.ownCount, 20);
   assert.strictEqual(c.forwardedCount, 51);
   assert.ok(Array.isArray(c.own));
   assert.ok(Array.isArray(c.forwarded));
-  assert.strictEqual(c.own.length, 19);
+  assert.strictEqual(c.own.length, 20);
   assert.strictEqual(c.forwarded.length, 51);
 });
 

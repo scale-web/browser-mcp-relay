@@ -3,6 +3,8 @@
 // processes — with only its external collaborators replaced:
 //   - cdp-bridge.js   → a fake Brave (no browser is launched)
 //   - pool-shared.js  → a claim in $HARNESS_DIR (no real profile, lock or reap)
+//   - meta-guard.js   → layers 2/3 are no-ops (no CDP endpoint to attach to);
+//                       layer 1 (checkToolArgs) stays real
 //   - scripts/patch-bdmcp-bundle.js → no-op (never write node_modules)
 // The upstream child is test/fixtures/mock-bdmcp-session.js via
 // BROWSER_RELAY_UPSTREAM_PATH.
@@ -24,8 +26,13 @@ function stubModule(absPath, exports) {
 
 let braveSeq = 0;
 let current = null;
-function fakeBrave(port, attached) {
+// Every fake launch gets the SAME port (the "relaunch on the same port" case)
+// but its own browser uuid — exactly like a real port-0 relaunch that
+// happens to be handed the same number.
+const FAKE_PORT = 10032;
+function fakeBrave(port, attached, wsEndpoint) {
   const id = `brave-${++braveSeq}`;
+  wsEndpoint = wsEndpoint || `ws://127.0.0.1:${port}/devtools/browser/00000000-0000-0000-0000-${String(braveSeq).padStart(12, "0")}`;
   fs.writeFileSync(path.join(dir, "brave-alive"), id);
   fs.appendFileSync(path.join(dir, "brave-launches"), `${id} port=${port} attached=${attached}\n`);
   const browser = new EventEmitter();
@@ -33,7 +40,7 @@ function fakeBrave(port, attached) {
   context.browser = () => browser;
   context.close = async () => { context.emit("close"); };
   context.pages = () => [];
-  const handle = { context, cdpConnectUrl: `http://127.0.0.1:${port}`, id };
+  const handle = { context, cdpConnectUrl: `http://127.0.0.1:${port}`, port, wsEndpoint, id };
   if (attached) Object.assign(handle, { attached: true, browser });
   current = handle;
   // $HARNESS_DIR/die-on-launch = N: Brave launch N dies right after
@@ -48,12 +55,25 @@ function fakeBrave(port, attached) {
   return handle;
 }
 
+const launchDelay = () => { try { return Number(fs.readFileSync(path.join(dir, "launch-delay-ms"), "utf8")); } catch { return 0; } };
 stubModule(path.join(SRC, "cdp-bridge.js"), {
-  launchBrave: async ({ port }) => fakeBrave(port, false),
-  attachBrave: async ({ port }) => fakeBrave(port, true),
-  closeBrave: async (h) => { if (h) h.context.emit("close"); },
-  closeBraveHard: async (h) => { if (h) h.context.emit("close"); },
-  waitForCdpReady: async () => {},
+  launchBrave: async () => {
+    const ms = launchDelay();
+    if (ms) { log(`launch-started`); await new Promise((r) => setTimeout(r, ms)); }
+    return fakeBrave(FAKE_PORT, false);
+  },
+  attachBrave: async ({ port, wsEndpoint }) => fakeBrave(port, true, wsEndpoint),
+  closeBrave: async (h) => { if (h) { log(`brave-closed ${h.id}`); h.context.emit("close"); } },
+  closeBraveHard: async (h) => { if (h) { log(`brave-closed ${h.id}`); h.context.emit("close"); } },
+  testLaunchRequested: () => false,
+  assertTestLaunchAllowed: () => {},
+});
+
+const realMetaGuard = require(path.join(SRC, "meta-guard.js"));
+stubModule(path.join(SRC, "meta-guard.js"), {
+  ...realMetaGuard,
+  installMetaGuard: async () => ({ alive: () => true, close: () => {}, recentlyBlocked: () => false }),
+  installWatchdog: () => {},
 });
 
 stubModule(path.join(SRC, "pool-shared.js"), {
@@ -66,10 +86,14 @@ stubModule(path.join(SRC, "pool-shared.js"), {
   SNAPSHOT_FILES: [],
   claimSlotWithRetry: async () => ({
     dir: path.join(dir, "profile"), lock: null, role: "default",
-    release: () => {}, ephemeral: false, baseDir: null,
+    release: () => { log("pool-released"); }, ephemeral: false, baseDir: null,
   }),
-  // $HARNESS_DIR/attachable = {"pid":1,"port":N} makes ensureBrave take the
-  // attach path (e.g. port differs from the one upstream was spawned with).
+  gcSessionClones: () => 0,
+  findBraveMainPid: () => null,
+  sessionClonesRoot: () => path.join(dir, "clones"),
+  cloneBelongsTo: () => false,
+  // $HARNESS_DIR/attachable = {"pid":1,"port":N,"wsEndpoint":"ws://…"} makes
+  // ensureBrave take the attach path.
   findAttachableBrave: async () => {
     try { return JSON.parse(fs.readFileSync(path.join(dir, "attachable"), "utf8")); } catch { return null; }
   },

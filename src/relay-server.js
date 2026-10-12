@@ -24,6 +24,7 @@
 // without missing context.
 
 const { EventEmitter } = require("node:events");
+const metaGuard = require("./meta-guard.js");
 
 // Cap each emitted event's response body at this size (in JSON-stringified
 // chars). capture_xhr / lighthouse_audit can return MB-scale responses;
@@ -70,7 +71,7 @@ class TrafficEmitter extends EventEmitter {
 }
 
 class RelayServer {
-  constructor({ getUpstream, ensureBrave, trafficEmitter } = {}) {
+  constructor({ getUpstream, ensureBrave, trafficEmitter, takeNotices } = {}) {
     if (typeof getUpstream !== "function") {
       throw new Error("RelayServer: constructor expects { getUpstream } async function");
     }
@@ -79,21 +80,26 @@ class RelayServer {
     }
     this.getUpstream = getUpstream;
     this.ensureBrave = ensureBrave || null;
-    this.ownTools = new Map(); // name → { name, description, inputSchema, handler }
+    // takeNotices(): string[] — texts to put in front of the next tool result
+    // as separate leading `text` items (mode changes, Meta-guard blocks). Only
+    // consumed when a result is actually returned, so a thrown call never
+    // swallows one.
+    this.takeNotices = typeof takeNotices === "function" ? takeNotices : () => [];
+    this.ownTools = new Map(); // name → { name, description, inputSchema, handler, needsBrave }
     // Traffic emitter is always present so call sites don't need null-guards.
     // If the caller doesn't pass one, we make our own (no subscribers = no
     // visible behavior change).
     this.trafficEmitter = trafficEmitter || new TrafficEmitter();
   }
 
-  registerOwnTool({ name, description, inputSchema, handler }) {
+  registerOwnTool({ name, description, inputSchema, handler, needsBrave = true }) {
     if (this.ownTools.has(name)) {
       throw new Error(`relay: tool "${name}" already registered`);
     }
     if (typeof handler !== "function") {
       throw new Error(`relay: tool "${name}" handler must be a function`);
     }
-    this.ownTools.set(name, { name, description, inputSchema, handler });
+    this.ownTools.set(name, { name, description, inputSchema, handler, needsBrave: needsBrave !== false });
   }
 
   async handleToolsList() {
@@ -161,10 +167,16 @@ class RelayServer {
     let status = "ok";
     let response;
     try {
-      if (isOwn) {
+      // Meta guard layer 1 (spec v4 §1d): refuse Meta URLs and Meta cookies
+      // before any browser work — the agent gets the route, not a 403 page.
+      const blocked = metaGuard.checkToolArgs(name, args);
+      if (blocked) {
+        response = blocked;
+      } else if (isOwn) {
         // Own-tool handlers read globalThis.__relayBridge. ensureBrave
-        // populates that. Always call it before invoking the handler.
-        if (this.ensureBrave) await this.ensureBrave();
+        // populates that — except for tools that never touch the browser
+        // (needsBrave: false, e.g. relay_status), which must not launch one.
+        if (this.ensureBrave && own.needsBrave) await this.ensureBrave();
         try {
           response = await own.handler(args || {});
         } catch (e) {
@@ -180,6 +192,10 @@ class RelayServer {
         response = await upstream.request("tools/call", { name, arguments: args });
       }
       if (response && response.isError) status = "error";
+      const notices = response && Array.isArray(response.content) ? this.takeNotices() : [];
+      if (notices.length > 0) {
+        response = { ...response, content: [...notices.map((text) => ({ type: "text", text })), ...response.content] };
+      }
     } catch (e) {
       // Forwarded-path failures bubble up as caller errors. Record + rethrow.
       status = "error";

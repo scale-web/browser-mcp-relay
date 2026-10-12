@@ -32,17 +32,19 @@ const { spawnSync } = require("node:child_process");
 const { detectBravePath, detectBraveProfileDir } = require("./detect-browser.js");
 const processShim = require("./process-shim.js");
 const { applyLocalConfigToEnv } = require("./local-config.js");
+const profileLock = require("./profile-lock.js");
+const cdpIdentity = require("./cdp-identity.js");
 
 // ───────────────────────────── Constants ─────────────────────────────
 
 const WRAPPER_LOCK = ".mcp-wrapper-lock";
 
-// CDP port range shared by every consumer that maps slots→ports or scans for
-// relay-launched Braves: index.js (initial port + F1-21 collision remap),
-// launch-project-isolated.js (slot assignment), and external scanners like
-// ghl-jwt.mjs. Single source of truth — widen HERE and every consumer keeps
-// agreeing. 9333..9349 = 17 ports: slots 1..12 map to 9333..9344, leaving
-// 9345..9349 as remap/clone headroom.
+// LEGACY CDP port range. Since spec v4 §1b this relay launches Brave with
+// --remote-debugging-port=0 (an OS-assigned port, read back from
+// <user-data-dir>/DevToolsActivePort), so it no longer maps slots to ports.
+// 9333..9349 is where PRE-CHANGE relays put their Braves (slot N → 9333+N-1,
+// plus the old F1-21 remap headroom) and what external scanners such as
+// ghl-jwt.mjs still scan; kept for them and for docs.
 const PORT_BASE = 9333;
 const PORT_SCAN_END = 9349;
 
@@ -491,88 +493,28 @@ function pickDirCandidates(cfg, requestedRole) {
 
 // ───────────────────────── Slot claim ────────────────────────────────
 
-/** Is the lock at `lockPath` held by a live process? Reads the lock meta and
- *  checks pid liveness; when the lock recorded a pidStartTime, a matching pid
- *  with a DIFFERENT current start time is a recycled pid → treated as dead.
- *  Unparseable lock files are treated as dead (self-heal). */
-function lockHeldByLiveProcess(lockPath, opts = {}) {
-  let meta;
-  try {
-    meta = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-  } catch {
-    return false;
-  }
-  if (!isPidAlive(meta.pid, opts)) return false;
-  // PID-reuse guard: same pid, different start time = a different process.
-  // Null probes (permissions, ps failure) are "unknown" — fail safe = alive.
-  if (meta.pidStartTime) {
-    const current = processShim.getPidStartTime(meta.pid, opts);
-    if (current && current !== meta.pidStartTime) return false;
-  }
-  return true;
-}
-
 /**
- * Try to claim ONE dir. Clears a stale lock (dead or pid-recycled owner),
- * then takes an atomic O_CREAT|O_EXCL lock on `<dir>/.mcp-wrapper-lock`.
- * Returns null when the dir is held by a live process; returns
- * { dir, lock, release } on success.
+ * Try to claim ONE dir under the kernel flock + v2 record protocol
+ * (profile-lock.js, spec v4 §1a). Returns null when the dir is busy (a live
+ * relay holds its flock, or a live pre-change relay holds its record);
+ * otherwise { dir, lock: { fd, path, flockPath }, flock, meta, release }.
+ * release() unlinks our record (owner-checked) and THEN closes the flock fd.
  *
- * NOTE (2026-07-06): claim no longer reaps orphan Brave processes. An orphan
- * Brave holding this dir is now an ATTACH candidate — index.js ensureBrave
- * probes it via findAttachableBrave() and only reaps when it can't attach
- * (pipe-only launch, dead CDP endpoint). Reaping here would kill the very
- * browser whose tabs we want to preserve across relay restarts.
+ * NOTE (2026-07-06): claim does not reap orphan Brave processes. An orphan
+ * Brave holding this dir is an ATTACH candidate — index.js ensureBrave probes
+ * it via findAttachableBrave() and only reaps when it can't attach.
  */
 function tryClaimDir(dir, opts = {}) {
   try { fs.mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
-  const lockPath = path.join(dir, WRAPPER_LOCK);
-
-  // Stale-clean: dead-PID (or recycled-PID) only.
-  try {
-    if (fs.existsSync(lockPath) && !lockHeldByLiveProcess(lockPath, opts)) {
-      fs.unlinkSync(lockPath);
-      process.stderr.write(`[mcp-relay] cleared stale lock at ${lockPath} (owner dead or pid recycled)\n`);
-    }
-  } catch { /* race: file vanished */ }
-
-  let fd;
-  try {
-    // F1-10 (2026-05-10): explicit 0o600 mode on POSIX so the lock file
-    // (which contains pid + hostname + start-time) isn't world-readable
-    // on multi-user systems. Windows ignores the mode arg.
-    fd = fs.openSync(lockPath, "wx", 0o600);
-  } catch (e) {
-    if (e.code === "EEXIST") return null;
-    throw e;
-  }
-  fs.writeSync(
-    fd,
-    JSON.stringify({
-      pid: process.pid,
-      startedAt: new Date().toISOString(),
-      // Recorded so future stale-checks can detect pid reuse: same pid,
-      // different start time → recycled pid, lock is stale.
-      pidStartTime: processShim.getPidStartTime(process.pid, opts),
-      host: os.hostname(),
-      relay: true,
-    }),
-  );
-  // V1-4: fdatasync flushes the lock contents to disk so a crash between
-  // write and the OS's lazy flush doesn't leave a zero-length / partial
-  // lock file that other relays would see as "stale" (and unlink) — even
-  // though this process is alive and holding fd. The stale-clean in this
-  // function self-heals partial files via JSON.parse failure → pidAlive
-  // false, but the data loss window during that gap could cause a brief
-  // double-claim. fdatasync closes that window.
-  try { fs.fdatasyncSync(fd); } catch { /* fdatasync unsupported on platform */ }
-
-  function release() {
-    try { fs.closeSync(fd); } catch { /* already closed */ }
-    try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
-  }
-
-  return { dir, lock: { fd, path: lockPath }, release };
+  const claim = profileLock.claimDir(dir, opts);
+  if (!claim) return null;
+  return {
+    dir,
+    lock: { fd: claim.flock.fd, path: path.join(dir, WRAPPER_LOCK), flockPath: claim.flock.path },
+    flock: claim.flock,
+    meta: claim.meta,
+    release: claim.release,
+  };
 }
 
 /**
@@ -633,7 +575,9 @@ function sessionClonesRoot(env = process.env) {
 }
 
 /** Create a unique clone dir for this process. The pid keys GC (dir is
- *  reclaimable once the pid dies); the nonce disambiguates pid reuse. */
+ *  reclaimable once the pid dies); the nonce disambiguates pid reuse. Clone
+ *  names are never re-claimed, which is what makes `rm -rf` of a clone dir —
+ *  flock file included — safe. */
 function createSessionCloneDir(baseDir, opts = {}) {
   const root = opts.root || sessionClonesRoot();
   const nonce = Math.random().toString(36).slice(2, 8);
@@ -642,12 +586,28 @@ function createSessionCloneDir(baseDir, opts = {}) {
   return dir;
 }
 
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Does clone dir name `name` belong to project `project` (a base dir's
+ *  basename)? Exact `<project>-p<pid>-<nonce>`, so project "as-ops" never
+ *  matches a clone of "as-ops-pages". */
+function cloneBelongsTo(name, project) {
+  return new RegExp(`^${escapeRegExp(project)}-p\\d+-[a-z0-9]+$`).test(name);
+}
+
 /**
- * Remove session-clone dirs whose owning relay is gone. A clone is
- * reclaimable when its lock file is missing/unparseable or its recorded
- * owner is dead (pid-reuse aware). Clones younger than `graceMs` with no
- * lock yet are skipped — they may be mid-creation by a sibling relay.
- * Best-effort: any per-dir failure is logged and skipped.
+ * Remove session-clone dirs whose owner is gone, using THE predicate
+ * (profile-lock.classifyDir). A clone is removable iff
+ *   - its dir mtime, read BEFORE its flock is opened, is older than `graceMs`
+ *     (a just-created clone is never touched — opening its flock first would
+ *     make the owner's own claim fail with EAGAIN), and
+ *   - the predicate says free (flock acquired, record not held), and
+ *   - no live Brave holds it (one `ps` per sweep, not per dir).
+ * The dir is removed WHILE its flock is held, then the fd is closed.
+ * `opts.project` limits the sweep to one project's clones (spec: sweep this
+ * project only). Best-effort: any per-dir failure is logged and skipped.
  *
  * @returns {number} count of clone dirs removed
  */
@@ -661,25 +621,25 @@ function gcSessionClones(opts = {}) {
   } catch {
     return 0; // root doesn't exist yet — nothing to GC
   }
+  let braves = null; // listed at most once per sweep, and only if needed
   let removed = 0;
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
+    if (opts.project && !cloneBelongsTo(entry.name, opts.project)) continue;
     const dir = path.join(root, entry.name);
-    const lockPath = path.join(dir, WRAPPER_LOCK);
+    let flock = null;
     try {
-      if (!fs.existsSync(lockPath)) {
-        // No lock: either mid-creation (young) or leftover junk (old).
-        const age = now - fs.statSync(dir).mtimeMs;
-        if (age < graceMs) continue;
-      } else if (lockHeldByLiveProcess(lockPath, opts)) {
-        continue;
+      // Age first — before anything is opened or created inside the dir.
+      const age = now - fs.statSync(dir).mtimeMs;
+      if (age < graceMs) continue;
+      const c = profileLock.classifyDir(dir, opts);
+      if (!c.free) continue;
+      flock = c.flock;
+      if (braves === null) {
+        const platform = opts._platform || process.platform;
+        braves = processShim.listProcessesByCommand(braveNeedle(platform), opts);
       }
-      // Belt-and-braces: never rm a dir a live Brave is still using, even
-      // when the lock says the owner is gone (owner crashed mid-shutdown,
-      // empty-lock write window, etc.). Fail-safe direction is "keep" —
-      // the next GC pass reclaims it once the Brave is really gone.
-      const platform = opts._platform || process.platform;
-      const braves = processShim.listProcessesByCommand(braveNeedle(platform), opts);
+      // Never rm a dir a live Brave is still using, whatever the record says.
       if (braves.some((p) => commandHasUserDataDir(p.command, dir))) {
         process.stderr.write(`[mcp-relay] session-clone GC kept ${dir}: live Brave still holds it\n`);
         continue;
@@ -689,9 +649,24 @@ function gcSessionClones(opts = {}) {
       process.stderr.write(`[mcp-relay] GC'd dead session clone ${dir}\n`);
     } catch (e) {
       process.stderr.write(`[mcp-relay] session-clone GC skipped ${dir}: ${e.message}\n`);
+    } finally {
+      profileLock.closeFlock(flock);
     }
   }
   return removed;
+}
+
+/** Claim our own freshly-created clone. GC never opens a clone's flock in its
+ *  first 60 s, but an inspector or prune probe could hold it for an instant:
+ *  retry for ~1 s before giving up. */
+async function claimFreshClone(cloneDir, opts = {}) {
+  const sleep = opts._sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  for (let i = 0; i < 20; i++) {
+    const claimed = tryClaimDir(cloneDir, opts);
+    if (claimed) return claimed;
+    await sleep(50);
+  }
+  return null;
 }
 
 /**
@@ -700,11 +675,14 @@ function gcSessionClones(opts = {}) {
  *   1. Try claimSlot(). On POOL_BUSY, retry every `delayMs` up to `retries`
  *      times — this absorbs the reconnect race where the previous relay is
  *      mid-shutdown and releases its lock within a second or two.
- *   2. Still busy: GC dead clones, create a fresh clone dir next to (not
- *      inside) the base profile, claim it, and return it flagged
+ *   2. Still busy: GC this project's dead clones, create a fresh clone dir
+ *      next to (not inside) the base profile, claim it, and return it flagged
  *      { ephemeral: true, baseDir } so the entrypoint can seed it from the
- *      base profile's cookies/storage. The clone's release() also removes
- *      the clone dir.
+ *      base profile's cookies/storage.
+ *
+ * A temp-path project (BROWSER_RELAY_EPHEMERAL_POOL_DIR=1, set by
+ * launch-project-isolated.js) claims its single fresh dir and is ephemeral
+ * with no base: nothing to seed from, removed at exit.
  *
  * Non-POOL_BUSY errors (config problems) are never retried.
  *
@@ -713,7 +691,7 @@ function gcSessionClones(opts = {}) {
  * @param {number} [opts.delayMs=500]
  * @param {boolean} [opts.allowClone=true]
  * @param {(ms: number) => Promise<void>} [opts._sleep] — test seam
- * @returns {Promise<{ dir, lock, role, release, ephemeral: boolean, baseDir: string|null }>}
+ * @returns {Promise<{ dir, lock, role, release, cleanup?, ephemeral: boolean, baseDir: string|null }>}
  */
 async function claimSlotWithRetry(opts = {}) {
   const retries = opts.retries ?? 6;
@@ -721,6 +699,14 @@ async function claimSlotWithRetry(opts = {}) {
   const allowClone = opts.allowClone ?? true;
   const sleep = opts._sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const claimOnce = opts._claimSlot || claimSlot;
+  const env = opts._env || applyLocalConfigToEnv(process.env);
+
+  if (!opts._claimSlot && env.BROWSER_RELAY_EPHEMERAL_POOL_DIR === "1") {
+    const dir = CONFIG.poolDirs[0];
+    const claimed = await claimFreshClone(dir, opts);
+    if (!claimed) throw new Error(`[mcp-relay] could not claim the fresh ephemeral dir ${dir}`);
+    return { ...claimed, role: "default", release: () => {}, cleanup: ownedDirCleanup(dir, claimed), ephemeral: true, baseDir: null };
+  }
 
   let lastErr;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -743,74 +729,106 @@ async function claimSlotWithRetry(opts = {}) {
   // Fall back to an ephemeral session clone of the first candidate dir.
   const requestedRole = process.env.BROWSER_MCP_ROLE || undefined;
   const baseDir = pickDirCandidates(CONFIG, requestedRole)[0];
-  try { gcSessionClones(opts); } catch { /* best-effort */ }
+  try { gcSessionClones({ ...opts, project: path.basename(baseDir) }); } catch { /* best-effort */ }
   const cloneDir = createSessionCloneDir(baseDir, opts);
-  const claimed = tryClaimDir(cloneDir, opts);
+  const claimed = await claimFreshClone(cloneDir, opts);
   if (!claimed) {
-    // Freshly created unique dir already locked — should be impossible.
+    // Our own unique dir stayed busy for ~1 s — should be impossible.
     throw lastErr;
   }
   process.stderr.write(
     `[mcp-relay] base profile busy (live relay holds it) — using ephemeral session clone ${cloneDir} seeded from ${baseDir}\n`,
   );
   const role = (CONFIG.slotRoles || {})[baseDir] || "default";
-  // Ephemeral lifecycle differs from a regular slot: release() is a NO-OP.
-  // W1-6's "release the lock early in shutdown" rationale doesn't apply — no
-  // other relay ever reclaims a clone dir — and releasing early would let a
-  // sibling's gcSessionClones see a lockless dir and rm it while this
-  // clone's Brave is still closing (up to 8s). The lock is held until
-  // cleanup(), which runs AFTER closeBrave and removes the dir. Unclean
-  // deaths are covered by gcSessionClones (dead-pid lock) on the next claim.
-  function cleanup() {
-    try { claimed.release(); } catch { /* already released */ }
-    try { fs.rmSync(cloneDir, { recursive: true, force: true }); } catch { /* GC will get it */ }
-  }
-  return { dir: cloneDir, lock: claimed.lock, role, release: () => {}, cleanup, ephemeral: true, baseDir };
+  // Ephemeral lifecycle differs from a regular slot: release() is a NO-OP —
+  // no other relay ever reclaims a clone dir, and releasing early would let a
+  // sibling's GC take the dir while this clone's Brave is still closing. The
+  // flock is held until cleanup(), which runs AFTER Brave is closed.
+  return { ...claimed, role, release: () => {}, cleanup: ownedDirCleanup(cloneDir, claimed), ephemeral: true, baseDir };
+}
+
+/** Spec N4: the owner removes its clone WHILE still holding the flock fd, then
+ *  closes it. Unclean deaths are covered by GC on a later start. */
+function ownedDirCleanup(dir, claimed) {
+  let done = false;
+  return function cleanup() {
+    if (done) return;
+    done = true;
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* GC will get it */ }
+    profileLock.closeFlock(claimed.flock);
+  };
 }
 
 // ───────────────────── Attach-to-existing Brave ──────────────────────
 
-/** Extract the `--remote-debugging-port=N` value from a command line.
- *  Returns null when absent or 0 (0 = ephemeral OS-assigned port at launch;
- *  the real port isn't recoverable from the command line). */
+/** Extract a NONZERO `--remote-debugging-port=N` from a command line; null
+ *  when absent or 0. Use cdpIdentity.debugPortArg to see 0. */
 function extractDebugPort(cmd) {
-  const m = /--remote-debugging-port=(\d+)/.exec(cmd || "");
-  if (!m) return null;
-  const port = parseInt(m[1], 10);
+  const port = cdpIdentity.debugPortArg(cmd);
   return Number.isFinite(port) && port > 0 ? port : null;
 }
 
 /**
- * Find a live, CDP-reachable Brave already holding `dir` as its
- * user-data-dir — the attach candidate a new relay should connect to
- * instead of reaping. Returns { pid, port } or null.
+ * Find a live Brave already holding `dir` whose CDP endpoint is PROVEN to be
+ * that Brave (cdp-identity.js) — the attach candidate a new relay connects to
+ * instead of reaping. Returns { pid, port, wsEndpoint, legacy } or null.
  *
- * A Brave is attachable when its command line advertises a nonzero
- * `--remote-debugging-port` AND that port answers /json/version. Pipe-only
- * launches (no HTTP CDP endpoint) return null → caller reaps + relaunches.
+ *   --remote-debugging-port=0  → DevToolsActivePort + uuid identity check
+ *   --remote-debugging-port=N  → the pid itself must listen on 127.0.0.1:N
+ *                                (lsof, address-specific), ws url from /json/version
+ *   no port (pipe-only)        → not attachable → caller reaps + relaunches
  *
  * @param {string} dir
- * @param {object} [opts]
- * @param {typeof fetch} [opts._fetch] — test seam
- * @param {number} [opts.probeTimeoutMs=1000]
+ * @param {object} [opts] — seams: _platform, _spawnSync (ps), _fetch,
+ *   _listensOnLoopbackV4, probeTimeoutMs
  */
 async function findAttachableBrave(dir, opts = {}) {
   const platform = opts._platform || process.platform;
-  const doFetch = opts._fetch || fetch;
-  const probeTimeoutMs = opts.probeTimeoutMs ?? 1000;
+  const timeoutMs = opts.probeTimeoutMs ?? 1000;
   const procs = processShim.listProcessesByCommand(braveNeedle(platform), opts);
-  const mine = procs.filter((p) => commandHasUserDataDir(p.command, dir));
-  for (const p of mine) {
-    const port = extractDebugPort(p.command);
-    if (!port) continue;
+  const mains = procs.filter((p) => commandHasUserDataDir(p.command, dir) && cdpIdentity.debugPortArg(p.command) !== null);
+  for (const p of mains) {
     try {
-      const resp = await doFetch(`http://127.0.0.1:${port}/json/version`, {
-        signal: AbortSignal.timeout(probeTimeoutMs),
-      });
-      if (resp.ok) return { pid: p.pid, port };
-    } catch { /* endpoint dead — not attachable via this process */ }
+      const ep = await cdpIdentity.resolveBraveEndpoint(p, dir, { ...opts, timeoutMs });
+      if (ep) return { pid: p.pid, ...ep };
+    } catch { /* not provable — not attachable via this process */ }
   }
   return null;
+}
+
+/** pid of the live Brave MAIN process running on `dir`, or null. */
+function findBraveMainPid(dir, opts = {}) {
+  const platform = opts._platform || process.platform;
+  const procs = processShim.listProcessesByCommand(braveNeedle(platform), opts);
+  const main = procs.find((p) => commandHasUserDataDir(p.command, dir) && cdpIdentity.debugPortArg(p.command) !== null);
+  return main ? main.pid : null;
+}
+
+// ───────────────── Inspector: state probe + Reap under the flock ─────────────
+
+/** "held" | "free" | "absent" for an inspector row, by THE predicate. Never
+ *  keeps the flock. "absent" = no such dir. */
+function probeDirState(dir, opts = {}) {
+  if (!fs.existsSync(dir)) return "absent";
+  const c = profileLock.classifyDir(dir, opts);
+  if (!c.free) return "held";
+  profileLock.closeFlock(c.flock);
+  return "free";
+}
+
+/** The inspector's Reap: only when the predicate says free, and only under the
+ *  flock — reap Brave squatters, remove the stale record (owner-checked),
+ *  then release. Throws when the dir is held. */
+function reapDirUnderFlock(dir, opts = {}) {
+  const c = profileLock.classifyDir(dir, opts);
+  if (!c.free) throw new Error(`not reaping ${dir}: ${c.reason}`);
+  try {
+    const killed = (opts._reapOrphansFor || reapOrphansFor)(dir, opts);
+    profileLock.removeStaleRecord(dir, c.record);
+    return killed;
+  } finally {
+    profileLock.closeFlock(c.flock);
+  }
 }
 
 // ───────────────────────── Profile snapshot ──────────────────────────
@@ -906,12 +924,16 @@ module.exports = {
   claimSlot,
   claimSlotWithRetry,
   tryClaimDir,
-  lockHeldByLiveProcess,
   sessionClonesRoot,
   createSessionCloneDir,
+  cloneBelongsTo,
   gcSessionClones,
+  claimFreshClone,
   findAttachableBrave,
+  findBraveMainPid,
   extractDebugPort,
+  probeDirState,
+  reapDirUnderFlock,
   commandHasUserDataDir,
   findBraveProcessesForDir,
   listBraveProcessesRaw,

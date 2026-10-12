@@ -3,7 +3,7 @@
  * browser-mcp-relay entrypoint.
  *
  * Lifecycle:
- *   1. Claim a pool slot via shared helpers (atomic lock, cookie snapshot).
+ *   1. Claim a pool slot via shared helpers (kernel flock + v2 record, cookie snapshot).
  *   2. Spawn upstream `browser-devtools-mcp` as a child with piped stdio.
  *   3. Wrap that child in an UpstreamClient (JSON-RPC over stdio).
  *   4. Run a RelayServer that:
@@ -11,7 +11,8 @@
  *      - dispatches: tools/list and tools/call use the relay logic;
  *        all other messages forward to upstream verbatim.
  *      - writes responses to process.stdout (relay → Cursor).
- *   5. On signal/exit, close upstream cleanly + release pool lock.
+ *   5. On signal/exit, close upstream cleanly, close Brave, THEN release the
+ *      pool lock (record, then flock) — a peer can't claim a dying Brave.
  */
 
 const fs = require("node:fs");
@@ -31,7 +32,13 @@ const {
 const pool = require("./pool-shared.js");
 const { UpstreamClient } = require("./upstream-client.js");
 const { RelayServer } = require("./relay-server.js");
-const { launchBrave, attachBrave, closeBrave, closeBraveHard } = require("./cdp-bridge.js");
+const {
+  launchBrave, attachBrave, closeBrave, closeBraveHard, testLaunchRequested, assertTestLaunchAllowed,
+} = require("./cdp-bridge.js");
+const { UNREACHABLE_WS_ENDPOINT } = require("./cdp-identity.js");
+const profileLock = require("./profile-lock.js");
+const { installMetaGuard, installWatchdog } = require("./meta-guard.js");
+const { StatusSidecar, buildRelayStatus, modeAnnouncement, readSidecar, SIDECAR_NAME } = require("./status-sidecar.js");
 const { tools: ownTools } = require("./own-tools/index.js");
 const { applyLocalConfigToEnv } = require("./local-config.js");
 const { loadVaultFromEnv } = require("./vault.js");
@@ -89,23 +96,43 @@ function resolveBdmcpEntry() {
   }
 }
 
+// MCP `instructions` sent at connect (spec v4 §1c). No BASE/CLONE claim here:
+// the text is not reliably re-sent after a reconnect, so the live answer is
+// relay_status, and every mode change is announced in a tool result.
+const RELAY_INSTRUCTIONS =
+  "Browser profile status: call relay_status; every mode change is announced in the tool result.";
+
 async function main() {
+  // Test-only launch hook (spec v4 amendment 5): refuse to RUN — not just to
+  // launch — unless HOME is a temp dir. A leftover flag fails loudly.
+  if (testLaunchRequested(RELAY_ENV)) assertTestLaunchAllowed();
+
   // 1. Claim slot — with retry (absorbs the reconnect race where the
   //    previous relay is mid-shutdown) and session-clone fallback (a second
   //    concurrent session in the same project gets its own ephemeral
   //    profile seeded from the base instead of dying with "pool exhausted").
   const claim = await pool.claimSlotWithRetry();
   const { dir, lock, role, release: releasePool, ephemeral, baseDir } = claim;
-  // Slot index for the launch banner (and for the CDP port calc below).
+  if (testLaunchRequested(RELAY_ENV)) {
+    try { assertTestLaunchAllowed(dir); } catch (e) {
+      try { releasePool(); } catch {}
+      if (claim.cleanup) { try { claim.cleanup(); } catch {} }
+      throw e;
+    }
+  }
+  const mode = ephemeral ? (baseDir ? "clone" : "ephemeral") : "base";
+  const project = path.basename(baseDir || dir);
+  // Start sweep, this project only (spec v4 §1a): dead clones of this
+  // project's base. The clone path already swept inside claimSlotWithRetry.
+  if (!ephemeral) {
+    try { pool.gcSessionClones({ project }); } catch { /* best-effort */ }
+  }
+  // Slot index — a LABEL only (banner, registry) since spec v4 §1b: Brave
+  // gets an OS-assigned port, so the slot no longer selects one.
   // Order of preference: explicit BROWSER_RELAY_POOL_SLOT env override
   // (parsed as a positive integer), otherwise the position of the claimed
-  // dir in CONFIG.poolDirs (1-based). The override exists so users running
-  // in pool mode can pin a specific port even if their dir-list ordering
-  // changes between runs.
-  // Ephemeral clones derive their slot from the BASE dir (the clone dir is
-  // never in poolDirs — indexOf would give slot 0 → port PORT_BASE-1,
-  // outside the scan range). Same-slot port collision with the base's Brave
-  // is then resolved by the F1-21 remap in ensureBrave.
+  // dir in CONFIG.poolDirs (1-based). Ephemeral clones label themselves with
+  // the BASE dir's slot.
   const slotSourceDir = ephemeral && baseDir ? baseDir : dir;
   const computedSlotIdx = Math.max(1, pool.CONFIG.poolDirs.indexOf(slotSourceDir) + 1);
   const slotOverrideRaw = RELAY_ENV.BROWSER_RELAY_POOL_SLOT;
@@ -122,7 +149,7 @@ async function main() {
   const ageDays = cookiesPath ? pool.checkCookieAgeDays(cookiesPath) : null;
   const ageStr = ageDays === null ? "?" : `${ageDays.toFixed(1)}d`;
   process.stderr.write(
-    `[mcp-relay] slot=${slotIdx}/${totalSlots} role=${role} pid=${process.pid} cookieAge=${ageStr} dir=${dir} mode=${pool.CONFIG.standalone ? "standalone" : "pool"}${ephemeral ? " (ephemeral session clone)" : ""}\n`,
+    `[mcp-relay] slot=${slotIdx}/${totalSlots} role=${role} pid=${process.pid} cookieAge=${ageStr} dir=${dir} mode=${pool.CONFIG.standalone ? "standalone" : "pool"}${ephemeral ? (baseDir ? " (ephemeral session clone)" : " (ephemeral temp-project profile)") : ""}\n`,
   );
 
   // 2. Profile snapshot from source (skipped in standalone mode — sourceProfile is null).
@@ -175,28 +202,29 @@ async function main() {
   //    This split eliminates idle-Brave: a session that connects but never
   //    calls a tool stays at ~50MB total (1 relay node + 1 upstream node,
   //    no Brave).
-  let port = pool.PORT_BASE + slotIdx - 1; // may be remapped below if taken / attached
+  // The CURRENT Brave's verified CDP port and exact ws endpoint
+  // (ws://127.0.0.1:<port>/devtools/browser/<uuid>); null while no Brave.
+  let port = null;
+  let wsEndpoint = null;
 
   // -- Upstream lifecycle (spawned on first tools/list or tools/call) --
   let upstreamChild = null;
   let upstreamClient = null;
   let upstreamSpawnPromise = null;
-  // The CDP port baked into the CURRENT upstream child's env at spawn time.
-  // tools/list spawns upstream before Brave exists, so when ensureBrave
-  // later attaches/remaps to a different port, the upstream child must be
-  // restarted — otherwise forwarded tools connectOverCDP to whatever Brave
-  // owns the ORIGINAL port (another project's browser). See
-  // restartUpstreamIfStale().
-  let upstreamPort = null;
+  // The CDP endpoint baked into the CURRENT upstream child's env at spawn
+  // time. tools/list spawns upstream before Brave exists (with the
+  // unreachable placeholder), so the first Brave always replaces that child;
+  // see restartUpstreamIfStale().
+  let upstreamEndpoint = null;
   // Brave generation: bumped every time ensureBrave() installs a NEW Brave
   // handle (launch or attach). upstreamBraveGeneration is the value when the
   // current upstream child was spawned. BDMCP caches its browser context +
   // page for the life of the child and never rebuilds them, so a child that
   // may have attached to an older Brave is wedged on "Target page, context
   // or browser has been closed" even when the new Brave reuses the same
-  // port (field report 2026-10-06). Generation 0 = spawned before this relay
-  // had ANY Brave (tools/list at connect): it cannot have attached yet, so
-  // the first Brave adopts it instead of paying a respawn.
+  // port (field report 2026-10-06). With an OS-assigned port and a per-browser
+  // ws endpoint, the endpoint check alone catches a relaunch; the generation
+  // is kept as the second, independent signal.
   let braveGeneration = 0;
   let upstreamBraveGeneration = null;
   // Set first thing by shutdownAsync/shutdownSync. getUpstream() refuses to
@@ -229,10 +257,17 @@ async function main() {
       process.stderr.write(`[mcp-relay] F1-20 patch threw (continuing): ${e.message}\n`);
     }
     process.stderr.write(`[mcp-relay] spawning upstream child (no Brave yet, entry=${bdmcpEntry})...\n`);
-    // CDP env points at the port we'll launch Brave on. Upstream is lazy
-    // about its CDP attach (only runs in newBrowserContext on first tool
-    // execution), so it's safe to set this before Brave is up.
-    const upstreamEnv = { ...RELAY_ENV };
+    // CDP env points at the exact ws endpoint of OUR Brave (pinned to its
+    // uuid, so it can reach no other browser). Before any Brave exists it is
+    // a well-formed endpoint that cannot connect — never an empty value
+    // (BDMCP would probe 9222/9229 or launch its own browser) and never a
+    // slot port (a peer's Brave). Upstream attaches lazily, on its first
+    // tool call, so ensureBrave() replaces a placeholder child first.
+    const upstreamEnv = {};
+    for (const [k, v] of Object.entries(RELAY_ENV)) {
+      if (k.startsWith("CLAUDE_CODE_MESSAGING_")) continue; // spec v4 §1e
+      upstreamEnv[k] = v;
+    }
     delete upstreamEnv.BROWSER_PERSISTENT_USER_DATA_DIR;
     delete upstreamEnv.BROWSER_PERSISTENT_ENABLE;
     // BDMCP reads `BROWSER_CDP_ENDPOINT_URL` from process.env and assigns it
@@ -242,14 +277,18 @@ async function main() {
     // its standalone-launch path (spawning a fresh temp-profile Brave next
     // to the relay's launched Brave). Don't set ENDPOINT_EXPLICIT — BDMCP
     // derives it internally from `!!_BROWSER_CDP_ENDPOINT`.
-    upstreamEnv.BROWSER_CDP_ENDPOINT_URL = `http://127.0.0.1:${port}`;
+    const endpointForChild = wsEndpoint || UNREACHABLE_WS_ENDPOINT;
+    upstreamEnv.BROWSER_CDP_ENDPOINT_URL = endpointForChild;
+    // On a failed attach BDMCP otherwise runs `open -a "Google Chrome"
+    // chrome://inspect/...` in the user's own Chrome.
+    upstreamEnv.BROWSER_CDP_OPEN_INSPECT = "false";
 
     const child = spawn(process.execPath, [bdmcpEntry, "--cursor-mcp-server"], {
       stdio: ["pipe", "pipe", "inherit"],
       env: upstreamEnv,
     });
     upstreamChild = child;
-    upstreamPort = port;
+    upstreamEndpoint = endpointForChild;
     // Recorded as-is even when no Brave is live right now (after an idle
     // reap, or a tools/list that lands mid-relaunch): the next Brave then
     // replaces this child although it never attached — one wasted spawn,
@@ -289,27 +328,21 @@ async function main() {
 
   /**
    * Kill + forget the upstream child when it is stale for the Brave that
-   * ensureBrave() just installed: either the CDP port it was spawned with
-   * no longer matches (F1-21 remap landed after upstream spawn, or
-   * ensureBrave attached to an existing Brave), or it may have attached to
-   * a previous Brave that has since died (see braveGeneration).
-   * The next getUpstream() respawns it lazily with the correct
-   * BROWSER_CDP_ENDPOINT_URL. Synchronous: state is cleared BEFORE the kill
-   * so the child's exit handler recognizes a deliberate restart.
+   * ensureBrave() just installed: the ws endpoint it was spawned with is not
+   * this Brave's (the placeholder, a previous Brave's uuid, an attach), or it
+   * was spawned for an earlier Brave generation (BDMCP caches its browser
+   * context for the child's life). The next getUpstream() respawns it lazily
+   * with the correct BROWSER_CDP_ENDPOINT_URL. Synchronous: state is cleared
+   * BEFORE the kill so the child's exit handler recognizes a deliberate restart.
    */
   function restartUpstreamIfStale() {
     if (!upstreamChild) return;
-    const portChanged = upstreamPort !== port;
-    const braveReplaced = upstreamBraveGeneration !== 0 && upstreamBraveGeneration !== braveGeneration;
-    if (!portChanged && !braveReplaced) {
-      // Adopt: from here on this child may attach to THIS Brave, so the
-      // next relaunch must replace it.
-      upstreamBraveGeneration = braveGeneration;
-      return;
-    }
+    const endpointChanged = upstreamEndpoint !== wsEndpoint;
+    const braveReplaced = upstreamBraveGeneration !== braveGeneration;
+    if (!endpointChanged && !braveReplaced) return;
     process.stderr.write(
-      portChanged
-        ? `[mcp-relay] CDP port changed ${upstreamPort} → ${port} after Brave attach/remap; restarting upstream child so forwarded tools target OUR Brave\n`
+      endpointChanged
+        ? `[mcp-relay] CDP endpoint changed (${upstreamEndpoint === UNREACHABLE_WS_ENDPOINT ? "placeholder" : upstreamEndpoint} → ${wsEndpoint}); restarting upstream child so forwarded tools target OUR Brave\n`
         : `[mcp-relay] Brave relaunched/reattached (generation ${upstreamBraveGeneration} → ${braveGeneration}); restarting upstream child so it drops its dead browser context\n`,
     );
     const oldChild = upstreamChild;
@@ -317,7 +350,7 @@ async function main() {
     upstreamChild = null;
     upstreamClient = null;
     upstreamSpawnPromise = null;
-    upstreamPort = null;
+    upstreamEndpoint = null;
     try { if (oldClient) oldClient.close(); } catch { /* best-effort */ }
     killUpstreamTree(oldChild);
   }
@@ -343,25 +376,89 @@ async function main() {
   // -- Brave lifecycle (launched ONLY on first tools/call, NOT on tools/list) --
   let bridge = null;
   let braveLaunchPromise = null;
+  let guardReinstallPromise = null;
+  // Meta-guard and mode notices for the next tool result (RelayServer prefixes
+  // them as separate leading text items).
+  const pendingNotices = [];
+  let announcedMode = null;
+  const takeNotices = () => {
+    const out = [];
+    if (announcedMode !== mode) {
+      out.push(modeAnnouncement(mode, project));
+      announcedMode = mode;
+    }
+    out.push(...pendingNotices.splice(0));
+    return out;
+  };
+  const noteBlocked = (host) => {
+    const text = `[browser-mcp-relay] BLOCKED a Meta page (${host}) in this browser. Relay browsers never open Instagram/Facebook/Meta pages — use the Instagram/Meta Graph API, or the account owner's phone.`;
+    if (!pendingNotices.includes(text)) pendingNotices.push(text);
+  };
+
+  // Status sidecar (spec v4 §1c) — cdpPort/bravePid for external consumers.
+  const sidecar = new StatusSidecar({ dir, mode, onTick: () => checkRecordConflict() });
+
+  /** Spec v4 amendment 3: a live legacy record in a dir we hold is a
+   *  double-claim by a pre-change relay. Log it and surface it; never
+   *  overwrite it (overwriting makes both relays believe they own the dir). */
+  function checkRecordConflict() {
+    if (relayShuttingDown || !claim.meta) return;
+    let rec;
+    try { rec = profileLock.readRecord(dir); } catch { return; }
+    if (rec.kind !== "ok" || rec.meta.pid === process.pid) return;
+    if (!profileLock.recordHeld(rec).held) return;
+    const conflict = `pid ${rec.meta.pid} (${Number.isFinite(rec.meta.v) ? `v${rec.meta.v}` : "pre-change relay"}) also claims ${dir}`;
+    if (sidecar.data.conflict !== conflict) {
+      process.stderr.write(`[mcp-relay] CONFLICT: ${conflict} — not overwriting its record\n`);
+      sidecar.update({ conflict }, { force: true });
+    }
+  }
+
+  async function armMetaGuard(l) {
+    const guard = await installMetaGuard({
+      wsEndpoint: l.wsEndpoint,
+      log: (m) => process.stderr.write(`[mcp-relay] ${m}\n`),
+      onBlocked: noteBlocked,
+    });
+    l.metaGuard = guard;
+    return guard;
+  }
 
   async function ensureBrave() {
-    if (bridge) return bridge;
+    // BACKLOG "A Brave relaunched during a SIGTERM shutdown is never closed"
+    // (spec v4 amendment 4): no launch or attach once shutdown has begun.
+    if (relayShuttingDown) throw new Error("relay shutting down — not launching Brave");
+    if (bridge) {
+      // The guard's own CDP session died (Brave is still up): re-arm it before
+      // anything else runs in this browser. Fail closed if it cannot be.
+      if (bridge.metaGuard && !bridge.metaGuard.alive()) {
+        const b = bridge;
+        if (!guardReinstallPromise) {
+          process.stderr.write(`[mcp-relay] Meta guard session lost — re-arming\n`);
+          guardReinstallPromise = armMetaGuard(b).finally(() => { guardReinstallPromise = null; });
+        }
+        await guardReinstallPromise;
+      }
+      return bridge;
+    }
     if (!braveLaunchPromise) {
       braveLaunchPromise = (async () => {
         // ATTACH-FIRST (2026-07-06): if a live Brave already holds OUR
-        // profile dir with a reachable CDP endpoint (previous relay died
+        // profile dir with a PROVEN CDP endpoint (previous relay died
         // uncleanly, or an attached-mode relay disconnected on shutdown),
-        // connect to it instead of reaping it. The old reap-and-relaunch
-        // path destroyed the user's open tabs on every unclean reconnect.
+        // connect to it instead of reaping it. findAttachableBrave proves
+        // identity (DevToolsActivePort uuid, or for a legacy fixed-port Brave
+        // an address-specific lsof) — F9: never a bare port probe.
         let launched = null;
+        let attachedPid = null;
         try {
           const attachable = await pool.findAttachableBrave(dir);
           if (attachable) {
             process.stderr.write(
-              `[mcp-relay] live Brave pid=${attachable.pid} already owns ${dir} (CDP port ${attachable.port}) — attaching, tabs preserved\n`,
+              `[mcp-relay] live Brave pid=${attachable.pid} already owns ${dir} (CDP port ${attachable.port}${attachable.legacy ? ", legacy fixed port" : ""}) — attaching, tabs preserved\n`,
             );
-            launched = await attachBrave({ port: attachable.port });
-            port = attachable.port;
+            launched = await attachBrave({ wsEndpoint: attachable.wsEndpoint, port: attachable.port });
+            attachedPid = attachable.pid;
           }
         } catch (e) {
           process.stderr.write(`[mcp-relay] attach to existing Brave failed (${e.message}); falling back to reap + launch\n`);
@@ -384,47 +481,10 @@ async function main() {
             throw e;
           }
         }
-        // F1-21 (2026-06-29): port-collision guard. The slot→port map
-        // (PORT_BASE+slot-1) is shared by BOTH legacy pool relays AND the
-        // per-project isolated-profile wrapper (which sets
-        // BROWSER_RELAY_POOL_SLOT). Two relays assigned the same slot number —
-        // e.g. a legacy pool slot-1 Brave and an isolated profile mapped to
-        // slot 1 — race for the same CDP port. The loser's Brave launches
-        // pipe-only (no HTTP CDP endpoint), so anything that discovers Brave by
-        // scanning the PORT_BASE..PORT_SCAN_END HTTP ports (ghl-jwt.mjs JWT
-        // capture, tab enumeration) attaches to the WRONG Brave. Our own
-        // user-data-dir differs from the squatter's, so launchPersistentContext
-        // itself succeeds — the collision is silent. Probe our assigned port; if
-        // another Brave already owns it, walk to the first FREE port in the
-        // scan range. ghl-jwt scans the whole range and picks by JWT-location
-        // match, own-tools read globalThis.__relayBridge.port, and
-        // restartUpstreamIfStale() re-points the upstream child, so any
-        // free in-range port works for every consumer. Ephemeral session
-        // clones inherit their base slot's port and rely on this remap to
-        // land on a free one.
-        const cdpBound = async (p) => {
-          try {
-            const r = await fetch(`http://127.0.0.1:${p}/json/version`, { signal: AbortSignal.timeout(400) });
-            return r.ok;
-          } catch { return false; }
-        };
-        if (await cdpBound(port)) {
-          let freePort = null;
-          for (let p = pool.PORT_BASE; p <= pool.PORT_SCAN_END; p++) {
-            if (p === port) continue;
-            if (!(await cdpBound(p))) { freePort = p; break; }
-          }
-          if (freePort) {
-            process.stderr.write(`[mcp-relay] CDP port ${port} already owned by another relay; remapping this session to free port ${freePort}\n`);
-            port = freePort;
-          } else {
-            process.stderr.write(`[mcp-relay] WARN CDP port ${port} taken and no free port in ${pool.PORT_BASE}..${pool.PORT_SCAN_END}; launch may be pipe-only\n`);
-          }
-        }
-        process.stderr.write(`[mcp-relay] launching Brave (port=${port}, exe=${bravePath})...\n`);
+        process.stderr.write(`[mcp-relay] launching Brave (port=auto, exe=${bravePath})...\n`);
         // F1-16 (2026-05-10): pre-launch reap of any orphan Brave squatting
         // on our user-data-dir. Since the attach-first probe above came up
-        // empty, anything still holding the dir is pipe-only / CDP-dead —
+        // empty, anything still holding the dir is pipe-only or unprovable —
         // not attachable, and its SingletonLock would fail our launch with
         // "user data dir already in use". Reap it.
         // The reap is idempotent and cheap (one tasklist + targeted
@@ -454,26 +514,52 @@ async function main() {
         // configured proxy but the relay's launched Brave didn't.
         launched = await launchBrave({
           userDataDir: dir,
-          port,
           headless: RELAY_ENV.BROWSER_HEADLESS_ENABLE === "true",
           extensionPath,
           executablePath: bravePath,
           proxyUrl: RELAY_ENV.BROWSER_RELAY_PROXY_URL || pool.CONFIG.proxyUrl || null,
         });
         }
+        // Shutdown began while we were launching/attaching: this Brave would
+        // never be closed (shutdown captured `bridge` before it existed).
+        // Close it here — a launched one is closed, an attached one only
+        // disconnected — and refuse.
+        if (relayShuttingDown) {
+          process.stderr.write(`[mcp-relay] shutdown began during Brave ${launched.attached ? "attach" : "launch"} — closing it\n`);
+          if (launched.attached) await closeBrave(launched);
+          else if (claim.cleanup) await closeBraveHard(launched);
+          else await closeBrave(launched);
+          throw new Error("relay shutting down — Brave closed");
+        }
         return await attachWithCleanupOnError(launched, async (l) => {
-          process.stderr.write(`[mcp-relay] Brave ready (cdpConnectUrl=${l.cdpConnectUrl}${l.attached ? ", attached to existing" : ""})\n`);
+          process.stderr.write(`[mcp-relay] Brave ready (port=${l.port}, ws=${l.wsEndpoint}${l.attached ? ", attached to existing" : ""})\n`);
           // Attach autofill listeners to the launched context. Pages BDMCP
           // creates via CDP attach share this context, so the framenavigated
           // event fires for them too — autofill works for both relay-driven
           // and BDMCP-driven navigations. No-op when the vault is empty.
           attachAutofill(l.context, vault, (msg) => process.stderr.write(msg + "\n"));
+          // Meta guard, layers 2 + 3 — for EVERY Brave generation, attached
+          // ones included. Fail closed: no guard, no browser.
+          const guard = await armMetaGuard(l);
+          installWatchdog(l.context, {
+            recentlyBlocked: (url) => !!(l.metaGuard && l.metaGuard.recentlyBlocked(url)),
+            onBlocked: noteBlocked,
+            log: (m) => process.stderr.write(`[mcp-relay] ${m}\n`),
+          });
+          void guard;
           // Make the bridge available to own-tool handlers via globalThis.
-          // Shape: { context, cdpConnectUrl, port } — Phase C tool handlers
-          // read globalThis.__relayBridge to drive CDP operations.
-          globalThis.__relayBridge = { ...l, port };
+          // Shape: { context, cdpConnectUrl, port, wsEndpoint } — tool
+          // handlers (lighthouse_audit: port) read globalThis.__relayBridge.
+          globalThis.__relayBridge = { ...l, port: l.port };
           bridge = l;
+          port = l.port;
+          wsEndpoint = l.wsEndpoint;
           braveGeneration++;
+          sidecar.update({
+            braveAlive: true,
+            cdpPort: l.port,
+            bravePid: attachedPid || pool.findBraveMainPid(dir),
+          }, { force: true });
           // V1-5 (2026-06-01): invalidate the cached `bridge` when the
           // underlying Brave context/process dies. Without this listener, a
           // crashed/force-quit Brave leaves `bridge` pointing at a dead
@@ -488,11 +574,7 @@ async function main() {
             process.stderr.write(
               `[mcp-relay] Brave context invalidated (${reason}); next ensureBrave() will relaunch\n`,
             );
-            bridge = null;
-            braveLaunchPromise = null;
-            if (globalThis.__relayBridge && globalThis.__relayBridge.context === l.context) {
-              globalThis.__relayBridge = null;
-            }
+            forgetBrave(l);
           };
           l.context.on("close", () => invalidateBridge("context closed"));
           try {
@@ -504,10 +586,9 @@ async function main() {
           } catch (e) {
             process.stderr.write(`[mcp-relay] could not attach browser.disconnected listener: ${e.message}\n`);
           }
-          // The port Brave actually landed on may differ from the port the
-          // upstream child was spawned with (F1-21 remap, attach), or this
-          // may be a relaunch after the previous Brave died. Restart
-          // upstream if so — forwarded tools must target OUR live Brave.
+          // The endpoint the upstream child was spawned with is the
+          // placeholder (first Brave), a previous Brave's, or an attach
+          // target's: restart it so forwarded tools reach OUR live Brave.
           restartUpstreamIfStale();
           return bridge;
         });
@@ -517,6 +598,21 @@ async function main() {
       });
     }
     return await braveLaunchPromise;
+  }
+
+  /** Drop every reference to Brave handle `l` (it is closing or dead). */
+  function forgetBrave(l) {
+    if (bridge === l) {
+      bridge = null;
+      braveLaunchPromise = null;
+      port = null;
+      wsEndpoint = null;
+    }
+    if (globalThis.__relayBridge && globalThis.__relayBridge.context === l.context) {
+      globalThis.__relayBridge = null;
+    }
+    if (l.metaGuard) { try { l.metaGuard.close(); } catch {} }
+    sidecar.update({ braveAlive: false, cdpPort: null, bravePid: null }, { force: true });
   }
 
   // -- Idle reaper (2026-07-16) --------------------------------------------
@@ -548,7 +644,7 @@ async function main() {
     upstreamChild = null;
     upstreamClient = null;
     upstreamSpawnPromise = null;
-    upstreamPort = null;
+    upstreamEndpoint = null;
     try { if (oldClient) oldClient.close(); } catch { /* best-effort */ }
     killUpstreamTree(oldChild);
   }
@@ -556,11 +652,7 @@ async function main() {
   async function idleReapBrave() {
     if (!bridge) return;
     const b = bridge;
-    bridge = null;
-    braveLaunchPromise = null;
-    if (globalThis.__relayBridge && globalThis.__relayBridge.context === b.context) {
-      globalThis.__relayBridge = null;
-    }
+    forgetBrave(b);
     await closeBraveHard(b);
   }
 
@@ -612,8 +704,27 @@ async function main() {
   // upstream's existing page via its own forwarded tools.
   globalThis.__relayUpstream = getUpstream;
 
+  // relay_status's payload (own-tools/relay-status.js). Reads records and
+  // sidecars only — never launches Brave or claims anything.
+  globalThis.__relayStatus = async () => (checkRecordConflict(), buildRelayStatus({
+    self: {
+      sessionId: sidecar.data.sessionId,
+      braveAlive: !!bridge,
+      cdpPort: port,
+      bravePid: sidecar.data.bravePid,
+      conflict: sidecar.data.conflict || null,
+    },
+    dir,
+    baseDir,
+    mode,
+    clonesRoot: pool.sessionClonesRoot(),
+    cloneBelongsTo: pool.cloneBelongsTo,
+    metaGuard: bridge ? (bridge.metaGuard && bridge.metaGuard.alive() ? "active" : "down (re-armed on the next browser call)") : "not installed yet (no Brave)",
+  }));
+  sidecar.start();
+
   // 4. Run MCP server (NO Brave, NO upstream yet — both spawn lazily).
-  const relay = new RelayServer({ getUpstream, ensureBrave });
+  const relay = new RelayServer({ getUpstream, ensureBrave, takeNotices });
   // Register Phase C own-tools. Each entry in ownTools is
   // { name, description, inputSchema, handler }.
   for (const tool of ownTools) {
@@ -661,7 +772,7 @@ async function main() {
 
   const server = new Server(
     { name: "browser-mcp-relay", version: "0.1.0" },
-    { capabilities: { tools: {} } },
+    { capabilities: { tools: {} }, instructions: RELAY_INSTRUCTIONS },
   );
   // bumpActivity on entry AND exit of every request so a long-running call
   // (lighthouse can take minutes) never has the reaper fire mid-flight or
@@ -673,6 +784,7 @@ async function main() {
   });
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     bumpActivity();
+    sidecar.update({ lastToolCallAt: new Date().toISOString() });
     inFlightRequests++;
     try { return await relay.handleToolsCall(req.params); } finally { inFlightRequests--; bumpActivity(); }
   });
@@ -733,37 +845,59 @@ async function main() {
     });
   }
 
+  /** Release the claim. Base: owner-checked record unlink, THEN the flock fd.
+   *  Clone / temp profile: rm -rf the dir while still holding the fd, then
+   *  close it (pool-shared ownedDirCleanup). */
+  function releaseClaim() {
+    try { sidecar.remove(); } catch {}
+    try { releasePool(); } catch {}
+    if (claim.cleanup) { try { claim.cleanup(); } catch { /* GC will get it */ } }
+  }
+
   function shutdownSync() {
-    // Only path here is process.on("exit") — no async, no awaits.
+    // Only path here is process.on("exit") — no async, no awaits. Brave's
+    // close is fired and forgotten; the kernel releases the flock on exit
+    // anyway, so the record is all there is to tidy (spec v4 amendment 4:
+    // on this path the release can precede Brave's exit).
     if (shutdownDone) return;
     shutdownDone = true;
     relayShuttingDown = true;
-    try { releasePool(); } catch {}
     if (upstreamClient) { try { upstreamClient.close(); } catch {} }
     killUpstreamTree();
-    if (bridge) { closeBrave(bridge).catch(() => {}); }
+    if (bridge) { (claim.cleanup ? closeBraveHard(bridge) : closeBrave(bridge)).catch(() => {}); }
     if (inspectorHandle) { inspectorHandle.close().catch(() => {}); }
-    // Ephemeral clone dir removal is best-effort here (Brave may still be
-    // mid-close and recreate files); gcSessionClones reclaims leftovers.
-    if (claim.cleanup) { try { claim.cleanup(); } catch {} }
+    releaseClaim();
   }
 
   function shutdownAsync() {
     if (shutdownPromise) return shutdownPromise;
     relayShuttingDown = true;
     shutdownPromise = (async () => {
-      // W1-6: release the pool lock FIRST so a second Ctrl-C (which
-      // process.exit's mid-await) leaves the slot reclaimable by the next
-      // relay.
-      try { releasePool(); } catch {}
+      // Spec v4 §1a (r2 N6): close Brave FIRST, release LAST. The old order
+      // (W1-6: release first "so a second Ctrl-C leaves the slot reclaimable")
+      // let a peer claim the base while our Brave was still closing and then
+      // attach to it or SIGKILL it. The kernel now releases the flock if we
+      // die mid-shutdown, so W1-6's reason is gone.
       if (upstreamClient) { try { upstreamClient.close(); } catch {} }
       // G0-3: kill the upstream tree, not just the parent PID.
       killUpstreamTree();
+      // A launch/attach already in flight finishes first; ensureBrave's
+      // post-launch check then closes that Brave (relayShuttingDown is set).
+      if (braveLaunchPromise) {
+        await withTimeout(braveLaunchPromise, 8000, "in-flight Brave launch");
+      }
       // G1-2: run Brave-close and inspector-close in PARALLEL with per-step
       // timeouts. Sequential await previously meant a hung Brave (30s) +
       // hung inspector (5s) = 35s shutdown wall time.
+      // Clones close HARD (an attached clone Brave would otherwise survive
+      // and have its dir rm -rf'd under it); a base's attached Brave is only
+      // disconnected, deliberately, so the next relay inherits its tabs.
       const tasks = [];
-      if (bridge) tasks.push(withTimeout(closeBrave(bridge), 8000, "closeBrave"));
+      if (bridge) {
+        const b = bridge;
+        tasks.push(withTimeout(claim.cleanup ? closeBraveHard(b) : closeBrave(b), 8000, "closeBrave"));
+        if (b.metaGuard) { try { b.metaGuard.close(); } catch {} }
+      }
       if (inspectorHandle) tasks.push(withTimeout(inspectorHandle.close(), 3000, "inspector"));
       const results = await Promise.all(tasks);
       for (const r of results) {
@@ -771,10 +905,10 @@ async function main() {
           process.stderr.write(`[mcp-relay] shutdown ${r.label} timed out — proceeding\n`);
         }
       }
-      // Now that Brave is closed (or timed out), remove the ephemeral clone
-      // dir. Doing this before closeBrave would race Brave recreating files
-      // inside the dir, leaving a half-deleted husk for GC to find.
-      if (claim.cleanup) { try { claim.cleanup(); } catch { /* GC will get it */ } }
+      // Now that Brave is closed (or timed out): release. For a clone this
+      // removes the dir — before closeBrave it would race Brave recreating
+      // files inside it.
+      releaseClaim();
       shutdownDone = true;
     })();
     return shutdownPromise;

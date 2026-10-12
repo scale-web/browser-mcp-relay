@@ -83,38 +83,41 @@ test("getPidStartTime returns null for a dead/invalid pid", () => {
   assert.strictEqual(processShim.getPidStartTime(2 ** 30), null);
 });
 
-// ───── lockHeldByLiveProcess ─────
+// ───── record predicate (was lockHeldByLiveProcess) ─────
+// Spec v4 §1a replaced the pidStartTime string compare (local time in an
+// unknown zone — H2's bug) with a TZ-free rule; these pin the new one. The
+// full matrix lives in test/profile-lock.test.js.
+const profileLock = require("../src/profile-lock.js");
 
-test("lockHeldByLiveProcess: dead pid → false, unparseable → false", () => {
+function recordIn(dir, meta) {
+  fs.writeFileSync(path.join(dir, ".mcp-wrapper-lock"), typeof meta === "string" ? meta : JSON.stringify(meta));
+  return profileLock.readRecord(dir);
+}
+
+test("record predicate: dead pid → not held; unparseable → held only while younger than 10 s", () => {
   const dir = tmpdir("relay-lock-");
-  const lockPath = path.join(dir, ".mcp-wrapper-lock");
-  fs.writeFileSync(lockPath, JSON.stringify({ pid: 2 ** 30 }));
-  assert.strictEqual(pool.lockHeldByLiveProcess(lockPath), false);
-  fs.writeFileSync(lockPath, "{not json");
-  assert.strictEqual(pool.lockHeldByLiveProcess(lockPath), false);
+  assert.strictEqual(profileLock.recordHeld(recordIn(dir, { pid: 2 ** 30 })).held, false);
+  const rec = recordIn(dir, "{not json");
+  assert.strictEqual(profileLock.recordHeld(rec).held, true, "young unparseable → a writer may be mid-write");
+  assert.strictEqual(profileLock.recordHeld(rec, { _now: Date.now() + 11_000 }).held, false);
 });
 
-test("lockHeldByLiveProcess: live pid with matching (or absent) start time → true", () => {
+test("record predicate: live legacy holder → held; a legacy record older than its pid's start → recycled", () => {
   const dir = tmpdir("relay-lock-");
-  const lockPath = path.join(dir, ".mcp-wrapper-lock");
-  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid }));
-  assert.strictEqual(pool.lockHeldByLiveProcess(lockPath), true, "no recorded start time → pid-alive rules");
-  const real = processShim.getPidStartTime(process.pid);
-  if (real) {
-    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, pidStartTime: real }));
-    assert.strictEqual(pool.lockHeldByLiveProcess(lockPath), true, "matching start time → live");
-  }
+  const startedAt = new Date().toISOString(); // this process started before now
+  assert.strictEqual(profileLock.recordHeld(recordIn(dir, { pid: process.pid, startedAt })).held, true);
+  const before = new Date(Date.now() - 365 * 24 * 3600 * 1000).toISOString();
+  assert.strictEqual(profileLock.recordHeld(recordIn(dir, { pid: process.pid, startedAt: before })).held, false,
+    "a record written a year before this pid started belongs to a dead owner whose pid was recycled");
 });
 
-test("lockHeldByLiveProcess: live pid with MISMATCHED start time → false (pid reuse)", (t) => {
+test("record predicate: a legacy pidStartTime from ANOTHER time zone no longer reads as recycled", (t) => {
   if (process.platform === "win32") return t.skip("relies on POSIX lstart probe");
-  const real = processShim.getPidStartTime(process.pid);
-  if (!real) return t.skip("start-time probe unavailable");
   const dir = tmpdir("relay-lock-");
-  const lockPath = path.join(dir, ".mcp-wrapper-lock");
-  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, pidStartTime: "Thu Jan  1 00:00:00 1970" }));
-  assert.strictEqual(pool.lockHeldByLiveProcess(lockPath), false,
-    "same pid but different start time must be treated as a recycled pid");
+  // The H2 case: pidStartTime written in a different TZ never equals ps's
+  // current-TZ string. The old rule called this live holder "recycled".
+  const rec = recordIn(dir, { pid: process.pid, startedAt: new Date().toISOString(), pidStartTime: "Thu Jan  1 00:00:00 1970" });
+  assert.strictEqual(profileLock.recordHeld(rec).held, true);
 });
 
 // ───── tryClaimDir ─────
@@ -126,7 +129,9 @@ test("tryClaimDir claims a fresh dir, blocks a second claim, release frees it", 
   assert.strictEqual(first.dir, dir);
   const meta = JSON.parse(fs.readFileSync(first.lock.path, "utf8"));
   assert.strictEqual(meta.pid, process.pid);
-  assert.ok("pidStartTime" in meta, "lock must record pidStartTime for pid-reuse detection");
+  assert.strictEqual(meta.v, 2, "v2 record (spec v4 §1a)");
+  assert.ok(Number.isFinite(meta.pidStartEpoch), "record carries pidStartEpoch for pid-reuse detection");
+  assert.ok(!("pidStartTime" in meta), "no pidStartTime: its local-time string was the TZ bug");
 
   assert.strictEqual(pool.tryClaimDir(dir), null, "second claim must return null while lock held");
 
@@ -230,16 +235,25 @@ test("claimSlotWithRetry with allowClone=false rethrows POOL_BUSY after retries"
 
 // ───── gcSessionClones ─────
 
+function backdate(dir, ms = 120_000) {
+  const t = (Date.now() - ms) / 1000;
+  fs.utimesSync(dir, t, t);
+}
+
 test("gcSessionClones removes dead-owner clones, keeps live ones and young lockless ones", () => {
   const root = tmpdir("relay-gc-");
 
+  // Spec v4 §1a: EVERY clone younger than the grace is skipped (its age is
+  // read before its flock is opened), so the dead and live ones are aged.
   const dead = path.join(root, "proj-p999999-aaa");
   fs.mkdirSync(dead, { recursive: true });
   fs.writeFileSync(path.join(dead, ".mcp-wrapper-lock"), JSON.stringify({ pid: 2 ** 30 }));
+  backdate(dead);
 
   const live = path.join(root, "proj-p1-bbb");
   fs.mkdirSync(live, { recursive: true });
-  fs.writeFileSync(path.join(live, ".mcp-wrapper-lock"), JSON.stringify({ pid: process.pid }));
+  fs.writeFileSync(path.join(live, ".mcp-wrapper-lock"), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+  backdate(live);
 
   const young = path.join(root, "proj-p2-ccc"); // no lock yet — mid-creation
   fs.mkdirSync(young, { recursive: true });
@@ -251,6 +265,7 @@ test("gcSessionClones removes dead-owner clones, keeps live ones and young lockl
   assert.ok(fs.existsSync(young), "young lockless dir must survive the grace period");
 
   // With grace 0, the lockless dir is treated as leftover junk.
+  backdate(young, 1000);
   const removed2 = pool.gcSessionClones({ root, graceMs: 0 });
   assert.strictEqual(removed2, 1);
   assert.ok(!fs.existsSync(young));
@@ -262,6 +277,7 @@ test("gcSessionClones keeps a dead-lock clone while a live Brave still holds it"
   const dir = path.join(root, "proj-p888888-ddd");
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, ".mcp-wrapper-lock"), JSON.stringify({ pid: 2 ** 30 })); // owner dead
+  backdate(dir);
   const removed = pool.gcSessionClones({
     root,
     _platform: "darwin",
@@ -282,18 +298,30 @@ function fakePs(lines) {
   return () => ({ status: 0, stdout: "  PID COMMAND\n" + lines.join("\n") + "\n" });
 }
 
-test("findAttachableBrave returns {pid, port} for a CDP-reachable Brave on our dir", async () => {
+test("findAttachableBrave: a legacy fixed-port Brave that itself listens on 127.0.0.1:N is attachable via its ws url", async () => {
+  const uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
   const result = await pool.findAttachableBrave("/pool/slot-1", {
     _platform: "darwin",
     _spawnSync: fakePs([
       "  100 /Applications/Brave.app/brave --user-data-dir=/pool/slot-1 --remote-debugging-port=9341 --flag",
     ]),
+    _listensOnLoopbackV4: (pid, port) => pid === 100 && port === 9341,
     _fetch: async (url) => {
-      assert.ok(url.includes(":9341/json/version"));
-      return { ok: true };
+      assert.ok(url.includes("127.0.0.1:9341/json/version"));
+      return { ok: true, json: async () => ({ webSocketDebuggerUrl: `ws://127.0.0.1:9341/devtools/browser/${uuid}` }) };
     },
   });
-  assert.deepStrictEqual(result, { pid: 100, port: 9341 });
+  assert.deepStrictEqual(result, { pid: 100, port: 9341, wsEndpoint: `ws://127.0.0.1:9341/devtools/browser/${uuid}`, legacy: true });
+});
+
+test("findAttachableBrave: a legacy Brave that does NOT itself listen on 127.0.0.1:N is not attachable (F9)", async () => {
+  const result = await pool.findAttachableBrave("/pool/slot-1", {
+    _platform: "darwin",
+    _spawnSync: fakePs(["  100 brave --user-data-dir=/pool/slot-1 --remote-debugging-port=9341"]),
+    _listensOnLoopbackV4: () => false, // e.g. it fell back to [::1]:9341
+    _fetch: async () => ({ ok: true, json: async () => ({ webSocketDebuggerUrl: "ws://127.0.0.1:9341/devtools/browser/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" }) }),
+  });
+  assert.strictEqual(result, null);
 });
 
 test("findAttachableBrave ignores pipe-only Braves (no debug port) and other dirs", async () => {
@@ -304,7 +332,8 @@ test("findAttachableBrave ignores pipe-only Braves (no debug port) and other dir
       "  101 brave --user-data-dir=/pool/slot-2 --remote-debugging-port=9342", // wrong dir
       "  102 brave --user-data-dir=/pool/slot-1-x --remote-debugging-port=9343", // prefix trap
     ]),
-    _fetch: async () => ({ ok: true }),
+    _listensOnLoopbackV4: () => true,
+    _fetch: async () => ({ ok: true, json: async () => ({ webSocketDebuggerUrl: "ws://127.0.0.1:9342/devtools/browser/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" }) }),
   });
   assert.strictEqual(result, null);
 });
@@ -315,6 +344,7 @@ test("findAttachableBrave returns null when the CDP probe fails", async () => {
     _spawnSync: fakePs([
       "  100 brave --user-data-dir=/pool/slot-1 --remote-debugging-port=9341",
     ]),
+    _listensOnLoopbackV4: () => true,
     _fetch: async () => { throw new Error("ECONNREFUSED"); },
   });
   assert.strictEqual(result, null);
@@ -368,11 +398,11 @@ test("ensureBrave probes findAttachableBrave BEFORE the reap+launch path", () =>
   assert.ok(attachIdx < reapIdx, "attach probe must run before the reap");
 });
 
-test("index.js restarts upstream when the CDP port changes after spawn (or Brave is replaced)", () => {
+test("index.js restarts upstream when the CDP endpoint changes after spawn (or Brave is replaced)", () => {
   const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
   assert.ok(/function\s+restartUpstreamIfStale\s*\(/.test(src));
   assert.ok(/restartUpstreamIfStale\(\);/.test(src), "ensureBrave must invoke the restart check");
-  assert.ok(/upstreamPort\s*=\s*port/.test(src), "spawnUpstream must record the port it was spawned with");
+  assert.ok(/upstreamEndpoint\s*=\s*endpointForChild/.test(src), "spawnUpstream must record the endpoint it was spawned with");
 });
 
 test("index.js claims via claimSlotWithRetry (retry + clone fallback), not bare claimSlot", () => {

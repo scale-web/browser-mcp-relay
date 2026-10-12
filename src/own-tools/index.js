@@ -1,11 +1,12 @@
 // own-tools/index.js — registry of all relay-owned tools (Phase C).
 // Each tool module exports an object with shape:
-//   { name, description, inputSchema, handler }
+//   { name, description, inputSchema, handler, needsBrave? }
+// needsBrave: false skips RelayServer's ensureBrave() (relay_status).
 // where handler is async (args) => mcpToolResult.
 //
 // Handlers access the shared Brave instance via globalThis.__relayBridge,
 // which is populated by index.js after launchBrave() succeeds:
-//   globalThis.__relayBridge = { context, cdpConnectUrl, port }
+//   globalThis.__relayBridge = { context, cdpConnectUrl, port, wsEndpoint }
 //
 // Naming: matches upstream's verb_action style. Collision with upstream is
 // detected at RelayServer.handleToolsList time (collisions throw on launch).
@@ -32,6 +33,8 @@ const tools = [
   require("./storage-get-local.js"),
   require("./storage-set-local.js"),
   require("./storage-clear-local.js"),
+  // Which profile (BASE / CLONE) this session drives. Never launches Brave.
+  require("./relay-status.js"),
 ];
 
 module.exports = { tools };

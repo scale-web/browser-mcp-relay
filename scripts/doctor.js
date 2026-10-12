@@ -36,7 +36,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 const processShim = require("../src/process-shim.js");
-const pool = require("../src/pool-shared.js");
+const cdpIdentity = require("../src/cdp-identity.js");
 
 const RELAY_DIR_MARKERS = [
   path.join(os.homedir(), "Library", "Caches", "browser-mcp-relay"),
@@ -67,14 +67,18 @@ function isRelayDir(dir) {
   return !!dir && RELAY_DIR_MARKERS.some((marker) => dir.startsWith(marker));
 }
 
-async function closeViaCdp(cmd) {
-  const port = pool.extractDebugPort(cmd);
-  if (!port) return false;
+/** Graceful Browser.close — only to an endpoint PROVEN to be this Brave
+ *  (spec v4 amendment 8, the attach-first identity checks): a port-0 Brave's
+ *  DevToolsActivePort uuid must match /json/version; a legacy fixed-port
+ *  Brave must itself listen on 127.0.0.1:<port>. Before this, a Brave that
+ *  had fallen back to [::1] (F9) made --reap-orphans send Browser.close to
+ *  ANOTHER lane's live Brave on 127.0.0.1:<port>. Unprovable → false, and
+ *  the caller falls back to SIGTERM on the right pid. */
+async function closeViaCdp(proc, dir, opts = {}) {
   try {
-    const ver = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1500) });
-    if (!ver.ok) return false;
-    const { webSocketDebuggerUrl } = await ver.json();
-    if (!webSocketDebuggerUrl) return false;
+    const ep = await cdpIdentity.resolveBraveEndpoint(proc, dir, { timeoutMs: 1500, ...opts });
+    if (!ep) return false;
+    const webSocketDebuggerUrl = ep.wsEndpoint;
     const { WebSocket } = require("ws");
     await new Promise((resolve, reject) => {
       const socket = new WebSocket(webSocketDebuggerUrl);
@@ -121,7 +125,7 @@ async function main() {
 
     const shouldClose = mode === "close-braves" || (mode === "reap-orphans" && orphan);
     if (!shouldClose) continue;
-    const graceful = await closeViaCdp(root.command);
+    const graceful = await closeViaCdp(root, dir);
     if (!graceful) {
       try { process.kill(root.pid, "SIGTERM"); } catch { /* already gone */ }
     }
@@ -144,4 +148,8 @@ async function main() {
   }
 }
 
-main().catch((e) => { console.error("doctor failed:", e.message); process.exit(1); });
+if (require.main === module) {
+  main().catch((e) => { console.error("doctor failed:", e.message); process.exit(1); });
+}
+
+module.exports = { closeViaCdp, userDataDir };

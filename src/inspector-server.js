@@ -29,6 +29,7 @@ const path = require("node:path");
 const { WebSocketServer } = require("ws");
 
 const pool = require("./pool-shared.js");
+const profileLock = require("./profile-lock.js");
 const { loadVaultFromEnv } = require("./vault.js");
 const { tools: ownTools } = require("./own-tools/index.js");
 const { detectBraveProfileDir } = require("./detect-browser.js");
@@ -131,6 +132,14 @@ function buildStatus(seams = {}) {
   const _startedAt = seams._startedAt || moduleStartedAt;
   const _ownTools = seams._ownTools || ownTools;
   const _env = seams._env || process.env;
+  // THE predicate (profile-lock.js, spec v4 §1a/N12): "held" when a live relay
+  // holds the dir's flock or a live holder owns its record; "free" otherwise;
+  // "absent" when the dir does not exist (then the record alone decides).
+  const _probeDir = seams._probeDir || ((dir) => pool.probeDirState(dir));
+  const _recordHeld = seams._recordHeld || ((meta, lockPath) => {
+    try { return profileLock.recordHeld({ kind: "ok", meta, mtimeMs: _statFile(lockPath).mtimeMs }, { _isPidAlive }).held; }
+    catch { return !!_isPidAlive(meta.pid); }
+  });
 
   const cfg = _loadConfig();
   const braveProcessText = _listBraveProcessesRaw();
@@ -142,6 +151,7 @@ function buildStatus(seams = {}) {
     let lockHeldMs = null;
     let state = "idle";
     let lockExists = false;
+    let recordIsHeld = false;
 
     try {
       lockExists = _existsFile(lockPath);
@@ -155,6 +165,7 @@ function buildStatus(seams = {}) {
         if (meta && Number.isFinite(meta.pid)) {
           pid = meta.pid;
           pidAlive = !!_isPidAlive(meta.pid);
+          recordIsHeld = pidAlive && _recordHeld(meta, lockPath);
         }
         if (meta && meta.startedAt) {
           const started = Date.parse(meta.startedAt);
@@ -174,12 +185,14 @@ function buildStatus(seams = {}) {
     const bravePids = _findBraveProcessesForDir(braveProcessText, dir);
     const liveBravePids = bravePids.filter((p) => _isPidAlive(p));
 
-    if (lockExists && pidAlive && liveBravePids.length > 0) {
+    // "orphan" = the predicate says FREE while a record remains — never
+    // pid-alive alone. A held flock is "claimed" whatever the record says.
+    let probe = "absent";
+    try { probe = _probeDir(dir); } catch { probe = "absent"; }
+    if (probe === "held") {
       state = "claimed";
-    } else if (lockExists && pidAlive === false) {
-      state = "orphan";
-    } else if (lockExists && liveBravePids.length === 0) {
-      state = pidAlive ? "claimed" : "orphan";
+    } else if (lockExists) {
+      state = probe === "free" || !recordIsHeld ? "orphan" : "claimed";
     } else {
       state = "idle";
     }
@@ -662,13 +675,10 @@ function makeHandler({ uiRoot, seams = {}, getSlotDetail, allowedOrigins, mutato
           res.end(JSON.stringify({ ok: false, reaped: false, message: "slot dir unresolved" }));
           return;
         }
-        const reapFn = _mutators.reapSlot || ((dir) => {
-          // Reap brave processes + clear the stale lock file.
-          const killed = pool.reapOrphansFor(dir);
-          const lockPath = path.join(dir, ".mcp-wrapper-lock");
-          try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
-          return killed;
-        });
+        // Reap only under the dir's flock and only when THE predicate says
+        // free (pool.reapDirUnderFlock throws otherwise): Brave squatters,
+        // then the stale record (owner-checked), then the flock is released.
+        const reapFn = _mutators.reapSlot || ((dir) => pool.reapDirUnderFlock(dir));
         // G0-8 (2026-05-10): cap the reap operation at 10s. taskkill /F /T
         // is normally fast but a wedged kernel handle (rare; happens when
         // a target process is stuck in an uninterruptible kernel wait) can

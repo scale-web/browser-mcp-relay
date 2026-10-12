@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen.svg)](#)
 [![Tests](https://img.shields.io/badge/tests-436%20passing-brightgreen.svg)](#)
-[![Tools](https://img.shields.io/badge/tools-70%20%2851%20forwarded%20%2B%2019%20own%29-blue.svg)](docs/REFERENCE.md#tool-catalog)
+[![Tools](https://img.shields.io/badge/tools-71%20%2851%20forwarded%20%2B%2020%20own%29-blue.svg)](docs/REFERENCE.md#tool-catalog)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-informational.svg)](docs/REFERENCE.md#platform-support)
 
 </div>
@@ -20,7 +20,7 @@
 
 When you ask Claude or Cursor to *"check what's on this page"*, *"fill out this form"*, or *"run Lighthouse on production"* — your AI doesn't actually have a browser. It needs a tool that drives one.
 
-`browser-mcp-relay` is that tool. It launches a real Brave browser on your computer, listens for instructions from your AI via the [Model Context Protocol](https://modelcontextprotocol.io/), and turns them into actual browser actions. Your AI gets **70 commands** ("tools") it can call; the relay does the work behind the scenes.
+`browser-mcp-relay` is that tool. It launches a real Brave browser on your computer, listens for instructions from your AI via the [Model Context Protocol](https://modelcontextprotocol.io/), and turns them into actual browser actions. Your AI gets **71 commands** ("tools") it can call; the relay does the work behind the scenes.
 
 ## What you can ask your AI to do
 
@@ -61,7 +61,7 @@ To re-verify anytime:
 
 ```bash
 npm run smoke
-# → ✓ Relay healthy. 70 tools available (≥60). 3.2s
+# → ✓ Relay healthy. 71 tools available (≥60). 3.2s
 ```
 
 ## The Inspector
@@ -75,7 +75,7 @@ npm run inspector
 | Page | What you see |
 |---|---|
 | **Pool overview** | Slot grid (claimed / idle / orphan), cookie freshness, vault summary |
-| **Tools catalog** | All 70 tools with filter + per-tool detail |
+| **Tools catalog** | All 71 tools with filter + per-tool detail |
 | **Slot detail** | Live request/response feed with timing, args, and full payloads |
 | **Activity history** | Cross-slot ring buffer of the last ~200 tool calls |
 | **Settings** | Resolved config + paste-ready `local-config.json` snippet |

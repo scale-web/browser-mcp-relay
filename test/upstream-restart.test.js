@@ -22,7 +22,12 @@ const { spawn } = require("node:child_process");
 const HARNESS = path.join(__dirname, "fixtures", "relay-harness.js");
 const MOCK_BDMCP = path.join(__dirname, "fixtures", "mock-bdmcp-session.js");
 const T = { timeout: 30000 }; // a hang must fail the test, not the suite
-const SLOT = "700"; // port 9333+699 = 10032 — outside the live relay range 9333-9349
+const SLOT = "700"; // a label only since spec v4 §1b; the fake Brave's port is 10032
+// Spec v4 §1b: the upstream child spawned by tools/list before any Brave
+// exists carries this unreachable endpoint, and the first Brave ALWAYS
+// replaces it ("generation 0 adopts" no longer holds — every launch gets a
+// new port/uuid). So child #1 below is that placeholder child.
+const PLACEHOLDER = "ws://127.0.0.1:1/devtools/browser/00000000-0000-0000-0000-000000000000";
 
 function isAlive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
@@ -98,9 +103,15 @@ async function startRelay({ attachable, idleMinutes = "0", extraEnv = {} } = {})
   const braveLaunches = () => {
     try { return fs.readFileSync(path.join(dir, "brave-launches"), "utf8").trim().split("\n").filter(Boolean); } catch { return []; }
   };
+  const notices = [];
   const call = async () => {
     const r = await request("tools/call", { name: "navigation_go-to", arguments: { url: "about:blank" } });
-    return { isError: !!r.isError, text: r.content[0].text, body: r.isError ? null : JSON.parse(r.content[0].text) };
+    // Relay notices (spec v4 §1c mode announcement) are separate LEADING
+    // text items; upstream's own result follows them untouched.
+    const own = r.content.filter((c) => c.text.startsWith("[browser-mcp-relay]"));
+    notices.push(own.map((c) => c.text));
+    const rest = r.content.slice(own.length);
+    return { isError: !!r.isError, text: rest[0].text, body: r.isError ? null : JSON.parse(rest[0].text) };
   };
   const killBrave = async () => {
     const before = (stderr.match(/HARNESS brave-killed/g) || []).length;
@@ -118,7 +129,7 @@ async function startRelay({ attachable, idleMinutes = "0", extraEnv = {} } = {})
     for (const pid of upstreamPids()) if (isAlive(pid)) { try { process.kill(pid, "SIGKILL"); } catch {} }
     fs.rmSync(dir, { recursive: true, force: true });
   };
-  return { child, dir, request, call, killBrave, stop, upstreamPids, braveLaunches, stderr: () => stderr };
+  return { child, dir, request, call, notices, killBrave, stop, upstreamPids, braveLaunches, stderr: () => stderr };
 }
 
 test("Brave relaunched on the SAME port → upstream child replaced; next forwarded call reaches the fresh child", T, async () => {
@@ -127,7 +138,7 @@ test("Brave relaunched on the SAME port → upstream child replaced; next forwar
     await r.request("tools/list", {});
     const first = await r.call();
     assert.strictEqual(first.isError, false, first.text);
-    const [p1] = r.upstreamPids();
+    const [, p1] = r.upstreamPids(); // [0] = the placeholder child
     assert.strictEqual(first.body.pid, p1);
 
     await r.killBrave();
@@ -138,9 +149,9 @@ test("Brave relaunched on the SAME port → upstream child replaced; next forwar
     assert.strictEqual(launches.length, 2, "Brave must have been relaunched exactly once");
     assert.strictEqual(launches[0].split(" ")[1], launches[1].split(" ")[1], "precondition: relaunch landed on the SAME port");
     const pids = r.upstreamPids();
-    assert.strictEqual(pids.length, 2, "exactly one replacement upstream child");
+    assert.strictEqual(pids.length, 3, "placeholder child + exactly one replacement per Brave");
     assert.notStrictEqual(second.body.pid, p1, "call must be answered by a NEW upstream child");
-    assert.strictEqual(second.body.pid, pids[1]);
+    assert.strictEqual(second.body.pid, pids[2]);
     assert.strictEqual(second.body.brave, "brave-2");
     await waitFor(() => !isAlive(p1), 3000, "old upstream child to die");
     assert.strictEqual(r.child.exitCode, null, "deliberate restart must not shut the relay down");
@@ -149,16 +160,42 @@ test("Brave relaunched on the SAME port → upstream child replaced; next forwar
   }
 });
 
-test("first Brave launch adopts the upstream spawned by tools/list (no wasted restart)", T, async () => {
+test("§1b: the tools/list child carries the unreachable placeholder and the first Brave replaces it exactly once", T, async () => {
   const r = await startRelay();
   try {
     await r.request("tools/list", {});
+    const [p0] = r.upstreamPids();
     const a = await r.call();
     const b = await r.call();
     assert.strictEqual(a.isError, false, a.text);
     assert.strictEqual(b.isError, false, b.text);
-    assert.deepStrictEqual(r.upstreamPids(), [a.body.pid], "one upstream child for the whole session");
-    assert.strictEqual(b.body.pid, a.body.pid);
+    const pids = r.upstreamPids();
+    assert.strictEqual(pids.length, 2, "placeholder child + one child for this Brave, no more");
+    assert.strictEqual(pids[0], p0);
+    assert.strictEqual(a.body.pid, pids[1]);
+    assert.strictEqual(b.body.pid, a.body.pid, "the child for this Brave is kept across calls");
+    assert.match(a.body.cdp, /^ws:\/\/127\.0\.0\.1:10032\/devtools\/browser\//, "child is pinned to OUR Brave's ws endpoint");
+    await waitFor(() => !isAlive(p0), 3000, "placeholder child to die");
+    assert.match(r.stderr(), /CDP endpoint changed \(placeholder → ws:/);
+  } finally {
+    await r.stop();
+  }
+});
+
+test("§1b/§1e: the pre-Brave child gets the unreachable ws placeholder, no chrome://inspect side effect, no messaging env", T, async () => {
+  const r = await startRelay({ extraEnv: { CLAUDE_CODE_MESSAGING_TOKEN: "fake-token", CLAUDE_CODE_MESSAGING_SOCKET: "/tmp/fake.sock" } });
+  try {
+    await r.request("tools/list", {});
+    const res = await r.call();
+    assert.strictEqual(res.isError, false, res.text);
+    const envs = fs.readFileSync(path.join(r.dir, "upstream-env"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.strictEqual(envs.length, 2);
+    assert.strictEqual(envs[0].endpoint, PLACEHOLDER, "gen-0 child: never a slot port, never empty (BDMCP would probe 9222/9229)");
+    assert.match(envs[1].endpoint, /^ws:\/\/127\.0\.0\.1:10032\/devtools\/browser\/[0-9a-f-]{36}$/);
+    for (const e of envs) {
+      assert.strictEqual(e.openInspect, "false", "a failed attach must not open chrome://inspect in the user's Chrome");
+      assert.deepStrictEqual(e.messagingKeys, [], "CLAUDE_CODE_MESSAGING_* must not reach the upstream child");
+    }
   } finally {
     await r.stop();
   }
@@ -174,9 +211,9 @@ test("concurrent calls after Brave death share one relaunch and one upstream res
     for (const x of results) assert.strictEqual(x.isError, false, x.text);
     assert.strictEqual(r.braveLaunches().length, 2, "one relaunch, not one per call");
     const pids = r.upstreamPids();
-    assert.strictEqual(pids.length, 2, "one respawn, not one per call");
-    for (const x of results) assert.strictEqual(x.body.pid, pids[1]);
-    assert.notStrictEqual(pids[1], first.body.pid);
+    assert.strictEqual(pids.length, 3, "placeholder + one child per Brave: one respawn, not one per call");
+    for (const x of results) assert.strictEqual(x.body.pid, pids[2]);
+    assert.notStrictEqual(pids[2], first.body.pid);
   } finally {
     await r.stop();
   }
@@ -204,13 +241,14 @@ test("restart triggered by an OWN-tool call (no immediate respawn) is not treate
   }
 });
 
-test("attach to a Brave on a different port still restarts upstream onto that port", T, async () => {
-  const r = await startRelay({ attachable: { pid: 1, port: 10040 } });
+test("attach to an existing Brave restarts upstream onto that Brave's VERIFIED ws endpoint", T, async () => {
+  const ws = "ws://127.0.0.1:10040/devtools/browser/abcdefab-0000-0000-0000-000000000040";
+  const r = await startRelay({ attachable: { pid: 1, port: 10040, wsEndpoint: ws } });
   try {
-    await r.request("tools/list", {}); // spawns upstream pointed at the slot port 10032
+    await r.request("tools/list", {}); // spawns upstream on the placeholder
     const res = await r.call();
     assert.strictEqual(res.isError, false, res.text);
-    assert.strictEqual(res.body.cdp, "http://127.0.0.1:10040");
+    assert.strictEqual(res.body.cdp, ws);
     assert.strictEqual(r.upstreamPids().length, 2);
   } finally {
     await r.stop();
@@ -230,7 +268,7 @@ test("a fresh upstream whose FIRST call hits a dead Brave is replaced by the nex
     await r.killBrave();
     const poisoned = await r.call(); // relaunch #2 dies before the call lands
     assert.strictEqual(poisoned.isError, true, `precondition: the fresh child's first call must hit the dead Brave; got ${poisoned.text}`);
-    const p2 = r.upstreamPids()[1];
+    const p2 = r.upstreamPids()[2];
     await waitFor(() => /brave-died-late brave-2/.test(r.stderr()), 3000, "late close event for brave-2");
     const healed = await r.call();
     assert.strictEqual(healed.isError, false, `still wedged: ${healed.text}`);
@@ -280,10 +318,10 @@ test("an upstream spawned by an own-tool AFTER Brave died mid-tool is replaced, 
     await waitFor(() => !isAlive(first.body.pid), 3000, "child #1 to die");
     const prop = await r.request("tools/call", { name: "harness_die_then_propagate", arguments: {} });
     const pids = r.upstreamPids();
-    assert.strictEqual(pids.length, 2, `precondition: the own-tool must spawn child #2: ${JSON.stringify(prop)}`);
+    assert.strictEqual(pids.length, 3, `precondition: the own-tool must spawn child #3: ${JSON.stringify(prop)}`);
     const healed = await r.call();
     assert.strictEqual(healed.isError, false, `adopted a poisoned child: ${healed.text}`);
-    assert.notStrictEqual(healed.body.pid, pids[1], "the child spawned with no live Brave must not be reused");
+    assert.notStrictEqual(healed.body.pid, pids[2], "the child spawned with no live Brave must not be reused");
     assert.strictEqual(healed.body.brave, "brave-3");
   } finally {
     await r.stop();
@@ -324,6 +362,80 @@ test("shutdown with a tools/list in flight never spawns another upstream child",
     const spawns = (r.stderr().match(/spawning upstream child/g) || []).length;
     assert.strictEqual(spawns, 1, `a new upstream child was spawned during shutdown:\n${r.stderr()}`);
     assert.strictEqual(r.upstreamPids().length, 1);
+  } finally {
+    await r.stop();
+  }
+});
+
+test("§1c: the first tool result carries the mode as a separate LEADING text item, later ones do not", T, async () => {
+  const r = await startRelay();
+  try {
+    await r.call();
+    await r.call();
+    assert.strictEqual(r.notices[0].length, 1, JSON.stringify(r.notices));
+    assert.match(r.notices[0][0], /Browser profile: BASE profile/);
+    assert.deepStrictEqual(r.notices[1], [], "announced once per mode change, not on every result");
+  } finally {
+    await r.stop();
+  }
+});
+
+test("§1c: relay_status (needsBrave:false) answers without launching Brave", T, async () => {
+  const r = await startRelay();
+  try {
+    const res = await r.request("tools/call", { name: "relay_status", arguments: {} });
+    const body = JSON.parse(res.content[res.content.length - 1].text);
+    assert.strictEqual(body.mode, "base");
+    assert.strictEqual(body.braveAlive, false);
+    assert.deepStrictEqual(r.braveLaunches(), [], "relay_status must not launch Brave");
+    const list = await r.request("tools/list", {});
+    assert.ok(list.tools.some((t) => t.name === "relay_status"), "relay_status is listed (no name collision)");
+  } finally {
+    await r.stop();
+  }
+});
+
+test("BACKLOG:212 / amendment 4: a call landing during SIGTERM shutdown never launches a Brave", T, async () => {
+  const r = await startRelay();
+  try {
+    await r.request("tools/list", {});
+    const first = await r.call();
+    assert.strictEqual(first.isError, false, first.text);
+    fs.writeFileSync(path.join(r.dir, "launch-delay-ms"), "600");
+    await r.killBrave(); // brave-1 dead; the next call relaunches (slowly)
+    const pending = r.call().catch((e) => e);
+    await waitFor(() => /HARNESS launch-started/.test(r.stderr()), 3000, "relaunch to start");
+    const exited = new Promise((res) => r.child.once("exit", res));
+    r.child.kill("SIGTERM"); // stdin stays open — the BACKLOG scenario
+    // A call that arrives during shutdown must not start another launch.
+    r.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 999, method: "tools/call", params: { name: "navigation_go-to", arguments: { url: "about:blank" } } }) + "\n");
+    await Promise.race([exited, new Promise((res) => setTimeout(res, 8000))]);
+    await pending;
+    assert.notStrictEqual(r.child.exitCode, null, "relay must have exited");
+    const launches = r.braveLaunches();
+    assert.strictEqual(launches.length, 2, `exactly the in-flight relaunch, nothing after shutdown began:\n${launches.join("\n")}`);
+    // The relaunched Brave (brave-2) resolved after shutdown began: it must
+    // have been closed, not orphaned.
+    assert.match(r.stderr(), /shutdown began during Brave launch — closing it/);
+    assert.match(r.stderr(), /HARNESS brave-closed brave-2/);
+  } finally {
+    await r.stop();
+  }
+});
+
+test("§1a/N6: shutdown closes Brave BEFORE releasing the pool claim", T, async () => {
+  const r = await startRelay();
+  try {
+    const first = await r.call();
+    assert.strictEqual(first.isError, false, first.text);
+    const exited = new Promise((res) => r.child.once("exit", res));
+    r.child.stdin.end();
+    await Promise.race([exited, new Promise((res) => setTimeout(res, 8000))]);
+    const err = r.stderr();
+    const closed = err.indexOf("HARNESS brave-closed brave-1");
+    const released = err.indexOf("HARNESS pool-released");
+    assert.ok(closed !== -1 && released !== -1, err);
+    assert.ok(closed < released, "Brave must be closed before the claim is released");
   } finally {
     await r.stop();
   }

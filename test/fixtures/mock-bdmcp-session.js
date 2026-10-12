@@ -15,6 +15,13 @@ const path = require("node:path");
 
 const dir = process.env.HARNESS_DIR;
 fs.appendFileSync(path.join(dir, "upstream-pids"), `${process.pid}\n`);
+// What the relay put in this child's env (spec v4 §1b/§1e assertions).
+fs.appendFileSync(path.join(dir, "upstream-env"), JSON.stringify({
+  pid: process.pid,
+  endpoint: process.env.BROWSER_CDP_ENDPOINT_URL || null,
+  openInspect: process.env.BROWSER_CDP_OPEN_INSPECT || null,
+  messagingKeys: Object.keys(process.env).filter((k) => k.startsWith("CLAUDE_CODE_MESSAGING_")),
+}) + "\n");
 const readAlive = () => {
   try { return fs.readFileSync(path.join(dir, "brave-alive"), "utf8"); } catch { return "none"; }
 };

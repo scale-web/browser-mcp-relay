@@ -142,12 +142,15 @@ test("W1-5: getUpstream wraps spawnUpstream() in Promise.resolve().then for sync
 });
 
 // ──────────────────────────────────────────────────────────────────
-// W1-6: releasePool() must come BEFORE the long-running closeBrave
-// in shutdownAsync — second Ctrl-C interrupts mid-await, leaves lock
-// stranded if released last.
+// W1-6 REVERSED by spec v4 §1a (r2 N6): with the kernel flock, a second
+// Ctrl-C mid-await no longer strands the lock (the kernel releases it on
+// death), and releasing FIRST let a peer claim the base while our Brave was
+// still closing. The claim is now released AFTER Brave is closed. The
+// behavioural proof is test/upstream-restart.test.js "shutdown closes Brave
+// BEFORE releasing the pool claim"; this pins the source order.
 // ──────────────────────────────────────────────────────────────────
 
-test("W1-6: shutdownAsync calls releasePool() BEFORE closeBrave() (lock-first ordering)", () => {
+test("N6 (was W1-6): shutdownAsync closes Brave BEFORE releasing the claim", () => {
   const fs = require("node:fs");
   const path = require("node:path");
   const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
@@ -156,12 +159,12 @@ test("W1-6: shutdownAsync calls releasePool() BEFORE closeBrave() (lock-first or
   const m = src.match(/function\s+shutdownAsync[\s\S]*?shutdownDone\s*=\s*true/);
   assert.ok(m, "expected to find shutdownAsync body");
   const body = m[0];
-  const releaseIdx = body.indexOf("releasePool()");
+  const releaseIdx = body.indexOf("releaseClaim()");
   const closeBraveIdx = body.indexOf("closeBrave(");
-  assert.ok(releaseIdx >= 0, "releasePool() must be called");
+  assert.ok(releaseIdx >= 0, "releaseClaim() must be called");
   assert.ok(closeBraveIdx >= 0, "closeBrave() must be called");
-  assert.ok(releaseIdx < closeBraveIdx,
-    "releasePool() must come BEFORE closeBrave() (W1-6 lock-first ordering for double-Ctrl-C safety)");
+  assert.ok(closeBraveIdx < releaseIdx,
+    "closeBrave() must come BEFORE releaseClaim() (N6: a peer must not claim a dying Brave)");
 });
 
 // ──────────────────────────────────────────────────────────────────
@@ -233,7 +236,7 @@ test("G0-7 + G1-2: shutdownAsync uses withTimeout + Promise.all (parallel + capp
   assert.ok(m, "expected shutdownAsync body");
   assert.ok(/Promise\.all\(\s*tasks\s*\)/.test(m[0]),
     "shutdownAsync must run close tasks in parallel via Promise.all");
-  assert.ok(/withTimeout\(closeBrave/.test(m[0]),
+  assert.ok(/withTimeout\([^;]*closeBrave\(/.test(m[0]),
     "closeBrave must be wrapped in withTimeout");
   assert.ok(/withTimeout\(inspectorHandle\.close/.test(m[0]),
     "inspectorHandle.close must be wrapped in withTimeout");

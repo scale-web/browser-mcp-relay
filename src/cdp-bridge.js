@@ -1,12 +1,69 @@
 // cdp-bridge.js — launches Brave for a slot via Playwright launchPersistentContext
-// with a remote-debugging-port that BOTH our relay AND upstream attach to via
-// chromium.connectOverCDP. See docs/probe-cdp-access.js for the standalone
-// probe used to verify this architecture.
+// with --remote-debugging-port=0: the OS picks a free port, Brave reports it in
+// <user-data-dir>/DevToolsActivePort, and the relay proves the 127.0.0.1
+// listener is THIS Brave before anyone uses it (spec v4 §1b, cdp-identity.js).
+// Playwright drives Brave over its own --remote-debugging-pipe; the TCP port is
+// for the upstream child (via the exact ws endpoint), attach-first, the Meta
+// guard and external scripts.
 
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { chromium } = require("playwright-core");
 const { applyLocalConfigToEnv } = require("./local-config.js");
+const cdpIdentity = require("./cdp-identity.js");
+
+// ── Test-only launch hook (spec v4 amendment 5) ─────────────────────────────
+// BROWSER_RELAY_TEST_LAUNCH keeps Playwright's --use-mock-keychain (so a test
+// Brave never touches the machine-global login keychain, which a fake HOME does
+// not isolate) and appends a FIXED allowlist of harness args. It is refused —
+// the relay throws and does not run — unless realpath(os.homedir()) is under
+// realpath(os.tmpdir()) AND the profile dir is under that home: a leftover flag
+// (local-config.json, a shell export) must fail loudly, never mock-key a real
+// profile (Brave would then write cookies it can never decrypt again).
+const TEST_LAUNCH_ARGS = Object.freeze(["--host-resolver-rules=MAP * 127.0.0.1"]);
+
+function testLaunchRequested(env = applyLocalConfigToEnv(process.env)) {
+  const v = env.BROWSER_RELAY_TEST_LAUNCH;
+  return typeof v === "string" && v.length > 0;
+}
+
+function isUnderDir(child, parent) {
+  const rel = path.relative(parent, child);
+  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+/** Throws unless the test hook may run here. `userDataDir` optional (the
+ *  relay checks HOME first thing, and the claimed dir once it has one). */
+function assertTestLaunchAllowed(userDataDir) {
+  let home = null;
+  try { home = fs.realpathSync(os.homedir()); } catch { /* unresolvable HOME is refused below */ }
+  const tmp = fs.realpathSync(os.tmpdir());
+  if (!home || !isUnderDir(home, tmp)) {
+    throw new Error(`[mcp-relay] BROWSER_RELAY_TEST_LAUNCH is set but HOME (${home || os.homedir()}) is not under ${tmp} — refusing to run (unset it; it is for the isolated test harness only)`);
+  }
+  if (userDataDir !== undefined) {
+    let real;
+    try { real = fs.realpathSync(userDataDir); } catch (e) {
+      throw new Error(`[mcp-relay] BROWSER_RELAY_TEST_LAUNCH: cannot resolve profile dir ${userDataDir}: ${e.message}`);
+    }
+    if (!isUnderDir(real, home)) {
+      throw new Error(`[mcp-relay] BROWSER_RELAY_TEST_LAUNCH is set but the profile dir ${real} is not under the temp HOME ${home} — refusing to run`);
+    }
+  }
+}
+
+/** Env for processes the relay spawns: relay-internal knobs and the Claude
+ *  Code messaging channel never reach Brave or the third-party upstream. */
+function sanitizeChildEnv(env) {
+  const out = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (k.startsWith("BROWSER_RELAY_")) continue;
+    if (k.startsWith("CLAUDE_CODE_MESSAGING_")) continue;
+    out[k] = v;
+  }
+  return out;
+}
 
 /**
  * Delete the profile's session store so Brave starts with one tab instead of
@@ -67,11 +124,12 @@ function clearSessionRestore(userDataDir, env = applyLocalConfigToEnv(process.en
 
 /**
  * Launch Brave for the slot. Returns a handle the caller passes back to
- * closeBrave on shutdown.
+ * closeBrave on shutdown. Call with the profile's flock held, AFTER the
+ * attach-first check and the pre-launch reap (this deletes DevToolsActivePort,
+ * so a live orphan must have been attached or reaped first).
  *
  * @param {object} opts
- * @param {string} opts.userDataDir — pool slot dir
- * @param {number} opts.port — unique per slot, exposes CDP HTTP endpoint
+ * @param {string} opts.userDataDir — pool slot dir (absolute)
  * @param {boolean} [opts.headless]
  * @param {string|null} [opts.extensionPath] — passed via --load-extension
  * @param {string} [opts.executablePath] — overrides bundled chromium
@@ -79,17 +137,22 @@ function clearSessionRestore(userDataDir, env = applyLocalConfigToEnv(process.en
  *   HTTPS_PROXY env so its outbound traffic routes through an HTTP proxy you
  *   control (e.g. a local debug proxy like Charles, mitmproxy, powhttp). The
  *   user's system proxy stays untouched — only this launched Brave opts in.
- * @returns {Promise<{ context: import('playwright-core').BrowserContext, cdpConnectUrl: string }>}
+ * @returns {Promise<{ context, port: number, wsEndpoint: string, cdpConnectUrl: string }>}
  */
 async function launchBrave({
   userDataDir,
-  port,
   headless = false,
   extensionPath = null,
   executablePath,
   proxyUrl = null,
 }) {
-  const args = [`--remote-debugging-port=${port}`];
+  cdpIdentity.requireAbsoluteDir(userDataDir);
+  const testLaunch = testLaunchRequested();
+  if (testLaunch) assertTestLaunchAllowed(userDataDir);
+  // Port 0: never a fixed port. Two Braves can no longer be handed the same
+  // number, so neither can fall back to [::1] and be mistaken for the other.
+  // No --remote-debugging-address: Brave binds 127.0.0.1.
+  const args = ["--remote-debugging-port=0"];
   // Strip Playwright's default `--use-mock-keychain`. That flag tells Chromium
   // to bypass the OS keychain (DPAPI on Windows, Keychain on macOS, libsecret
   // on Linux), which prevents Brave from unwrapping `Local State.os_crypt
@@ -102,7 +165,10 @@ async function launchBrave({
   // checks the calling exe identity. Removing mock-keychain restores the
   // OS keychain fallback path, so v10 rows decrypt; v20 (ABE-only) rows may
   // still fail under Playwright-launched Brave.
-  const ignoreDefaultArgs = ["--use-mock-keychain"];
+  //
+  // The test hook KEEPS the mock keychain (see TEST_LAUNCH_ARGS above).
+  const ignoreDefaultArgs = testLaunch ? [] : ["--use-mock-keychain"];
+  if (testLaunch) args.push(...TEST_LAUNCH_ARGS);
   if (extensionPath) {
     args.push(`--load-extension=${extensionPath}`);
     args.push(`--disable-extensions-except=${extensionPath}`);
@@ -159,11 +225,9 @@ async function launchBrave({
   // are relay-internal and shouldn't be visible to Brave (which would try
   // to interpret them on a chrome:// extension page that loads Node-aware
   // code, etc.). Always sanitize.
-  const sanitizedEnv = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith("BROWSER_RELAY_")) continue; // relay-internal
-    sanitizedEnv[k] = v;
-  }
+  // Spec v4 §1e: CLAUDE_CODE_MESSAGING_* (the session's peer-messaging socket
+  // and token) is stripped too.
+  const sanitizedEnv = sanitizeChildEnv(process.env);
 
   // Per-process proxy whitelist: when proxyUrl is set, Brave inherits
   // HTTP_PROXY / HTTPS_PROXY env so outbound traffic routes through the
@@ -190,58 +254,65 @@ async function launchBrave({
     process.stderr.write(`[mcp-relay] could NOT clear session restore (${sessionClear.reason}) — Brave will restore its previous tabs\n`);
   }
 
+  // A leftover file from an earlier port-0 Brave (Chromium never deletes it)
+  // would hand us a dead port — or one a different Brave has since taken.
+  cdpIdentity.removeDevToolsActivePort(userDataDir);
+
   const context = await chromium.launchPersistentContext(userDataDir, launchOpts);
 
-  // Wait for the CDP HTTP endpoint to respond before returning. Upstream's
-  // connectOverCDP will hit /json/version, so we want it ready first.
-  //
-  // V0-3: launchPersistentContext returned a LIVE context that holds a file
-  // lock on userDataDir. If waitForCdpReady throws (timeout, unreachable CDP),
-  // the context would leak forever — the lock blocks any other relay from
-  // claiming this slot until the user reboots / kills brave.exe by hand. So
-  // we close the context on any waitForCdpReady failure before re-throwing.
-  // attachWithCleanupOnError in index.js only wraps post-launch steps, so
-  // this cleanup must live here.
+  // Read the port back and PROVE the 127.0.0.1 listener is this Brave: its
+  // /json/version must name the uuid Brave wrote into OUR profile dir. Fail
+  // closed — close the context (it holds the user-data-dir lock) and throw.
   try {
-    await waitForCdpReady(port, 10000);
+    const file = await cdpIdentity.waitForDevToolsActivePort(userDataDir, { timeoutMs: 3000 });
+    const wsEndpoint = await cdpIdentity.verifyPortIdentity(file.port, file.browserPath, { timeoutMs: 1000 });
+    if (!wsEndpoint) {
+      throw new Error(`[mcp-relay] CDP identity check failed: 127.0.0.1:${file.port}/json/version does not name ${file.browserPath} from ${userDataDir}/DevToolsActivePort`);
+    }
+    return {
+      context,
+      port: file.port,
+      wsEndpoint,
+      cdpConnectUrl: `http://127.0.0.1:${file.port}`,
+    };
   } catch (e) {
     try { await context.close(); }
     catch (closeErr) {
       process.stderr.write(
-        `[mcp-relay] cdp-bridge: context.close() failed during waitForCdpReady cleanup: ${closeErr.message}\n`,
+        `[mcp-relay] cdp-bridge: context.close() failed during CDP identity cleanup: ${closeErr.message}\n`,
       );
     }
     throw e;
   }
-
-  return {
-    context,
-    cdpConnectUrl: `http://127.0.0.1:${port}`,
-  };
 }
 
 /**
- * Attach to an ALREADY-RUNNING Brave via its CDP HTTP endpoint instead of
- * launching a new one. Used when a previous relay died uncleanly and left
- * its Brave orphaned on our profile dir — attaching preserves the user's
- * open tabs; the old reap-and-relaunch path destroyed them.
+ * Attach to an ALREADY-RUNNING Brave instead of launching a new one. Used when
+ * a previous relay died uncleanly and left its Brave orphaned on our profile
+ * dir — attaching preserves the user's open tabs.
  *
- * The returned handle is shaped like launchBrave's ({ context,
- * cdpConnectUrl }) plus { attached: true, browser } so closeBrave and the
- * entrypoint's bridge-invalidation listeners can tell the two apart.
+ * Takes the VERIFIED ws endpoint from findAttachableBrave (cdp-identity.js),
+ * never a bare port: re-resolving over HTTP would reopen the F9 hole.
+ *
+ * The returned handle is shaped like launchBrave's plus { attached: true,
+ * browser } so closeBrave and the entrypoint's bridge-invalidation listeners
+ * can tell the two apart.
  *
  * @param {object} opts
- * @param {number} opts.port — the running Brave's --remote-debugging-port
+ * @param {string} opts.wsEndpoint — ws://127.0.0.1:<port>/devtools/browser/<uuid>
+ * @param {number} opts.port
  * @param {number} [opts.timeoutMs=5000]
  */
-async function attachBrave({ port, timeoutMs = 5000 }) {
-  const cdpConnectUrl = `http://127.0.0.1:${port}`;
-  const browser = await chromium.connectOverCDP(cdpConnectUrl, { timeout: timeoutMs });
+async function attachBrave({ wsEndpoint, port, timeoutMs = 5000 }) {
+  if (typeof wsEndpoint !== "string" || !wsEndpoint.startsWith("ws://127.0.0.1:")) {
+    throw new Error(`[mcp-relay] attachBrave needs a verified ws://127.0.0.1 endpoint, got ${JSON.stringify(wsEndpoint)}`);
+  }
+  const browser = await chromium.connectOverCDP(wsEndpoint, { timeout: timeoutMs });
   // A persistent-context Brave always exposes its default context. A brand-
   // new context here would NOT see the profile's cookies/tabs, so only fall
   // back to creating one if contexts() is somehow empty.
   const context = browser.contexts()[0] || (await browser.newContext());
-  return { context, cdpConnectUrl, attached: true, browser };
+  return { context, port, wsEndpoint, cdpConnectUrl: `http://127.0.0.1:${port}`, attached: true, browser };
 }
 
 /**
@@ -299,27 +370,14 @@ async function closeBrave(handle) {
   }
 }
 
-/**
- * Poll /json/version (the standard CDP discovery endpoint) until it returns
- * 200, or timeout. Throws on timeout. Used after launchPersistentContext to
- * confirm the CDP endpoint is reachable before letting upstream try to attach.
- */
-async function waitForCdpReady(port, timeoutMs) {
-  const start = Date.now();
-  let lastErr;
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const resp = await fetch(`http://127.0.0.1:${port}/json/version`);
-      if (resp.ok) return;
-      lastErr = new Error(`status ${resp.status}`);
-    } catch (e) {
-      lastErr = e;
-    }
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  throw new Error(
-    `[mcp-relay] CDP endpoint http://127.0.0.1:${port}/json/version not ready after ${timeoutMs}ms: ${lastErr?.message || "unknown"}`,
-  );
-}
-
-module.exports = { launchBrave, attachBrave, closeBrave, closeBraveHard, waitForCdpReady, _clearSessionRestore: clearSessionRestore };
+module.exports = {
+  launchBrave,
+  attachBrave,
+  closeBrave,
+  closeBraveHard,
+  sanitizeChildEnv,
+  testLaunchRequested,
+  assertTestLaunchAllowed,
+  TEST_LAUNCH_ARGS,
+  _clearSessionRestore: clearSessionRestore,
+};

@@ -5,7 +5,7 @@ The slim README at the root of the repo is for getting up and running. This file
 ## Contents
 
 - [Tool catalog](#tool-catalog)
-  - [First-party tools (19)](#first-party-tools-19)
+  - [First-party tools (20)](#first-party-tools-20)
   - [Forwarded upstream tools (51)](#forwarded-upstream-tools-51)
 - [Worked examples](#worked-examples)
 - [Architecture](#architecture)
@@ -26,11 +26,11 @@ The slim README at the root of the repo is for getting up and running. This file
 
 ## Tool catalog
 
-**70 tools total = 19 first-party (built into this relay) + 51 forwarded from [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp).**
+**71 tools total = 20 first-party (built into this relay) + 51 forwarded from [`browser-devtools-mcp`](https://github.com/serkan-ozal/browser-devtools-mcp).**
 
 Both layers are merged into a single `tools/list` response, so to your MCP client they all just look like "tools the relay provides."
 
-### First-party tools (19)
+### First-party tools (20)
 
 #### 🔬 Performance & diagnostics
 
@@ -95,6 +95,12 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
 | `extract_structured` | CSS-selector-based extraction | `schema` | Scrape an authed page that public scrapers can't reach |
+
+#### 🧭 Relay status
+
+| Tool | Purpose | Notable arg | Example use case |
+|---|---|---|---|
+| `relay_status` | Which profile this session drives (BASE or a CLONE whose logins are deleted at session end), who holds the base, this Brave's CDP port. Never launches a browser. | — | Check before any sign-in |
 
 > Source for each first-party tool lives at [`src/own-tools/<tool-name>.js`](../src/own-tools/).
 
@@ -339,16 +345,17 @@ Each example shows the raw JSON-RPC `tools/call` request your MCP client would s
                                             │ CDP (Playwright connectOverCDP)
                                             │
                                        relay's own-tools
-                                       (this repo, 19 tools)
+                                       (this repo, 20 tools)
 ```
 
 **How it works:**
 
 - 📥 The relay receives MCP messages on stdin from your client.
-- 📋 `tools/list` → merges the upstream's catalog with the 19 own-tool definitions and returns one combined list.
+- 📋 `tools/list` → merges the upstream's catalog with the 20 own-tool definitions and returns one combined list.
 - ⚙️ `tools/call` → either forwards to the upstream child (for the 51 forwarded tools) or runs an own-tool handler directly.
-- 🔌 Both paths attach to the same Brave instance: the upstream uses `BROWSER_CDP_CONNECT_URL`, own-tools use Playwright's `chromium.connectOverCDP` against the same port.
+- 🔌 Both paths drive the same Brave instance. Brave is launched with `--remote-debugging-port=0`: the OS picks a free port, Brave writes it to `<profile>/DevToolsActivePort` with its browser uuid, and the relay proves `127.0.0.1:<port>/json/version` names that same uuid before anything uses it. The upstream child gets that exact endpoint (`BROWSER_CDP_ENDPOINT_URL=ws://127.0.0.1:<port>/devtools/browser/<uuid>`), so it can reach no other browser. External scripts read the port from `<profile>/.mcp-relay-status.json` (`cdpPort`) or `DevToolsActivePort`.
 - 🪶 One Brave per relay process. Brave is launched **lazily on the first `tools/call`**, not at startup.
+- 🚫 **Meta guard.** Relay browsers never open Instagram / Facebook / Messenger / Threads / Meta account pages (top-level documents only; pixels, SDK scripts and embeds still load). Three layers: URL arguments are refused before any browser work, a CDP `Fetch` guard on every page and popup answers blocked documents with a 403 page, and a watchdog catches service-worker-served pages. The block/allow lists are one constant at the top of `src/meta-guard.js`. There is no override.
 
 **Shutdown lifecycle (since v0.3.2):** orphan Brave processes are reaped at three points — `claimSlot` (lock-acquire), `ensureBrave` (pre-launch, `F1-16`), and `closeBrave` (shutdown via Playwright `context.close`). The pre-launch reap closes the lazy-launch gap where a previous-session Brave can squat on a claimed-but-not-yet-launched user-data-dir.
 
@@ -364,7 +371,7 @@ All paths the relay needs are auto-detected by default. Override them with these
 | `BROWSER_RELAY_UPSTREAM_PATH` | `require.resolve("browser-devtools-mcp/dist/index.js")` | Path to the upstream `browser-devtools-mcp` entry. Override to point at a custom build. |
 | `BROWSER_RELAY_BRAVE_PROFILE_DIR` | unset | Optional profile dir hint used by detection / cookie snapshot. |
 | `BROWSER_RELAY_POOL_DIR` | unset (standalone) | Opt-in: absolute path to a Brave user-data-dir to claim. Standalone mode uses `<repo>/.browser-data` (or a per-user cache dir if the repo is read-only — `~/.cache/browser-mcp-relay/browser-data` on Linux, `~/Library/Caches/browser-mcp-relay/browser-data` on macOS, `%LOCALAPPDATA%\browser-mcp-relay\Cache\browser-data` on Windows). |
-| `BROWSER_RELAY_POOL_SLOT` | unset | Cosmetic slot index for the launch banner; also sets the CDP port (`9333 + slot - 1`) when using pool mode. |
+| `BROWSER_RELAY_POOL_SLOT` | unset | Cosmetic slot index for the launch banner and registry. It no longer selects a CDP port: Brave's port is OS-assigned (`--remote-debugging-port=0`) and published in `<profile>/.mcp-relay-status.json` as `cdpPort`. Pre-change relays used `9333 + slot - 1` (range 9333–9349). |
 | `BROWSER_HEADLESS_ENABLE` | `false` | Set `true` to launch Brave headless. |
 | `BROWSER_LOAD_EXTENSIONS` | unset | Path to an unpacked Chrome extension to load. |
 | `BROWSER_MCP_ROLE` | unset | Role-based slot filter (only meaningful with the optional pool wrapper). |
@@ -389,7 +396,7 @@ One Brave per relay process. Profile stored at `<repo>/.browser-data` (or a per-
 
 ### 🔵 Pool (opt-in)
 
-Set `BROWSER_RELAY_POOL_DIR` to an absolute path of a Brave user-data-dir to claim. Pool mode uses that single dir + the slot index from `BROWSER_RELAY_POOL_SLOT` for the launch banner + CDP port (`9333 + slot - 1`). **Useful when running multiple relay processes against pre-warmed Brave profiles** — each relay claims a different dir, each gets a deterministic port.
+Set `BROWSER_RELAY_POOL_DIR` to an absolute path of a Brave user-data-dir to claim. Pool mode uses that single dir + the slot index from `BROWSER_RELAY_POOL_SLOT` for the launch banner. **Useful when running multiple relay processes against pre-warmed Brave profiles** — each relay claims a different dir, and each Brave gets its own OS-assigned CDP port (read it from `<dir>/.mcp-relay-status.json` → `cdpPort`).
 
 ---
 
@@ -403,7 +410,9 @@ Each pool dir has up to three pieces of state:
 
 | File / process | Purpose |
 |---|---|
-| `<pool-dir>/.mcp-wrapper-lock` | Atomic lock file. JSON `{ pid, startedAt, host, relay: true }`. Created via `O_CREAT \| O_EXCL` (POSIX) or `wx` flag (Win). Mode `0o600` on POSIX so the file isn't world-readable. |
+| `<pool-dir>/.mcp-relay.flock` | The ownership lock (macOS): opened `O_EXLOCK\|O_NONBLOCK` and held for the relay's life; the kernel releases it when the relay dies. Never deleted. |
+| `<pool-dir>/.mcp-wrapper-lock` | Compatibility record, compact JSON `{"v":2,"pid":…,"ppid":…,"startedAt":…,"pidStartEpoch":…,"sessionId":…,"host":…}`, written tmp-then-`link()` under the flock, mode `0o600`. Pre-change relays and scripts read `pid` / `startedAt` from it. |
+| `<pool-dir>/.mcp-relay-status.json` | Status sidecar (`mode`, `cdpPort`, `bravePid`, `braveAlive`, `lastToolCallAt`, …), mode `0o600`. |
 | `<pool-dir>/Default/...` | The actual Brave user-data — cookies, localStorage, history, etc. Read by every Brave attached to this dir. |
 | Brave subtree | Main Brave process + 5–15 helper subprocesses (renderer / GPU / utility / crashpad), all with `--user-data-dir=<pool-dir>` in their command line. |
 
@@ -435,9 +444,13 @@ The relay holds the lock but doesn't launch Brave at startup — only when the f
 2. F1-16 (v0.3.2): pool.reapOrphansFor(dir) AGAIN — catches any orphan
    that appeared on this dir AFTER claim but BEFORE first tool call
    (lazy-launch gap; the bug that bit me on 2026-05-10)
-3. launchBrave({ userDataDir: dir, port: 9333 + slot - 1, ... })
-4. Brave subtree comes up; CDP endpoint at http://127.0.0.1:<port>
-5. waitForCdpReady polls /json/version until 200 or timeout
+3. launchBrave({ userDataDir: dir, ... }) with --remote-debugging-port=0,
+   after deleting any stale <dir>/DevToolsActivePort
+4. Brave subtree comes up; it writes <dir>/DevToolsActivePort
+   ("<port>\n/devtools/browser/<uuid>")
+5. The relay polls that file (3 s max), then requires
+   127.0.0.1:<port>/json/version to name the same uuid — else it closes
+   Brave and fails (a different browser answered on that port)
 6. attachAutofill listens on framenavigated for vault credentials
 7. Subsequent tool calls reuse the same Brave instance
 ```
@@ -447,17 +460,21 @@ The relay holds the lock but doesn't launch Brave at startup — only when the f
 ```
 On SIGTERM / SIGINT / upstream-child-exit:
   1. shutdownAsync() — memoized so concurrent triggers all await one chain
-  2. releasePool() FIRST — unlinks the lock so the slot is reclaimable
-     (W1-6: if a second Ctrl-C interrupts mid-await, the slot is already
-     freed)
-  3. upstreamClient.close() — graceful TCP/stdio close
-  4. killUpstreamTree() — taskkill /F /T on the upstream BDMCP node
+  2. upstreamClient.close() — graceful TCP/stdio close
+  3. killUpstreamTree() — taskkill /F /T on the upstream BDMCP node
      (G0-3: walks the subtree on Win; only the parent on POSIX, where
      reparenting is graceful)
-  5. closeBrave(bridge) + inspectorHandle.close() in PARALLEL with per-
+  4. closeBrave(bridge) + inspectorHandle.close() in PARALLEL with per-
      step timeouts (8s / 3s) — G0-7 + G1-2: prevents one wedged step
-     from blocking the whole shutdown
+     from blocking the whole shutdown. A clone's Brave is closed hard.
+  5. Release LAST: unlink our record (owner-checked), then close the flock
+     fd (a clone's dir is removed while the fd is still held). Releasing
+     first (the old W1-6 order) let a peer claim the base while our Brave
+     was still closing; a second Ctrl-C can't strand the lock any more,
+     because the kernel drops the flock when the relay dies.
   6. process.exit(128 + signal-num)
+  Once shutdown starts, ensureBrave() refuses to launch, and a launch already
+  in flight is closed as soon as it resolves.
 
 On Windows TerminateProcess (force-quit Cursor, blue screen, power loss):
   - Only process.on("exit") fires → shutdownSync() runs
@@ -601,7 +618,7 @@ After the next MCP connect, open `http://localhost:9091/slot/1` to see the per-s
 |---|---|
 | **Pool overview** (`/`) — slot grid (claimed / idle / orphan), cookie-source freshness card, vault summary. Orphan slots get a **Reap** button that clears the stale lock + kills any leftover Brave processes holding that user-data-dir. | ![Pool overview](./screenshots/01-pool-overview.png) |
 | **Slot detail** (`/slot/N`) — per-slot live activity feed (request → response cards, last 100), click any event to see request JSON + response + timing in the Detail card. Empty in standalone mode; live in in-process mode. | ![Slot detail](./screenshots/02-slot-detail.png) |
-| **Tools catalog** (`/tools`) — all 70 tools (19 first-party + 51 forwarded), filter + per-tool detail | ![Tools catalog](./screenshots/03-tools-catalog.png) |
+| **Tools catalog** (`/tools`) — all 71 tools (20 first-party + 51 forwarded), filter + per-tool detail | ![Tools catalog](./screenshots/03-tools-catalog.png) |
 | **Activity history** (`/activity`) — cross-slot ring buffer of the last ~200 MCP tool calls, with filter pills (All / Requests / Responses / Errors) and time-range picker (5m / 1h / 24h). Empty in standalone mode. | ![Activity history](./screenshots/04-activity-history.png) |
 | **Settings** (`/settings`) — resolved config, env-var booleans, paste-ready `local-config.json` snippet | ![Settings](./screenshots/06-settings.png) |
 
@@ -719,10 +736,10 @@ Which pool slots have valid locks vs. stale ones. The relay self-heals stale loc
 
 ### Check whether a relay is actually responding
 
-If `tools/call` is hanging, this confirms whether the relay's CDP endpoint is reachable. Replace the port with the slot's CDP port (`9333 + slot - 1`).
+If `tools/call` is hanging, this confirms whether the relay's CDP endpoint is reachable. Replace the port with the relay's CDP port: `cdpPort` in `<profile>/.mcp-relay-status.json` (or line 1 of `<profile>/DevToolsActivePort`). Relays from before the port-0 change used `9333 + slot - 1`.
 
 ```powershell
-Invoke-WebRequest -Uri "http://127.0.0.1:9333/json/version" -UseBasicParsing | Select-Object StatusCode, @{
+Invoke-WebRequest -Uri "http://127.0.0.1:<port>/json/version" -UseBasicParsing | Select-Object StatusCode, @{
   N='Browser'; E={ ($_.Content | ConvertFrom-Json).Browser }
 }
 ```
