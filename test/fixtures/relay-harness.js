@@ -64,7 +64,7 @@ stubModule(path.join(SRC, "cdp-bridge.js"), {
   },
   attachBrave: async ({ port, wsEndpoint }) => fakeBrave(port, true, wsEndpoint),
   closeBrave: async (h) => { if (h) { log(`brave-closed ${h.id}`); h.context.emit("close"); } },
-  closeBraveHard: async (h) => { if (h) { log(`brave-closed ${h.id}`); h.context.emit("close"); } },
+  closeBraveHard: async (h) => { if (h) { log(`brave-closed ${h.id} hard`); h.context.emit("close"); } },
   testLaunchRequested: () => false,
   assertTestLaunchAllowed: () => {},
 });
@@ -72,7 +72,10 @@ stubModule(path.join(SRC, "cdp-bridge.js"), {
 const realMetaGuard = require(path.join(SRC, "meta-guard.js"));
 stubModule(path.join(SRC, "meta-guard.js"), {
   ...realMetaGuard,
-  installMetaGuard: async () => ({ alive: () => true, close: () => {}, recentlyBlocked: () => false }),
+  installMetaGuard: async ({ wsEndpoint }) => {
+    log(`guard-installed ${wsEndpoint}`);
+    return { alive: () => true, close: () => {}, recentlyBlocked: () => false };
+  },
   installWatchdog: () => {},
 });
 
@@ -84,10 +87,12 @@ stubModule(path.join(SRC, "pool-shared.js"), {
   PORT_BASE: 9333,
   PORT_SCAN_END: 9349,
   SNAPSHOT_FILES: [],
-  claimSlotWithRetry: async () => ({
-    dir: path.join(dir, "profile"), lock: null, role: "default",
-    release: () => { log("pool-released"); }, ephemeral: false, baseDir: null,
-  }),
+  // $HARNESS_DIR/clone-mode makes the claim an ephemeral session clone.
+  claimSlotWithRetry: async () => (fs.existsSync(path.join(dir, "clone-mode"))
+    ? { dir: path.join(dir, "clone"), lock: null, role: "default", release: () => {},
+      cleanup: () => { log("pool-released"); }, ephemeral: true, baseDir: path.join(dir, "profile") }
+    : { dir: path.join(dir, "profile"), lock: null, role: "default",
+      release: () => { log("pool-released"); }, ephemeral: false, baseDir: null }),
   gcSessionClones: () => 0,
   findBraveMainPid: () => null,
   sessionClonesRoot: () => path.join(dir, "clones"),

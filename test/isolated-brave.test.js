@@ -221,6 +221,13 @@ test("Meta guard (Fetch layer): direct, script, popup, _blank, redirect and seco
   try {
     const metaHosts = ["www.facebook.com", "www.instagram.com", "m.facebook.com", "business.facebook.com", "threads.net", "web.whatsapp.com"];
     const before = metaHosts.map((x) => hostHits(x).length);
+    // 0. a page that ALREADY existed when the guard was installed (an
+    //    attach-first Brave's open tabs)
+    const pre = h.context.pages()[0];
+    assert.ok(pre, "precondition: a pre-existing page");
+    await pre.goto(U("www.instagram.com", "/already-open")).catch(() => {});
+    assert.ok(await isGuardPage(pre), `pre-existing page: ${pre.url()}`);
+
     const p = await h.context.newPage();
 
     // a. direct navigation (forwarded navigation_go-to / human typing)
@@ -263,8 +270,8 @@ test("Meta guard (Fetch layer): direct, script, popup, _blank, redirect and seco
 
     const after = metaHosts.map((x) => hostHits(x).length);
     assert.deepStrictEqual(after, before, `Meta hosts must receive no requests: ${JSON.stringify(hits.slice(-10))}`);
-    assert.ok(g.stats.blocked >= 6, `blocked ${g.stats.blocked}`);
-    assert.ok(blocked.length >= 6);
+    assert.ok(g.stats.blocked >= 7, `blocked ${g.stats.blocked}`);
+    assert.ok(blocked.length >= 7);
     assert.ok(!blocked.some((b) => b.startsWith("watchdog:")), "the watchdog must not fire on the guard's own 403 pages");
   } finally {
     g.close();

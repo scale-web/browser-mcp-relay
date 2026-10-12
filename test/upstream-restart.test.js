@@ -42,9 +42,10 @@ async function waitFor(pred, ms = 3000, what = "condition") {
   throw new Error(`timed out waiting for ${what}`);
 }
 
-async function startRelay({ attachable, idleMinutes = "0", extraEnv = {} } = {}) {
+async function startRelay({ attachable, idleMinutes = "0", extraEnv = {}, clone = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-upstream-restart-"));
   if (attachable) fs.writeFileSync(path.join(dir, "attachable"), JSON.stringify(attachable));
+  if (clone) fs.writeFileSync(path.join(dir, "clone-mode"), "1");
   const env = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (!k.startsWith("BROWSER_")) env[k] = v;
@@ -436,6 +437,41 @@ test("§1a/N6: shutdown closes Brave BEFORE releasing the pool claim", T, async 
     const released = err.indexOf("HARNESS pool-released");
     assert.ok(closed !== -1 && released !== -1, err);
     assert.ok(closed < released, "Brave must be closed before the claim is released");
+  } finally {
+    await r.stop();
+  }
+});
+
+test("amendment 4: a CLONE relay closes its Brave HARD at shutdown (the dir is deleted next); a base relay does not", T, async () => {
+  for (const clone of [true, false]) {
+    const r = await startRelay({ clone });
+    try {
+      const res = await r.call();
+      assert.strictEqual(res.isError, false, res.text);
+      const exited = new Promise((x) => r.child.once("exit", x));
+      r.child.stdin.end();
+      await Promise.race([exited, new Promise((x) => setTimeout(x, 8000))]);
+      const hard = /HARNESS brave-closed brave-1 hard/.test(r.stderr());
+      assert.strictEqual(hard, clone, `${clone ? "clone" : "base"}: hard close = ${hard}`);
+      assert.ok(r.stderr().indexOf("brave-closed brave-1") < r.stderr().indexOf("HARNESS pool-released"));
+    } finally {
+      await r.stop();
+    }
+  }
+});
+
+test("§1d: the Meta guard is installed for EVERY Brave generation, attached ones included, on that Brave's endpoint", T, async () => {
+  const ws = "ws://127.0.0.1:10040/devtools/browser/abcdefab-0000-0000-0000-000000000040";
+  const r = await startRelay({ attachable: { pid: 1, port: 10040, wsEndpoint: ws } });
+  try {
+    await r.call(); // attach
+    fs.rmSync(path.join(r.dir, "attachable"));
+    await r.killBrave();
+    await r.call(); // relaunch
+    const installs = r.stderr().match(/HARNESS guard-installed \S+/g) || [];
+    assert.strictEqual(installs.length, 2, installs.join("\n"));
+    assert.strictEqual(installs[0], `HARNESS guard-installed ${ws}`, "attached generation guarded");
+    assert.match(installs[1], /guard-installed ws:\/\/127\.0\.0\.1:10032\/devtools\/browser\/0{8}-0{4}-0{4}-0{4}-0{11}2$/, "relaunched generation guarded");
   } finally {
     await r.stop();
   }

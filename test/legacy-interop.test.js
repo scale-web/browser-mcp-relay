@@ -20,6 +20,9 @@ const OLD_REV = "ecb7b6c";
 let oldRoot = null;
 function oldCode() {
   if (oldRoot) return oldRoot;
+  // A pre-extracted `git archive ecb7b6c` (used when the suite runs from a
+  // copy without .git, e.g. the mutation runner).
+  if (process.env.RELAY_OLD_CODE_DIR) return (oldRoot = process.env.RELAY_OLD_CODE_DIR);
   const dest = homeTmp("old-relay-");
   const archive = spawnSync("git", ["-C", REPO, "archive", OLD_REV, "src"], { maxBuffer: 64 * 1024 * 1024 });
   if (archive.status !== 0) throw new Error(`git archive failed: ${archive.stderr}`);
