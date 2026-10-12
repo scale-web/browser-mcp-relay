@@ -49,6 +49,16 @@ const cacheRoot = path.join(os.homedir(), "Library", "Caches", "browser-mcp-rela
 const profilesRoot = path.join(cacheRoot, "profiles");
 const regPath = path.join(cacheRoot, "project-registry.json");
 
+// The test hook is refused BEFORE this wrapper writes anything (Phase 1 review:
+// with a real HOME it registered the project and created its profile dir, and
+// only then did the relay refuse).
+{
+  const { testLaunchRequested, assertTestLaunchAllowed } = require(path.join(__dirname, "src", "cdp-bridge.js"));
+  if (testLaunchRequested()) {
+    try { assertTestLaunchAllowed(); } catch (e) { process.stderr.write(`${e.message}\n`); process.exit(1); }
+  }
+}
+
 /** {} when there is no registry yet; null when it exists but did not parse —
  *  the caller must then NOT write it back. */
 function readRegistry() {

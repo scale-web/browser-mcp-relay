@@ -61,6 +61,9 @@ test("checkToolArgs: URL arguments of every navigating tool, and Meta cookies, a
     ["lighthouse_audit", { url: "https://www.messenger.com/" }],
     ["cookies_import", { cookies: [{ name: "sessionid", value: "x", domain: ".instagram.com", path: "/" }] }],
     ["cookies_import", { cookies: [{ name: "c_user", value: "x", url: "https://www.facebook.com/" }] }],
+    // Phase 1 review: an ALLOWED page's URL still sets a facebook.com session cookie.
+    ["cookies_import", { cookies: [{ name: "xs", value: "x", url: "https://www.facebook.com/ads/library/" }] }],
+    ["cookies_import", { cookies: [{ name: "xs", value: "x", domain: "developers.facebook.com" }] }],
   ];
   for (const [name, args] of cases) {
     const r = g.checkToolArgs(name, args);

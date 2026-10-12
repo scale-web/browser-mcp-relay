@@ -350,6 +350,37 @@ test("Meta guard: a service-worker-served Meta navigation never shows Meta conte
   }
 });
 
+test("Meta guard: a URL the Fetch layer just blocked, then served by a service worker, is still evicted (Phase 1 review: no 30 s watchdog skip)", ISO, async () => {
+  await startServer();
+  const { chromium } = require("playwright-core");
+  const dir = homeTmp("guard-sw2-");
+  const ctx = await chromium.launchPersistentContext(dir, {
+    headless: true, executablePath: BRAVE, handleSIGINT: false, handleSIGTERM: false,
+    args: ["--remote-debugging-port=0", "--ignore-certificate-errors", ...require("../src/cdp-bridge.js").TEST_LAUNCH_ARGS],
+  });
+  let g;
+  try {
+    const file = await id.waitForDevToolsActivePort(dir);
+    const ws = await id.verifyPortIdentity(file.port, file.browserPath);
+    const blocked = [];
+    g = await guard.installMetaGuard({ wsEndpoint: ws, onBlocked: (host) => blocked.push(host) });
+    guard.installWatchdog(ctx, { recentlyBlocked: g.recentlyBlocked, onBlocked: (host) => blocked.push(`watchdog:${host}`) });
+    const p = await ctx.newPage();
+    await p.goto(U("www.facebook.com", "/sw-login")).catch(() => {});   // 1. the Fetch layer blocks it
+    await new Promise((r) => setTimeout(r, 800));
+    assert.ok(await isGuardPage(p), `the guard's own 403 page stays (url ${p.url()})`);
+    await p.goto(U("www.facebook.com", "/ads/library/sw-setup"));       // 2. an allowed page registers a SW
+    await p.waitForFunction(() => document.title === "SW-READY", null, { timeout: 10000 });
+    await p.goto(U("www.facebook.com", "/sw-login")).catch(() => {});   // 3. same URL, within seconds, from the SW
+    await new Promise((r) => setTimeout(r, 2500));
+    const body = await p.content().catch(() => "");
+    assert.doesNotMatch(body, /SERVED-BY-SERVICE-WORKER/, `SW content must not stay on screen (url ${p.url()})`);
+  } finally {
+    if (g) g.close();
+    await ctx.close();
+  }
+});
+
 test("Meta guard: if the guard's CDP session dies while a new target waits for it, the target resumes (no hang)", ISO, async () => {
   await startServer();
   const { h } = await launch("guard-death-");

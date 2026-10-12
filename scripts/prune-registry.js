@@ -21,6 +21,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const profileLock = require("../src/profile-lock.js");
+const processShim = require("../src/process-shim.js");
 
 function isTempPath(p, home = os.homedir()) {
   const real = (q) => { try { return fs.realpathSync(q); } catch { return q; } };
@@ -57,14 +58,43 @@ function plan({ cacheRoot }) {
   return { regPath, reg, tempKeys, dirsToPrune, forHuman };
 }
 
-function apply(p, { now = new Date() } = {}) {
+/** A copy of pool-shared's commandHasUserDataDir (requiring pool-shared would
+ *  load the legacy pool wrapper beside the checkout). */
+function holdsDir(cmd, dir) {
+  if (!cmd || !dir) return false;
+  if (cmd.includes(`--user-data-dir="${dir}"`)) return true;
+  const bare = `--user-data-dir=${dir}`;
+  let idx = 0;
+  while ((idx = cmd.indexOf(bare, idx)) !== -1) {
+    const after = cmd[idx + bare.length];
+    if (after === undefined || after === " " || after === "\t" || after === '"') return true;
+    idx += bare.length;
+  }
+  return false;
+}
+
+/** Spec's "removable", the same test GC applies (Phase 1 review: the prune used
+ *  "free" alone and removed a dir a live Brave held): the dir's mtime, read
+ *  BEFORE its flock is opened, is over 60 s old; the predicate says free; and
+ *  no live Brave holds it (one `ps` for the whole run). */
+function apply(p, { now = new Date(), graceMs = 60_000 } = {}) {
   const backup = `${p.regPath}.bak-${now.toISOString().replace(/[:.]/g, "-")}`;
   fs.copyFileSync(p.regPath, backup);
   const removedDirs = [];
   const busy = [];
+  let braves = null;
   for (const d of p.dirsToPrune) {
+    let age;
+    try { age = now.getTime() - fs.statSync(d).mtimeMs; } catch (e) { busy.push({ dir: d, why: e.code || e.message }); continue; }
+    if (age < graceMs) { busy.push({ dir: d, why: "changed in the last 60 s" }); continue; }
     const c = profileLock.classifyDir(d);
     if (!c.free) { busy.push({ dir: d, why: c.reason }); continue; }
+    if (braves === null) braves = processShim.listProcessesByCommand(process.platform === "win32" ? "brave.exe" : "brave");
+    if (braves.some((b) => holdsDir(b.command, d))) {
+      profileLock.closeFlock(c.flock);
+      busy.push({ dir: d, why: "a live Brave holds it" });
+      continue;
+    }
     try {
       fs.rmSync(d, { recursive: true, force: true }); // under its flock
       removedDirs.push(d);

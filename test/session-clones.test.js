@@ -409,3 +409,10 @@ test("index.js claims via claimSlotWithRetry (retry + clone fallback), not bare 
   const src = fs.readFileSync(path.resolve(__dirname, "..", "src", "index.js"), "utf8");
   assert.ok(/await\s+pool\.claimSlotWithRetry\(\)/.test(src));
 });
+
+test("BROWSER_RELAY_EPHEMERAL_POOL_DIR=1 is refused unless the pool dir is a session clone (Phase 1 review: cleanup would rm -rf a base profile)", async () => {
+  await assert.rejects(
+    pool.claimSlotWithRetry({ _env: { ...process.env, BROWSER_RELAY_EPHEMERAL_POOL_DIR: "1" }, retries: 0 }),
+    /not under .*session-clones.* refusing/,
+  );
+});

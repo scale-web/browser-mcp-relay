@@ -703,6 +703,14 @@ async function claimSlotWithRetry(opts = {}) {
 
   if (!opts._claimSlot && env.BROWSER_RELAY_EPHEMERAL_POOL_DIR === "1") {
     const dir = CONFIG.poolDirs[0];
+    // This flag makes cleanup rm -rf the dir, so it must be a session-clone dir
+    // (Phase 1 review: any local-config.json key becomes an env var, and a stray
+    // one would have deleted a base profile and its logins at exit).
+    const real = (q) => { try { return fs.realpathSync(q); } catch { return path.resolve(q); } };
+    const root = real(sessionClonesRoot(env)) + path.sep;
+    if (!(real(dir) + path.sep).startsWith(root) || real(dir) + path.sep === root) {
+      throw new Error(`[mcp-relay] BROWSER_RELAY_EPHEMERAL_POOL_DIR=1 but ${dir} is not under ${root} — refusing (that flag deletes the dir at exit)`);
+    }
     const claimed = await claimFreshClone(dir, opts);
     if (!claimed) throw new Error(`[mcp-relay] could not claim the fresh ephemeral dir ${dir}`);
     return { ...claimed, role: "default", release: () => {}, cleanup: ownedDirCleanup(dir, claimed), ephemeral: true, baseDir: null };

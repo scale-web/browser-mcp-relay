@@ -25,8 +25,8 @@
 const WebSocket = require("ws");
 
 // ─────────────────────────────────────────────────────────────────────────────
-// THE LISTS — PROPOSED, NOT YET CONFIRMED BY TREVOR (spec v4 "Decisions for
-// Trevor" #1). Edit here; nothing else needs to change.
+// THE LISTS — confirmed by Trevor 2026-10-12 exactly as spec v4 §1d proposed,
+// WhatsApp Web blocked (register A49). Edit here; nothing else needs to change.
 //   block: "host" = exactly that host; "*.host" = any subdomain (NOT the apex —
 //          list the apex separately); "label.*" = that first label on any domain.
 //   allow: "host" or "host/path-prefix*" — exceptions to `block` for top-level
@@ -101,13 +101,23 @@ function blockedMessage(what) {
 // ── Layer 1: tool-argument pre-check ─────────────────────────────────────────
 const URL_ARG_KEYS = ["url", "navigateToUrl"];
 
+/** A cookie is judged by the BLOCK list alone: the allow list says which pages
+ *  may load, and a session cookie set through an allowed path (Ad Library) is
+ *  still a logged-in Meta session (Phase 1 review: `url: …/ads/library/` let
+ *  an `xs` cookie in, and the next allowed load sent it). */
+function hostOnBlockList(host) {
+  const h = String(host || "").replace(/^\./, "").toLowerCase();
+  return !!h && COMPILED.block.some((m) => m(h));
+}
+
 function cookieTargetsMeta(c) {
   if (!c || typeof c !== "object") return null;
-  if (typeof c.url === "string" && classifyUrl(c.url).blocked) return c.url;
-  if (typeof c.domain === "string") {
-    const host = c.domain.replace(/^\./, "");
-    if (classifyUrl(`https://${host}/`).blocked) return c.domain;
+  if (typeof c.url === "string") {
+    let host = null;
+    try { host = new URL(c.url).hostname; } catch { /* not a URL: judged by domain below */ }
+    if (hostOnBlockList(host)) return c.url;
   }
+  if (typeof c.domain === "string" && hostOnBlockList(c.domain)) return c.domain;
   return null;
 }
 
@@ -198,7 +208,7 @@ async function installMetaGuard({ wsEndpoint, log = () => {}, onBlocked = () => 
   const patterns = COMPILED.fetchNeedles.map((n) => ({ urlPattern: `*://*${n}*`, resourceType: "Document", requestStage: "Request" }));
   const sessions = new Map(); // sessionId → { targetId, type }
   const armed = new Map(); // targetId → sessionId (one guard session per target)
-  const recent = new Map(); // url → expiry ms (watchdog skips our own 403 pages)
+  const recent = new Map(); // url → { n: blocks not yet seen by the watchdog, exp }
   const stats = { blocked: 0, continued: 0, attached: 0 };
 
   async function arm(sessionId, targetInfo, waiting) {
@@ -237,7 +247,9 @@ async function installMetaGuard({ wsEndpoint, log = () => {}, onBlocked = () => 
     const verdict = isMainFrameDoc ? classifyUrl(p.request.url) : { blocked: false };
     if (verdict.blocked) {
       stats.blocked++;
-      recent.set(p.request.url, Date.now() + 30_000);
+      // One token per block: the guard's own 403 page consumes it in the watchdog.
+      const t = recent.get(p.request.url);
+      recent.set(p.request.url, { n: (t && t.exp >= Date.now() ? t.n : 0) + 1, exp: Date.now() + 10_000 });
       log(`meta-guard: blocked top-level navigation to ${verdict.host}`);
       onBlocked(verdict.host);
       conn.send("Fetch.fulfillRequest", {
@@ -272,10 +284,14 @@ async function installMetaGuard({ wsEndpoint, log = () => {}, onBlocked = () => 
   return {
     alive: () => !conn.closed,
     close: () => conn.close(),
+    // Consumes one token: the 403 page of ONE block, never every load of that
+    // URL for a while (Phase 1 review: a URL match skipped the watchdog for
+    // 30 s, so a service worker could serve the real page in that window).
     recentlyBlocked: (url) => {
-      const exp = recent.get(url);
-      if (!exp) return false;
-      if (exp < Date.now()) { recent.delete(url); return false; }
+      const t = recent.get(url);
+      if (!t) return false;
+      if (t.exp < Date.now() || t.n < 1) { recent.delete(url); return false; }
+      if (--t.n === 0) recent.delete(url);
       return true;
     },
     stats,
@@ -298,10 +314,29 @@ function installWatchdog(context, { recentlyBlocked = () => false, onBlocked, lo
       if (frame !== page.mainFrame()) return;
       const url = frame.url();
       const v = classifyUrl(url);
-      if (!v.blocked || recentlyBlocked(url)) return; // our own 403 page is fine
-      log(`meta-guard watchdog: main frame reached ${v.host} (not via Fetch — service worker?); sending it to about:blank`);
-      onBlocked(v.host);
-      page.goto("about:blank").catch(() => {});
+      if (!v.blocked) return;
+      const evict = () => {
+        log(`meta-guard watchdog: main frame reached ${v.host} (not via Fetch — service worker?); sending it to about:blank`);
+        onBlocked(v.host);
+        page.goto("about:blank").catch(() => {});
+      };
+      if (!recentlyBlocked(url)) return evict();
+      // A token says the Fetch layer just served its 403 page for this URL.
+      // Confirm the page IS that page (its marker), not something else that
+      // committed the same URL. Polled: right after the commit the marker may
+      // not be parsed yet (a one-shot read evicted a real 403 page after a 302).
+      const deadline = Date.now() + 2000;
+      const check = () => {
+        if (frame.isDetached() || frame.url() !== url) return;        // it moved on
+        frame.evaluate(() => document.documentElement && document.documentElement.getAttribute("data-relay-meta-guard"))
+          .catch(() => null)
+          .then((mark) => {
+            if (mark === "1" || frame.isDetached() || frame.url() !== url) return;
+            if (Date.now() >= deadline) return evict();
+            setTimeout(check, 50);
+          });
+      };
+      check();
     });
   };
   for (const p of context.pages()) watch(p);

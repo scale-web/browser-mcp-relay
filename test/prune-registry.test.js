@@ -6,7 +6,7 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
+const { spawnSync, spawn } = require("node:child_process");
 const { isolated, SKIP_MSG, homeTmp, claimHolder, killAndWait, REPO } = require("./helpers/isolation.js");
 
 const ISO = { skip: !isolated() ? SKIP_MSG : (process.platform !== "darwin" ? "darwin" : false), timeout: 60000 };
@@ -53,6 +53,8 @@ function fixture() {
     [path.join(os.tmpdir(), "busy-temp")]: { slot: 4, slug: "busy-temp", dir: dirs.tempBusy },
   };
   fs.writeFileSync(path.join(cacheRoot, "project-registry.json"), JSON.stringify(reg, null, 2));
+  const old = new Date(Date.now() - 120_000); // the prune leaves anything changed in the last 60 s alone
+  for (const d of Object.values(dirs)) fs.utimesSync(d, old, old);
   return { home, cacheRoot, dirs, reg, tmpA, tmpB, real };
 }
 
@@ -91,5 +93,27 @@ test("prune-registry --apply: backs up, drops temp keys, removes only temp-only 
     assert.match(r.stdout, /no registry key maps to it/);
   } finally {
     await killAndWait(holder.child);
+  }
+});
+
+test("prune-registry --apply: a removable dir needs age > 60 s AND no live Brave holding it (Phase 1 review: it used \"free\" alone)", ISO, async () => {
+  const young = fixture();
+  const now = new Date();
+  fs.utimesSync(young.dirs.tempOnly, now, now); // changed just now
+  const r1 = run(young, ["--apply"]);
+  assert.strictEqual(r1.status, 0, r1.stderr);
+  assert.ok(fs.existsSync(young.dirs.tempOnly), "a dir changed in the last 60 s is kept");
+
+  const held = fixture();
+  // A stand-in Brave: its command line names the dir as its user-data-dir.
+  const brave = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)", "brave", `--user-data-dir=${held.dirs.tempOnly}`], { stdio: "ignore" });
+  try {
+    await new Promise((x) => setTimeout(x, 300));
+    const r2 = run(held, ["--apply"]);
+    assert.strictEqual(r2.status, 0, r2.stderr);
+    assert.ok(fs.existsSync(held.dirs.tempOnly), "a dir a live Brave holds is kept");
+    assert.match(r2.stdout, /a live Brave holds it/);
+  } finally {
+    await killAndWait(brave);
   }
 });
