@@ -5,6 +5,7 @@
   "type": "commonjs",
   "scripts": {
     "test": "node scripts/run-tests.js",
+    "test:isolated": "node scripts/test-harness.js",
     "start": "node src/index.js",
     "setup": "node scripts/setup.js",
     "smoke": "node scripts/smoke.js",
