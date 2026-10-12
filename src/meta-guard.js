@@ -344,8 +344,10 @@ function installWatchdog(context, { recentlyBlocked = () => false, onBlocked, lo
         frame.evaluate(({ id, first }) => {
           const d = document;
           const mark = d.documentElement ? d.documentElement.getAttribute("data-relay-meta-guard") : null;
-          if (first) { d.__relayGuardStamp = id; return { mark, same: true }; }
-          return { mark, same: d.__relayGuardStamp === id };
+          // The document's ORIGINAL URL: replaceState cannot change it.
+          const nav = (performance.getEntriesByType && performance.getEntriesByType("navigation")[0] || {}).name || null;
+          if (first) { d.__relayGuardStamp = id; return { mark, same: true, nav }; }
+          return { mark, same: d.__relayGuardStamp === id, nav };
         }, { id: stampId, first: !stamped }).catch(() => null),
         new Promise((r) => setTimeout(() => r(null), 500)),           // a hung page still meets the deadline
       ]);
@@ -353,8 +355,11 @@ function installWatchdog(context, { recentlyBlocked = () => false, onBlocked, lo
         if (frame.isDetached()) return;
         read().then((r) => {
           if (frame.isDetached()) return;
-          // (No URL check on the first read: the page's own script may already have
-          // replaceState'd it. A real navigation in the gap is judged fail-closed.)
+          // The first read may already be on the NEXT document (re-review 2: the
+          // agent's next goto right after a block was stamped and evicted). Only a
+          // document loaded FROM the blocked URL is ours to watch; its own URL may
+          // since have been replaceState'd, its navigation entry's may not.
+          if (r && !stamped && r.nav && noFragment(r.nav) !== bare) return;
           if (r && !r.same) return;                                   // a new document committed
           if (r) stamped = true;
           if (r && r.mark === "1") return;                            // the guard's own 403 page

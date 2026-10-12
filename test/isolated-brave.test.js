@@ -430,6 +430,40 @@ test("Meta guard: the 403 page for a URL with a #fragment stays (tokens are keye
   }
 });
 
+test("Meta guard: the agent's NEXT allowed page right after a block is never evicted (re-review 2: 15/15 were)", ISO, async () => {
+  await startServer();
+  const { h } = await launch("guard-next-");
+  let g;
+  const reported = [];
+  try {
+    g = await guard.installMetaGuard({ wsEndpoint: h.wsEndpoint });
+    guard.installWatchdog(h.context, { recentlyBlocked: g.recentlyBlocked, onBlocked: (host) => reported.push(host) });
+    const p = await h.context.newPage();
+    for (let i = 0; i < 5; i++) {
+      // a. a blocked goto, then the usual immediate retry somewhere allowed
+      await p.goto(U("www.facebook.com", `/login-${i}`)).catch(() => {});
+      await p.goto(U("allowed.test", `/after-${i}`));
+      // b. an allowed page that 302s to a blocked one, then an allowed goto
+      await p.goto(U("allowed.test", "/redirect-to-fb")).catch(() => {});
+      await p.goto(U("allowed.test", `/after-302-${i}`));
+      await new Promise((r) => setTimeout(r, 2600));                     // past the poll's deadline
+      assert.strictEqual(p.url(), U("allowed.test", `/after-302-${i}`), `round ${i}: the allowed page stayed`);
+    }
+    // c. back/forward through a 403 page: A -> blocked -> B -> back (403) -> back to A
+    await p.goto(U("allowed.test", "/A"));
+    await p.goto(U("www.instagram.com", "/bf")).catch(() => {});
+    await p.goto(U("allowed.test", "/B"));
+    await p.goBack().catch(() => {});
+    await p.goBack().catch(() => {});
+    await new Promise((r) => setTimeout(r, 2600));
+    assert.strictEqual(p.url(), U("allowed.test", "/A"), "back to A stays on A");
+    assert.deepStrictEqual(reported, [], "the watchdog evicted nothing");
+  } finally {
+    if (g) g.close();
+    await closeBrave(h);
+  }
+});
+
 test("Meta guard: if the guard's CDP session dies while a new target waits for it, the target resumes (no hang)", ISO, async () => {
   await startServer();
   const { h } = await launch("guard-death-");
