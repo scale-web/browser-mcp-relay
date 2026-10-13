@@ -30,6 +30,15 @@ let current = null;
 // but its own browser uuid — exactly like a real port-0 relaunch that
 // happens to be handed the same number.
 const FAKE_PORT = 10032;
+// $HARNESS_DIR/brave-port = N: launches use port N instead — a real listener
+// the test owns — and the relay process itself holds a TCP connection to it,
+// as Playwright's CDP connection does (idle-reaper-cdp-clients.test.js).
+const bravePort = () => { try { return Number(fs.readFileSync(path.join(dir, "brave-port"), "utf8")); } catch { return null; } };
+function holdRelayCdpConnection(port, context) {
+  const sock = require("node:net").connect(port, "127.0.0.1");
+  sock.on("error", () => {});
+  context.on("close", () => sock.destroy());
+}
 function fakeBrave(port, attached, wsEndpoint) {
   const id = `brave-${++braveSeq}`;
   wsEndpoint = wsEndpoint || `ws://127.0.0.1:${port}/devtools/browser/00000000-0000-0000-0000-${String(braveSeq).padStart(12, "0")}`;
@@ -42,6 +51,7 @@ function fakeBrave(port, attached, wsEndpoint) {
   context.pages = () => [];
   const handle = { context, cdpConnectUrl: `http://127.0.0.1:${port}`, port, wsEndpoint, id };
   if (attached) Object.assign(handle, { attached: true, browser });
+  if (port === bravePort()) holdRelayCdpConnection(port, context);
   current = handle;
   // $HARNESS_DIR/die-on-launch = N: Brave launch N dies right after
   // ensureBrave() returns it — before the forwarded call reaches upstream —
@@ -60,7 +70,7 @@ stubModule(path.join(SRC, "cdp-bridge.js"), {
   launchBrave: async () => {
     const ms = launchDelay();
     if (ms) { log(`launch-started`); await new Promise((r) => setTimeout(r, ms)); }
-    return fakeBrave(FAKE_PORT, false);
+    return fakeBrave(bravePort() || FAKE_PORT, false);
   },
   attachBrave: async ({ port, wsEndpoint }) => fakeBrave(port, true, wsEndpoint),
   closeBrave: async (h) => { if (h) { log(`brave-closed ${h.id}`); h.context.emit("close"); } },

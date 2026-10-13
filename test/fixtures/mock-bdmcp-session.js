@@ -22,6 +22,12 @@ fs.appendFileSync(path.join(dir, "upstream-env"), JSON.stringify({
   openInspect: process.env.BROWSER_CDP_OPEN_INSPECT || null,
   messagingKeys: Object.keys(process.env).filter((k) => k.startsWith("CLAUDE_CODE_MESSAGING_")),
 }) + "\n");
+// $HARNESS_DIR/upstream-connects: hold a TCP connection to the endpoint's
+// port, as BDMCP's CDP connection does (never to the unreachable placeholder).
+if (fs.existsSync(path.join(dir, "upstream-connects"))) {
+  const port = Number(new URL(process.env.BROWSER_CDP_ENDPOINT_URL || "ws://127.0.0.1:1/").port);
+  if (port > 1) require("node:net").connect(port, "127.0.0.1").on("error", () => {});
+}
 const readAlive = () => {
   try { return fs.readFileSync(path.join(dir, "brave-alive"), "utf8"); } catch { return "none"; }
 };

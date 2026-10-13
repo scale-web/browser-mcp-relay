@@ -43,6 +43,7 @@ const { tools: ownTools } = require("./own-tools/index.js");
 const { applyLocalConfigToEnv } = require("./local-config.js");
 const { loadVaultFromEnv } = require("./vault.js");
 const { attachAutofill } = require("./autofill-injector.js");
+const { listExternalCdpClients } = require("./cdp-clients.js");
 
 // Layer local-config.json under env so resolveBdmcpEntry / launch flags see
 // it transparently. pool-shared.js applies the same overlay independently.
@@ -626,6 +627,21 @@ async function main() {
   // used (not closeBrave) so ATTACHED Braves are actually terminated —
   // reclaiming RAM is the whole point here, unlike shutdown where the
   // disconnect-only semantics preserve tabs for the next session.
+  //
+  // Browser-activity signal (2026-10-12, register A51 D1): sessions also drive
+  // their Brave DIRECTLY over its CDP port from shell scripts (a websocket to
+  // 127.0.0.1:<cdpPort>), which no MCP call reveals — the reaper killed Braves
+  // mid-script 3x on 2026-10-12. So when a tick WOULD reap, it first lists the
+  // ESTABLISHED client sockets to 127.0.0.1:<this Brave's cdpPort>
+  // (src/cdp-clients.js, one lsof, 3 s timeout). Any socket owned by a process
+  // other than the relay, the upstream child or the Brave main process counts
+  // as activity: activity is bumped and nothing is reaped. Only a connection
+  // OPEN at the tick is seen — a script that connects and exits between ticks
+  // leaves no trace. If lsof fails or times out (missing on Windows, a broken
+  // PATH, a stalled system), that tick falls back to the pre-2026-10-12
+  // MCP-only rule and reaps, logged once per relay: never reaping would
+  // silently remove the RAM bound for the life of the relay wherever lsof is
+  // unusable, while a reap that ends one script is the old, known cost.
   let lastActivityAt = Date.now();
   // In-flight request counter: the reaper must never fire while a call is
   // running, even one that outlives the idle threshold (a lighthouse run
@@ -633,6 +649,27 @@ async function main() {
   // Brave killed mid-flight).
   let inFlightRequests = 0;
   function bumpActivity() { lastActivityAt = Date.now(); }
+
+  let cdpClientCheckFailureLogged = false;
+  /** True when a foreign process holds an ESTABLISHED CDP connection to the
+   *  current Brave (bumps activity). False when none does, or the check failed. */
+  async function externalCdpClientsSeen() {
+    if (!bridge || !port) return false;
+    const excludePids = [process.pid, upstreamChild && upstreamChild.pid, sidecar.data.bravePid];
+    const r = await listExternalCdpClients({ port, excludePids, timeoutMs: 3000 });
+    if (!r.ok) {
+      if (!cdpClientCheckFailureLogged) {
+        cdpClientCheckFailureLogged = true;
+        process.stderr.write(`[mcp-relay] idle reaper: external-CDP-client check unavailable (${r.reason}); falling back to MCP-only idleness for such ticks (logged once)\n`);
+      }
+      return false;
+    }
+    if (r.clients.length === 0) return false;
+    bumpActivity();
+    const pids = [...new Set(r.clients.map((c) => c.pid))].join(",");
+    process.stderr.write(`[mcp-relay] idle reaper: external CDP client(s) on 127.0.0.1:${port} (pid ${pids}) — Brave kept, idle clock reset\n`);
+    return true;
+  }
 
   function idleReapUpstream() {
     if (!upstreamChild) return;
@@ -662,7 +699,22 @@ async function main() {
     : parseFloat(idleMinutesRaw);
   if (Number.isFinite(idleMinutes) && idleMinutes > 0) {
     const idleMs = idleMinutes * 60_000;
+    // One check at a time: a slow lsof must not stack ticks (or lsofs).
+    let reapCheckRunning = false;
     const tick = setInterval(async () => {
+      if (reapCheckRunning) return;
+      if (inFlightRequests > 0) return;
+      if (Date.now() - lastActivityAt < idleMs) return;
+      if (!bridge && !upstreamChild) return;
+      reapCheckRunning = true;
+      try {
+        if (await externalCdpClientsSeen()) return;
+      } catch (e) {
+        process.stderr.write(`[mcp-relay] idle reaper: external-CDP-client check threw: ${e.message}\n`);
+      } finally {
+        reapCheckRunning = false;
+      }
+      // A call may have started or finished while lsof ran.
       if (inFlightRequests > 0) return;
       if (Date.now() - lastActivityAt < idleMs) return;
       if (!bridge && !upstreamChild) return;
