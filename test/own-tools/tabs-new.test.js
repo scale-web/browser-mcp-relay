@@ -1,6 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const tool = require("../../src/own-tools/tabs-new.js");
+const sync = require("../../src/own-tools/_upstream-sync.js");
+const { fakeUpstream } = require("../fixtures/fake-upstream-page.js");
 
 test("tabs_new has required tool shape", () => {
   assert.strictEqual(tool.name, "tabs_new");
@@ -42,91 +44,99 @@ function makeFakeBridge() {
   };
 }
 
-test("tabs_new without url: does NOT call upstream propagate", async () => {
+test("tabs_new without url: does NOT call upstream, and warns that upstream tools act on another tab", async () => {
   const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  let upstreamCalled = false;
+  const up = fakeUpstream({ url: "https://a.example/" });
+  const restore = up.install();
   globalThis.__relayBridge = makeFakeBridge();
-  globalThis.__relayUpstream = async () => ({
-    request: async () => { upstreamCalled = true; return {}; },
-  });
   try {
     const result = await tool.handler({});
     assert.strictEqual(result.isError, undefined);
-    const payload = JSON.parse(result.content[0].text);
+    assert.match(result.content[0].text, /UPSTREAM DESYNC/);
+    const payload = JSON.parse(result.content[1].text);
     assert.strictEqual(payload.upstreamPropagated, false);
-    assert.strictEqual(upstreamCalled, false, "upstream must NOT be called when no url");
+    assert.match(payload.upstreamReason, /about:blank/);
+    assert.strictEqual(up.calls.length, 0, "upstream must NOT be called when no url");
   } finally {
     globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
+    restore();
   }
 });
 
 test("tabs_new with url: calls upstream navigation_go-to with that url", async () => {
   const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  let calledWith = null;
+  const up = fakeUpstream();
+  const restore = up.install();
   globalThis.__relayBridge = makeFakeBridge();
-  globalThis.__relayUpstream = async () => ({
-    request: async (method, params) => {
-      calledWith = { method, params };
-      return {};
-    },
-  });
   try {
     const result = await tool.handler({ url: "https://example.com/foo" });
     assert.strictEqual(result.isError, undefined);
+    assert.strictEqual(result.content.length, 1, "no warning when synced");
     const payload = JSON.parse(result.content[0].text);
     assert.strictEqual(payload.upstreamPropagated, true);
     assert.strictEqual(payload.url, "https://example.com/foo");
-    assert.ok(calledWith, "upstream.request must be invoked");
-    assert.strictEqual(calledWith.method, "tools/call");
-    assert.strictEqual(calledWith.params.name, "navigation_go-to");
-    assert.strictEqual(calledWith.params.arguments.url, "https://example.com/foo");
+    const navs = up.navs();
+    assert.strictEqual(navs.length, 1, "upstream navigation_go-to must be invoked");
+    assert.strictEqual(navs[0].method, "tools/call");
+    assert.strictEqual(navs[0].params.arguments.url, "https://example.com/foo");
     // Snapshot/screenshot must be disabled to keep the propagation cheap.
-    assert.strictEqual(calledWith.params.arguments.includeSnapshot, false);
-    assert.strictEqual(calledWith.params.arguments.includeScreenshot, false);
+    assert.strictEqual(navs[0].params.arguments.includeSnapshot, false);
+    assert.strictEqual(navs[0].params.arguments.includeScreenshot, false);
   } finally {
     globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
+    restore();
   }
 });
 
 test("tabs_new: upstream failure does NOT fail the tool call", async () => {
   const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
+  const restore = fakeUpstream({ fail: "upstream blew up" }).install();
   globalThis.__relayBridge = makeFakeBridge();
-  globalThis.__relayUpstream = async () => ({
-    request: async () => { throw new Error("upstream blew up"); },
-  });
   try {
     const result = await tool.handler({ url: "https://example.com/" });
     assert.strictEqual(result.isError, undefined, "tool must succeed even if upstream fails");
-    const payload = JSON.parse(result.content[0].text);
+    const payload = JSON.parse(result.content[result.content.length - 1].text);
     assert.strictEqual(payload.upstreamPropagated, false);
+    assert.match(payload.upstreamReason, /upstream blew up/);
   } finally {
     globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
+    restore();
+  }
+});
+
+test("tabs_new: upstream's tab on the user's page is left alone; the result warns first", async () => {
+  const prevBridge = globalThis.__relayBridge;
+  const up = fakeUpstream({ url: "https://user-signed-in.example/dashboard" });
+  const restore = up.install();
+  globalThis.__relayBridge = makeFakeBridge();
+  try {
+    const result = await tool.handler({ url: "https://example.com/" });
+    assert.strictEqual(result.isError, undefined);
+    assert.match(result.content[0].text, /UPSTREAM DESYNC.*user-signed-in/);
+    const payload = JSON.parse(result.content[1].text);
+    assert.strictEqual(payload.upstreamPropagated, false);
+    assert.strictEqual(payload.upstreamUrl, "https://user-signed-in.example/dashboard");
+    assert.strictEqual(up.navs().length, 0);
+  } finally {
+    globalThis.__relayBridge = prevBridge;
+    restore();
   }
 });
 
 test("tabs_new: about:blank URL skips upstream propagation", async () => {
   const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  let upstreamCalled = false;
+  const up = fakeUpstream();
+  const restore = up.install();
   globalThis.__relayBridge = makeFakeBridge();
-  globalThis.__relayUpstream = async () => ({
-    request: async () => { upstreamCalled = true; return {}; },
-  });
   try {
     const result = await tool.handler({ url: "about:blank" });
     assert.strictEqual(result.isError, undefined);
-    const payload = JSON.parse(result.content[0].text);
+    const payload = JSON.parse(result.content[result.content.length - 1].text);
     assert.strictEqual(payload.upstreamPropagated, false);
-    assert.strictEqual(upstreamCalled, false);
+    assert.strictEqual(up.calls.length, 0);
   } finally {
     globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
+    restore();
   }
 });
 
@@ -155,22 +165,20 @@ function makeFakeBridgeWithFailingGoto(errMsg = "net::ERR_NAME_NOT_RESOLVED") {
 
 test("T0-7: tabs_new with bad URL returns isError + navError + does NOT propagate", async () => {
   const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  let upstreamCalled = false;
+  const up = fakeUpstream();
+  const restore = up.install();
   globalThis.__relayBridge = makeFakeBridgeWithFailingGoto();
-  globalThis.__relayUpstream = async () => ({
-    request: async () => { upstreamCalled = true; return {}; },
-  });
   try {
     const result = await tool.handler({ url: "https://no-such-host.invalid/" });
     assert.strictEqual(result.isError, true);
-    const payload = JSON.parse(result.content[0].text);
+    const payload = JSON.parse(result.content[result.content.length - 1].text);
     assert.match(payload.navError, /ERR_NAME_NOT_RESOLVED|invalid/i);
     assert.strictEqual(payload.upstreamPropagated, false);
-    assert.strictEqual(upstreamCalled, false, "upstream must NOT be called when goto fails");
+    assert.strictEqual(up.calls.length, 0, "upstream must NOT be called when goto fails");
+    assert.strictEqual(sync.isDesynced(), true, "upstream still shows another tab");
   } finally {
     globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
+    restore();
   }
 });
 

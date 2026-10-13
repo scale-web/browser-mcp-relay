@@ -1,6 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const tool = require("../../src/own-tools/tabs-select.js");
+const sync = require("../../src/own-tools/_upstream-sync.js");
+const { fakeUpstream } = require("../fixtures/fake-upstream-page.js");
 
 test("tabs_select has required tool shape", () => {
   assert.strictEqual(tool.name, "tabs_select");
@@ -87,74 +89,85 @@ test("V1-5: tabs_select error message includes pages-count for actionability", a
   }
 });
 
-test("tabs_select: about:blank target skips upstream propagation", async () => {
+test("tabs_select: about:blank target skips upstream propagation and warns (the 2026-10-13 incident)", async () => {
   const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  let upstreamCalled = false;
-  globalThis.__relayBridge = makeFakeBridge(["about:blank", "about:blank"]);
-  globalThis.__relayUpstream = async () => ({
-    request: async () => { upstreamCalled = true; return {}; },
-  });
+  const up = fakeUpstream({ url: "https://user-signed-in.example/dashboard" });
+  const restore = up.install();
+  globalThis.__relayBridge = makeFakeBridge(["about:blank", "https://user-signed-in.example/dashboard"]);
   try {
     const result = await tool.handler({ index: 0 });
     assert.strictEqual(result.isError, undefined);
-    const payload = JSON.parse(result.content[0].text);
+    assert.match(result.content[0].text, /UPSTREAM DESYNC/);
+    const payload = JSON.parse(result.content[1].text);
     assert.strictEqual(payload.selected, 0);
     assert.strictEqual(payload.upstreamPropagated, false);
-    assert.strictEqual(upstreamCalled, false);
+    assert.strictEqual(up.calls.length, 0);
+    assert.strictEqual(sync.isDesynced(), true);
     // bringToFront still called (Playwright-side focus)
     assert.strictEqual(globalThis.__relayBridge._pages[0]._bringCalled, 1);
   } finally {
     globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
+    restore();
   }
 });
 
 test("tabs_select: real URL triggers upstream navigation_go-to", async () => {
   const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
-  let calledWith = null;
+  const up = fakeUpstream();
+  const restore = up.install();
   globalThis.__relayBridge = makeFakeBridge([
     "about:blank",
     "file:///c/tmp/test.html",
   ]);
-  globalThis.__relayUpstream = async () => ({
-    request: async (method, params) => {
-      calledWith = { method, params };
-      return {};
-    },
-  });
   try {
     const result = await tool.handler({ index: 1 });
     assert.strictEqual(result.isError, undefined);
+    assert.strictEqual(result.content.length, 1, "no warning when synced");
     const payload = JSON.parse(result.content[0].text);
     assert.strictEqual(payload.selected, 1);
     assert.strictEqual(payload.url, "file:///c/tmp/test.html");
     assert.strictEqual(payload.upstreamPropagated, true);
-    assert.ok(calledWith, "upstream.request must be invoked");
-    assert.strictEqual(calledWith.params.name, "navigation_go-to");
-    assert.strictEqual(calledWith.params.arguments.url, "file:///c/tmp/test.html");
+    assert.strictEqual(up.navs().length, 1, "upstream navigation_go-to must be invoked");
+    assert.strictEqual(up.navs()[0].params.arguments.url, "file:///c/tmp/test.html");
     assert.strictEqual(globalThis.__relayBridge._pages[1]._bringCalled, 1);
   } finally {
     globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
+    restore();
   }
 });
 
 test("tabs_select: upstream failure does NOT fail the tool call", async () => {
   const prevBridge = globalThis.__relayBridge;
-  const prevUpstream = globalThis.__relayUpstream;
+  const restore = fakeUpstream({ fail: "upstream blew up" }).install();
   globalThis.__relayBridge = makeFakeBridge(["https://example.com/"]);
-  globalThis.__relayUpstream = async () => ({
-    request: async () => { throw new Error("upstream blew up"); },
-  });
   try {
     const result = await tool.handler({ index: 0 });
     assert.strictEqual(result.isError, undefined);
-    const payload = JSON.parse(result.content[0].text);
+    const payload = JSON.parse(result.content[result.content.length - 1].text);
     assert.strictEqual(payload.upstreamPropagated, false);
+    assert.match(result.content[0].text, /UPSTREAM DESYNC/);
   } finally {
     globalThis.__relayBridge = prevBridge;
-    globalThis.__relayUpstream = prevUpstream;
+    restore();
   }
 });
+
+test("tabs_select: selecting the tab upstream already shows syncs without reloading it", async () => {
+  const prevBridge = globalThis.__relayBridge;
+  const up = fakeUpstream({ url: "https://user-signed-in.example/dashboard" });
+  const restore = up.install();
+  globalThis.__relayBridge = makeFakeBridge(["about:blank", "https://user-signed-in.example/dashboard"]);
+  try {
+    await tool.handler({ index: 0 });
+    assert.strictEqual(sync.isDesynced(), true);
+    const result = await tool.handler({ index: 1 });
+    assert.strictEqual(result.content.length, 1);
+    assert.strictEqual(JSON.parse(result.content[0].text).upstreamPropagated, true);
+    assert.strictEqual(up.navs().length, 0, "no navigation, so no reload of the user's page");
+    assert.strictEqual(sync.isDesynced(), false);
+  } finally {
+    globalThis.__relayBridge = prevBridge;
+    restore();
+  }
+});
+

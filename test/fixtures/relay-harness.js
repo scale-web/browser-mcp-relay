@@ -78,7 +78,15 @@ function fakeBrave(port, attached, wsEndpoint) {
   const context = new EventEmitter();
   context.browser = () => browser;
   context.close = async () => { context.emit("close"); };
-  context.pages = () => [];
+  // $HARNESS_DIR/fake-pages = JSON array of URLs: the tabs this Brave has
+  // (tabs_select needs some). Default: none.
+  let pages = [];
+  try {
+    pages = JSON.parse(fs.readFileSync(path.join(dir, "fake-pages"), "utf8")).map((u) => Object.assign(new EventEmitter(), {
+      url: () => u, isClosed: () => false, bringToFront: async () => {},
+    }));
+  } catch { /* none */ }
+  context.pages = () => pages;
   const handle = { context, cdpConnectUrl: `http://127.0.0.1:${port}`, port, wsEndpoint, id };
   if (attached) Object.assign(handle, { attached: true, browser });
   if (port === bravePort()) holdRelayCdpConnection(port, context);

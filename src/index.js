@@ -40,6 +40,7 @@ const profileLock = require("./profile-lock.js");
 const { installMetaGuard, installWatchdog } = require("./meta-guard.js");
 const { StatusSidecar, buildRelayStatus, modeAnnouncement, readSidecar, SIDECAR_NAME } = require("./status-sidecar.js");
 const { tools: ownTools } = require("./own-tools/index.js");
+const { reset: resetUpstreamSync } = require("./own-tools/_upstream-sync.js");
 const { applyLocalConfigToEnv } = require("./local-config.js");
 const { loadVaultFromEnv } = require("./vault.js");
 const { attachAutofill } = require("./autofill-injector.js");
@@ -325,6 +326,8 @@ async function main() {
     });
 
     upstreamClient = new UpstreamClient(child.stdout, child.stdin);
+    // A new child pins a fresh page: no desync to report, no page the relay owns.
+    resetUpstreamSync();
     return upstreamClient;
   }
 

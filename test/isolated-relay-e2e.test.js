@@ -210,3 +210,63 @@ test("attach-first across relays: a relay killed uncleanly leaves its Brave; the
     await orphan.close().catch(() => {});
   }
 });
+
+// Kit staging 2026-10-13-relay-active-page: upstream's pinned tab, once the
+// user has changed it, is never navigated by propagation (rule C); upstream
+// tools that change a page are refused while it is not the selected tab (B);
+// every upstream result says so (A). Real upstream `execute` reads the URL.
+test("e2e: a tab the user navigated is not taken over by tabs_new; execute is refused, then allowed by opt-in or by selecting it", ISO, async () => {
+  await startServer();
+  const home = homeTmp("home-");
+  const proj = path.join(home, "proj-desync");
+  const base = profileOf(home, proj);
+  const r = await startRelay({ env: { HOME: home, CLAUDE_PROJECT_DIR: proj, ...RELAY_ENV() }, realUpstream: true });
+  let browser = null;
+  try {
+    const nav = await r.call("navigation_go-to", { url: U("relay.test", "/a"), includeSnapshot: false }, 90000);
+    assert.ok(!nav.isError, nav.text);
+
+    // The user, in that same tab, goes somewhere the relay never sent it.
+    const { chromium } = require("playwright-core");
+    browser = await chromium.connectOverCDP(`http://127.0.0.1:${sidecar(base).cdpPort}`);
+    const tabs = () => browser.contexts().flatMap((c) => c.pages());
+    const pinned = tabs().find((p) => p.url() === U("relay.test", "/a"));
+    assert.ok(pinned, "upstream's tab is visible over CDP");
+    await pinned.goto(U("user.test", "/dashboard"));
+
+    const opened = await r.call("tabs_new", { url: U("relay.test", "/b") }, 60000);
+    assert.ok(!opened.isError, opened.text);
+    const payload = JSON.parse(opened.rest[opened.rest.length - 1].text);
+    assert.strictEqual(payload.upstreamPropagated, false, opened.text);
+    assert.strictEqual(payload.upstreamUrl, U("user.test", "/dashboard"));
+    assert.match(opened.text, /UPSTREAM DESYNC/);
+    assert.strictEqual(pinned.url(), U("user.test", "/dashboard"), "the user's tab was not navigated");
+
+    const refused = await r.call("execute", { code: `await page.goto(${JSON.stringify(U("relay.test", "/c"))}); return page.url();` }, 60000);
+    assert.strictEqual(refused.isError, true);
+    assert.match(refused.text, /REFUSED execute/);
+    assert.strictEqual(hits.filter((h) => h.path === "/c").length, 0);
+    assert.strictEqual(pinned.url(), U("user.test", "/dashboard"));
+
+    const optIn = await r.call("execute", { code: "return page.url();", allowPinnedPage: true }, 60000);
+    assert.ok(!optIn.isError, optIn.text);
+    assert.ok(optIn.text.includes(U("user.test", "/dashboard")), optIn.text);
+    assert.match(optIn.text, /UPSTREAM DESYNC/);
+
+    // Selecting the user's tab is a sync with no reload.
+    const listed = await r.call("tabs_list");
+    const list = JSON.parse(listed.rest[listed.rest.length - 1].text);
+    const idx = list.pages.findIndex((t) => t.url === U("user.test", "/dashboard"));
+    assert.ok(idx >= 0, JSON.stringify(list));
+    const dashHits = hits.filter((h) => h.path === "/dashboard").length;
+    const sel = await r.call("tabs_select", { index: idx }, 60000);
+    assert.doesNotMatch(sel.text, /UPSTREAM DESYNC/);
+    assert.strictEqual(JSON.parse(sel.text).upstreamPropagated, true);
+    assert.strictEqual(hits.filter((h) => h.path === "/dashboard").length, dashHits, "no reload of the user's page");
+    const ok = await r.call("execute", { code: "return 2;" }, 60000);
+    assert.ok(!ok.isError, ok.text);
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    await r.stop();
+  }
+});

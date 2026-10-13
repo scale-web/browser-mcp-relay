@@ -11,6 +11,7 @@
 
 const { propagateActivePageToUpstream } = require("./_propagate-active-page.js");
 const { setActivePage } = require("./_active-page.js");
+const sync = require("./_upstream-sync.js");
 
 module.exports = {
   name: "tabs_select",
@@ -50,12 +51,15 @@ module.exports = {
     // Propagate to upstream so content_take-screenshot etc. target this
     // tab's URL. Best-effort; about:blank is skipped to avoid churn.
     const propagation = await propagateActivePageToUpstream(url);
-    return {
-      content: [{ type: "text", text: JSON.stringify({
-        selected: index,
-        url,
-        upstreamPropagated: propagation.propagated,
-      }, null, 2) }],
-    };
+    const content = [{ type: "text", text: JSON.stringify({
+      selected: index,
+      url,
+      upstreamPropagated: propagation.propagated,
+      ...(propagation.propagated ? {} : { upstreamReason: propagation.reason, upstreamUrl: propagation.upstreamUrl || null }),
+    }, null, 2) }];
+    // Rule A: say it where the caller is already looking.
+    const warn = sync.warning();
+    if (warn) content.unshift({ type: "text", text: warn });
+    return { content };
   },
 };

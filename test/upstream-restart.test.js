@@ -476,3 +476,30 @@ test("§1d: the Meta guard is installed for EVERY Brave generation, attached one
     await r.stop();
   }
 });
+
+test("desync guard (real relay process): a blank tabs_select refuses execute; a Brave relaunch respawns upstream and clears it", T, async () => {
+  const r = await startRelay();
+  const text = (res) => res.content.map((c) => c.text).join("\n");
+  try {
+    fs.writeFileSync(path.join(r.dir, "fake-pages"), JSON.stringify(["about:blank"]));
+    await r.request("tools/list", {});
+    const warm = await r.request("tools/call", { name: "content_get-as-text", arguments: {} });
+    assert.ok(!warm.isError, text(warm));
+    const sel = await r.request("tools/call", { name: "tabs_select", arguments: { index: 0 } });
+    assert.match(text(sel), /UPSTREAM DESYNC/);
+    const before = r.upstreamPids().length;
+    const refused = await r.request("tools/call", { name: "execute", arguments: { code: "return 1" } });
+    assert.strictEqual(refused.isError, true);
+    assert.match(text(refused), /REFUSED execute/);
+    const read = await r.request("tools/call", { name: "content_get-as-text", arguments: {} });
+    assert.match(text(read), /UPSTREAM DESYNC/, "a read-only tool runs and warns");
+
+    await r.killBrave();
+    const after = await r.request("tools/call", { name: "execute", arguments: { code: "return 1" } });
+    assert.ok(!after.isError, text(after));
+    assert.doesNotMatch(text(after), /UPSTREAM DESYNC|REFUSED/);
+    assert.ok(r.upstreamPids().length > before, "the relaunch respawned upstream");
+  } finally {
+    await r.stop();
+  }
+});

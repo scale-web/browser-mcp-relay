@@ -25,6 +25,7 @@
 
 const { EventEmitter } = require("node:events");
 const metaGuard = require("./meta-guard.js");
+const sync = require("./own-tools/_upstream-sync.js");
 
 // Cap each emitted event's response body at this size (in JSON-stringified
 // chars). capture_xhr / lighthouse_audit can return MB-scale responses;
@@ -121,7 +122,26 @@ class RelayServer {
       if (!e || e.message !== "client closed") throw e;
       upstreamResponse = await (await this.getUpstream()).request("tools/list", {});
     }
-    const upstreamTools = upstreamResponse.tools || [];
+    // Guarded upstream tools (_upstream-sync.js rule B) take the relay-only
+    // opt-in; advertise it so a caller can find it. The relay strips it before
+    // forwarding.
+    const upstreamTools = (upstreamResponse.tools || []).map((t) => {
+      if (!sync.isGuarded(t.name)) return t;
+      const schema = t.inputSchema && typeof t.inputSchema === "object" ? t.inputSchema : { type: "object" };
+      return {
+        ...t,
+        inputSchema: {
+          ...schema,
+          properties: {
+            ...(schema.properties || {}),
+            [sync.OPT_IN]: {
+              type: "boolean",
+              description: "Relay-only. Run even though tabs_select / tabs_new could not point upstream's tab at the selected one (the relay then refuses this tool and says why). Acts on upstream's tab, not the selected one.",
+            },
+          },
+        },
+      };
+    });
     const ownTools = Array.from(this.ownTools.values()).map(({ name, description, inputSchema }) => ({
       name, description, inputSchema,
     }));
@@ -187,9 +207,27 @@ class RelayServer {
         }
       } else {
         // Forwarded — upstream lazily attaches via CDP. Brave must be up first.
+        // Rule B (_upstream-sync.js): while upstream's tab is not the selected
+        // one, a tool that changes the page is refused unless opted in.
+        // Checked after ensureBrave()/getUpstream(): a Brave relaunch respawns
+        // upstream, which pins a fresh page and clears the old desync.
+        const { args: fwdArgs, optIn } = sync.stripOptIn(args);
+        const guarded = sync.isGuarded(name);
         if (this.ensureBrave) await this.ensureBrave();
         const upstream = await this.getUpstream();
-        response = await upstream.request("tools/call", { name, arguments: args });
+        if (guarded && sync.isDesynced() && !optIn) {
+          response = sync.refusal(name);
+        } else {
+          const before = guarded ? await sync.readUpstreamUrl() : null;
+          response = await upstream.request("tools/call", { name, arguments: fwdArgs });
+          if (guarded) await sync.afterGuardedCall(before);
+          // Rule A: every upstream result says so while upstream's tab is not
+          // the selected one.
+          const warn = sync.warning();
+          if (warn && response && Array.isArray(response.content)) {
+            response = { ...response, content: [{ type: "text", text: warn }, ...response.content] };
+          }
+        }
       }
       if (response && response.isError) status = "error";
       const notices = response && Array.isArray(response.content) ? this.takeNotices() : [];

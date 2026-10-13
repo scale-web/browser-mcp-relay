@@ -1,99 +1,160 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const { propagateActivePageToUpstream } = require("../../src/own-tools/_propagate-active-page.js");
+const sync = require("../../src/own-tools/_upstream-sync.js");
+const { fakeUpstream } = require("../fixtures/fake-upstream-page.js");
 
-test("propagateActivePageToUpstream: empty url skips", async () => {
-  const r = await propagateActivePageToUpstream("");
-  assert.strictEqual(r.propagated, false);
-  assert.match(r.reason, /empty|about:blank/);
+test("propagateActivePageToUpstream: empty url skips, calls nothing, and is a desync", async () => {
+  const up = fakeUpstream();
+  const restore = up.install();
+  try {
+    const r = await propagateActivePageToUpstream("");
+    assert.strictEqual(r.propagated, false);
+    assert.match(r.reason, /empty|about:blank/);
+    assert.strictEqual(up.calls.length, 0, "a blank selection must not start upstream's session");
+    assert.strictEqual(sync.isDesynced(), true);
+  } finally { restore(); }
 });
 
 test("propagateActivePageToUpstream: null url skips", async () => {
-  const r = await propagateActivePageToUpstream(null);
-  assert.strictEqual(r.propagated, false);
+  const restore = fakeUpstream().install();
+  try {
+    const r = await propagateActivePageToUpstream(null);
+    assert.strictEqual(r.propagated, false);
+  } finally { restore(); }
 });
 
-test("propagateActivePageToUpstream: about:blank skips", async () => {
-  const r = await propagateActivePageToUpstream("about:blank");
-  assert.strictEqual(r.propagated, false);
-  assert.match(r.reason, /about:blank/);
+test("propagateActivePageToUpstream: about:blank skips without calling upstream (the 2026-10-13 incident's first step)", async () => {
+  const up = fakeUpstream({ url: "https://user-signed-in.example/dashboard" });
+  const restore = up.install();
+  try {
+    const r = await propagateActivePageToUpstream("about:blank");
+    assert.strictEqual(r.propagated, false);
+    assert.match(r.reason, /about:blank/);
+    assert.strictEqual(up.calls.length, 0);
+    assert.strictEqual(sync.isDesynced(), true);
+    assert.match(sync.warning(), /UPSTREAM DESYNC/);
+  } finally { restore(); }
 });
 
-test("propagateActivePageToUpstream: missing __relayUpstream skips", async () => {
+test("propagateActivePageToUpstream: missing __relayUpstream skips and leaves the state alone", async () => {
   const prev = globalThis.__relayUpstream;
   globalThis.__relayUpstream = undefined;
+  sync.reset();
   try {
     const r = await propagateActivePageToUpstream("https://example.com/");
     assert.strictEqual(r.propagated, false);
     assert.match(r.reason, /__relayUpstream/);
+    assert.strictEqual(sync.isDesynced(), false);
   } finally {
     globalThis.__relayUpstream = prev;
   }
 });
 
-test("propagateActivePageToUpstream: forwards to upstream navigation_go-to", async () => {
-  const prev = globalThis.__relayUpstream;
-  let calledWith = null;
-  globalThis.__relayUpstream = async () => ({
-    request: async (method, params) => {
-      calledWith = { method, params };
-      return {};
-    },
-  });
+test("propagateActivePageToUpstream: reads first, then forwards to upstream navigation_go-to when upstream's tab is blank", async () => {
+  const up = fakeUpstream({ url: "about:blank" });
+  const restore = up.install();
   try {
     const r = await propagateActivePageToUpstream("https://example.com/");
     assert.strictEqual(r.propagated, true);
-    assert.strictEqual(calledWith.method, "tools/call");
-    assert.strictEqual(calledWith.params.name, "navigation_go-to");
-    assert.strictEqual(calledWith.params.arguments.url, "https://example.com/");
-    assert.strictEqual(calledWith.params.arguments.includeSnapshot, false);
-    assert.strictEqual(calledWith.params.arguments.includeScreenshot, false);
-  } finally {
-    globalThis.__relayUpstream = prev;
-  }
+    assert.strictEqual(up.calls[0].params.name, "execute", "the URL read comes first");
+    const navs = up.navs();
+    assert.strictEqual(navs.length, 1);
+    assert.strictEqual(navs[0].method, "tools/call");
+    assert.strictEqual(navs[0].params.arguments.url, "https://example.com/");
+    assert.strictEqual(navs[0].params.arguments.includeSnapshot, false);
+    assert.strictEqual(navs[0].params.arguments.includeScreenshot, false);
+    assert.strictEqual(sync.isDesynced(), false);
+    assert.strictEqual(sync.state().relayUrl, "https://example.com/");
+  } finally { restore(); }
 });
 
-test("propagateActivePageToUpstream: upstream error returned as failure, not thrown", async () => {
-  const prev = globalThis.__relayUpstream;
-  globalThis.__relayUpstream = async () => ({
-    request: async () => { throw new Error("kaboom"); },
-  });
+test("C: upstream's tab on a page the relay did not put there is NOT navigated", async () => {
+  const up = fakeUpstream({ url: "https://user-signed-in.example/dashboard" });
+  const restore = up.install();
   try {
     const r = await propagateActivePageToUpstream("https://example.com/");
     assert.strictEqual(r.propagated, false);
-    assert.match(r.reason, /kaboom/);
-  } finally {
-    globalThis.__relayUpstream = prev;
-  }
+    assert.match(r.reason, /protected/);
+    assert.strictEqual(r.upstreamUrl, "https://user-signed-in.example/dashboard");
+    assert.strictEqual(up.navs().length, 0, "the user's tab must not be navigated");
+    assert.strictEqual(up.url, "https://user-signed-in.example/dashboard");
+    assert.strictEqual(sync.isDesynced(), true);
+    assert.match(sync.warning(), /ask the user to close it/);
+  } finally { restore(); }
 });
 
-test("propagateActivePageToUpstream: upstream isError result reported as failure, not success", async () => {
+test("C: the page the relay last put there IS navigated; a user's change to it is not", async () => {
+  const up = fakeUpstream();
+  const restore = up.install();
+  try {
+    assert.strictEqual((await propagateActivePageToUpstream("https://a.example/")).propagated, true);
+    assert.strictEqual((await propagateActivePageToUpstream("https://b.example/")).propagated, true, "relay-owned a → b");
+    assert.strictEqual(up.navs().length, 2);
+    up.url = "https://b.example/after-sign-in"; // the user signs in inside that tab
+    const r = await propagateActivePageToUpstream("https://c.example/");
+    assert.strictEqual(r.propagated, false);
+    assert.strictEqual(up.navs().length, 2);
+    assert.strictEqual(up.url, "https://b.example/after-sign-in");
+  } finally { restore(); }
+});
+
+test("C: upstream already showing the URL is synced with no navigation (no reload of the user's page)", async () => {
+  const up = fakeUpstream({ url: "https://user-signed-in.example/dashboard" });
+  const restore = up.install();
+  try {
+    sync.markDesynced("about:blank", null, "earlier");
+    const r = await propagateActivePageToUpstream("https://user-signed-in.example/dashboard");
+    assert.strictEqual(r.propagated, true);
+    assert.strictEqual(up.navs().length, 0);
+    assert.strictEqual(sync.isDesynced(), false);
+    assert.strictEqual(sync.state().relayUrl, null, "selecting the user's page does not make it the relay's");
+  } finally { restore(); }
+});
+
+test("C: a redirect lands on a URL the relay owns", async () => {
+  const up = fakeUpstream();
+  const restore = up.install();
+  const orig = up.client.request;
+  up.client.request = async (m, p) => {
+    const r = await orig(m, p);
+    if (p.name === "navigation_go-to") up.url = p.arguments.url + "landed";
+    return r;
+  };
+  try {
+    await propagateActivePageToUpstream("https://a.example/");
+    assert.strictEqual(sync.state().relayUrl, "https://a.example/landed");
+    assert.strictEqual((await propagateActivePageToUpstream("https://b.example/")).propagated, true);
+  } finally { restore(); }
+});
+
+test("propagateActivePageToUpstream: unreadable upstream URL leaves the tab alone and is a desync", async () => {
+  const restore = fakeUpstream({ fail: "kaboom" }).install();
+  try {
+    const r = await propagateActivePageToUpstream("https://example.com/");
+    assert.strictEqual(r.propagated, false);
+    assert.match(r.reason, /could not read.*kaboom/);
+    assert.strictEqual(sync.isDesynced(), true);
+  } finally { restore(); }
+});
+
+test("propagateActivePageToUpstream: upstream isError on navigation reported as failure, not success", async () => {
   // browser-devtools-mcp reports tool failures as a normal result with
   // isError: true, not as a thrown JSON-RPC error.
-  const prev = globalThis.__relayUpstream;
-  globalThis.__relayUpstream = async () => ({
-    request: async () => ({
-      content: [{ type: "text", text: "Target page, context or browser has been closed" }],
-      isError: true,
-    }),
-  });
+  const restore = fakeUpstream({ navFail: "Target page, context or browser has been closed" }).install();
   try {
     const r = await propagateActivePageToUpstream("https://example.com/");
     assert.strictEqual(r.propagated, false);
     assert.match(r.reason, /has been closed/);
-  } finally {
-    globalThis.__relayUpstream = prev;
-  }
+    assert.strictEqual(sync.isDesynced(), true);
+  } finally { restore(); }
 });
 
 test("propagateActivePageToUpstream: isError with no text still reported as failure", async () => {
-  const prev = globalThis.__relayUpstream;
-  globalThis.__relayUpstream = async () => ({ request: async () => ({ isError: true }) });
+  const restore = fakeUpstream({ navFail: "" }).install();
   try {
     const r = await propagateActivePageToUpstream("https://example.com/");
     assert.strictEqual(r.propagated, false);
     assert.match(r.reason, /returned isError/);
-  } finally {
-    globalThis.__relayUpstream = prev;
-  }
+  } finally { restore(); }
 });

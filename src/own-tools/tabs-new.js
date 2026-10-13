@@ -32,6 +32,7 @@
 const { propagateActivePageToUpstream } = require("./_propagate-active-page.js");
 const { applyLocalConfigToEnv } = require("../local-config.js");
 const { setActivePage, getActivePageRaw } = require("./_active-page.js");
+const sync = require("./_upstream-sync.js");
 
 /** Host of an http(s) URL, else null (about:blank, chrome://, bad URLs). */
 function urlHost(url) {
@@ -184,9 +185,13 @@ module.exports = {
     }
 
     // Propagate to upstream (best-effort) only if navigation succeeded.
-    const propagation = navError
-      ? { propagated: false, reason: "navError" }
-      : await propagateActivePageToUpstream(url);
+    let propagation;
+    if (navError) {
+      propagation = { propagated: false, reason: "skipped: this tab's navigation failed" };
+      sync.markDesynced(page.url(), null, propagation.reason);
+    } else {
+      propagation = await propagateActivePageToUpstream(url);
+    }
 
     const pages = bridge.context.pages();
     const result = {
@@ -201,9 +206,13 @@ module.exports = {
           waitUntil,
           navError,
           upstreamPropagated: propagation.propagated,
+          ...(propagation.propagated ? {} : { upstreamReason: propagation.reason, upstreamUrl: propagation.upstreamUrl || null }),
         }, null, 2),
       }],
     };
+    // Rule A: say it where the caller is already looking.
+    const warn = sync.warning();
+    if (warn) result.content.unshift({ type: "text", text: warn });
     // Only set isError when truthy — keeping success-path shape `{ content }`
     // identical to the pre-T0-7 contract that existing tests assert on.
     if (navError) result.isError = true;

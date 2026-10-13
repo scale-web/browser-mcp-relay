@@ -36,28 +36,64 @@
 // than fail the tabs_* call. The relay-side page is still created/
 // brought to front; only the upstream-propagation half failed. This
 // keeps the tabs_* tools robust for offline/file-only flows.
+//
+// Non-destructive (2026-10-13, ALA-CRO's lost tab): navigating upstream's
+// pinned page REPLACES what it shows, and that page can be one the user is
+// working in. So before navigating we read its URL (upstream `execute`,
+// `return page.url()`) and navigate only a page the relay put there — see
+// _upstream-sync.js rule C. Otherwise the pinned page is left as it is and
+// the relay records the desync, which warns on, and guards, every later
+// upstream call.
+
+const sync = require("./_upstream-sync.js");
 
 /**
- * Navigate upstream's tracked page to `url` so its tools (screenshot,
- * snapshots, etc.) target this URL. Best-effort — never throws.
+ * Point upstream's tracked page at `url` so its tools (screenshot,
+ * snapshots, execute, etc.) act on the URL the caller selected.
+ * Best-effort — never throws. Records the outcome in _upstream-sync.js.
  *
- * Skips when:
- * - url is empty / null / undefined
- * - url === "about:blank" (upstream's `_page` already starts there for new
- *   sessions, and navigating to about:blank is a no-op churn)
- * - globalThis.__relayUpstream is missing (shouldn't happen at runtime
- *   under the relay; only in unit tests)
+ * Returns propagated: true when upstream's page now shows `url` (already
+ * showing it counts — no reload). Returns propagated: false, with a reason,
+ * when:
+ * - url is empty / about:blank (no upstream call at all)
+ * - globalThis.__relayUpstream is missing (only in unit tests; state untouched)
+ * - upstream's URL can't be read (left as is: we can't tell whose page it is)
+ * - upstream's page shows a page the relay did not put there (left as is)
+ * - upstream's navigation_go-to fails
  *
  * @param {string} url - target URL
- * @returns {Promise<{propagated: boolean, reason?: string}>}
+ * @returns {Promise<{propagated: boolean, reason?: string, upstreamUrl?: string}>}
  */
 async function propagateActivePageToUpstream(url) {
+  // A blank tab is no navigation target, and asking upstream anything would
+  // start its session (it opens a page of its own on its first call). Upstream
+  // tools still act on another tab, though: the 2026-10-13 incident began with
+  // exactly this (tabs_select of a blank tab, then execute's page.goto).
   if (!url || url === "about:blank") {
-    return { propagated: false, reason: "skipped: empty or about:blank" };
+    const reason = "skipped: the selected tab is empty or about:blank";
+    sync.markDesynced(url, null, reason);
+    return { propagated: false, reason };
   }
   const getUpstream = globalThis.__relayUpstream;
   if (typeof getUpstream !== "function") {
     return { propagated: false, reason: "skipped: __relayUpstream not exposed" };
+  }
+  const read = await sync.readUpstreamUrl();
+  if (typeof read.url !== "string") {
+    const reason = `could not read upstream's page: ${read.error}`;
+    sync.markDesynced(url, null, reason);
+    return { propagated: false, reason };
+  }
+  const current = read.url;
+  if (current === url) {
+    sync.markSynced(sync.mayNavigate(current) ? url : null);
+    return { propagated: true, reason: "already showing", upstreamUrl: current };
+  }
+  if (!sync.mayNavigate(current)) {
+    const reason = "protected: upstream's tab shows a page the relay did not put there (likely the user's), so it was not navigated";
+    process.stderr.write(`[mcp-relay] tabs: upstream tab shows ${current}, not the relay's; left as is\n`);
+    sync.markDesynced(url, current, reason, true);
+    return { propagated: false, reason, upstreamUrl: current };
   }
   try {
     const upstream = await getUpstream();
@@ -78,13 +114,20 @@ async function propagateActivePageToUpstream(url) {
         : "";
       throw new Error(text || "navigation_go-to returned isError");
     }
-    return { propagated: true };
   } catch (e) {
     process.stderr.write(
       `[mcp-relay] tabs: upstream propagate to ${url} failed (continuing): ${e.message}\n`,
     );
-    return { propagated: false, reason: `upstream error: ${e.message}` };
+    const reason = `upstream error: ${e.message}`;
+    sync.markDesynced(url, null, reason);
+    return { propagated: false, reason };
   }
+  // The relay put this page there. Own its final URL (after redirects); if
+  // that can't be read, own the URL we asked for.
+  const after = await sync.readUpstreamUrl();
+  const landed = typeof after.url === "string" ? after.url : url;
+  sync.markSynced(landed);
+  return { propagated: true, upstreamUrl: landed };
 }
 
 module.exports = { propagateActivePageToUpstream };
