@@ -152,42 +152,69 @@ test("ReapLog.held survives a throwing ps (command: null); psCommands reads real
     await log.held([7], 1);
     assert.deepStrictEqual(readLog(path.join(dir, REAP_LOG_NAME))[0].heldBy, [{ pid: 7, command: null }]);
     const real = await psCommands([process.pid]);
-    assert.match(real[process.pid], /^node( [\w.@+-]+\.(mjs|cjs|js))?$/, real[process.pid]);
+    assert.match(real[process.pid], /^node( [\w@+-][\w.@+-]*(\/[\w@+-][\w.@+-]*)?)*$/, real[process.pid]);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("redactCommand keeps the executable and script basenames only — never arguments", () => {
+test("redactCommand names the helper — script path as parent/base, python -m, .bin shims, npx/tsx — never arguments", () => {
   const SECRET = "tok_SECRET123";
+  const N = "/opt/homebrew/bin/node";
   const cases = [
-    ["/opt/homebrew/bin/node", `node /Users/x/repo/scripts/lib/own-relay-port.mjs --url=https://h/?token=${SECRET}`, "node own-relay-port.mjs"],
-    ["/opt/homebrew/bin/node", `/opt/homebrew/bin/node --inspect /a/b/xhr-capture-ghl.mjs https://app.example/?token=${SECRET}`, "node xhr-capture-ghl.mjs"],
-    ["/usr/bin/curl", `curl -s https://h/json?token=${SECRET}`, "curl"],
-    ["/usr/bin/curl", `curl https://h/x.js?token=${SECRET}`, "curl"],
-    ["/opt/homebrew/bin/node", `node -e require("net").connect(1)`, "node"],
-    ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", `/Applications/Brave Browser.app/Contents/MacOS/Brave Browser --user-data-dir=/x?token=${SECRET}`, "Brave Browser"],
-    ["/usr/bin/python3", `python3 /tmp/sniff.py ${SECRET}`, "python3 sniff.py"],
-    ["", "anything", null],
+    // the reviewer's shapes
+    ["/usr/bin/python3", "python3 -m helpers.cdp_watch --port 9335", null, "python3 -m helpers.cdp_watch"],
+    [N, `node /Users/x/p/node_modules/.bin/tsx scripts/drive.ts --url=https://h/?token=${SECRET}`, null, "tsx scripts/drive.ts"],
+    [N, `node --require ./otel.js drive.mjs https://h/?token=${SECRET}`, "/Users/x/proj", "node proj/drive.mjs"],
+    [N, "node index.js", "/Users/x/drive", "node drive/index.js"],
+    [N, "node index.js", null, "node index.js"],
+    [N, "node /Users/x/.npm/_npx/abc/node_modules/.bin/firecrawl-mcp", null, "firecrawl-mcp"],
+    // more shapes
+    [N, `node /opt/homebrew/bin/npx -y firecrawl-mcp --api-key ${SECRET}`, null, "npx firecrawl-mcp"],
+    ["/opt/homebrew/bin/npx", `npx tsx scripts/drive.ts ?token=${SECRET}`, null, "npx tsx"],
+    ["/usr/local/bin/tsx", "tsx /a/scripts/drive.ts", null, "tsx scripts/drive.ts"],
+    [N, `node /Users/x/repo/scripts/lib/own-relay-port.mjs --url=https://h/?token=${SECRET}`, null, "node lib/own-relay-port.mjs"],
+    [N, `/opt/homebrew/bin/node --inspect=127.0.0.1:9229 /a/b/xhr-capture-ghl.mjs https://app.example/?token=${SECRET}`, null, "node b/xhr-capture-ghl.mjs"],
+    [N, "node -r ./otel.js -r dotenv/config /srv/bin/sniffer", null, "node bin/sniffer"],
+    [N, `node -e require("net").connect(1) ${SECRET}`, null, "node"],
+    [N, `node -p process.env.TOKEN ${SECRET}.js`, null, "node"],
+    ["/usr/bin/python3", `python3 -c import os;print("${SECRET}")`, null, "python3"],
+    ["/usr/bin/python3", `python3 /tmp/sniff.py ${SECRET}`, null, "python3 tmp/sniff.py"],
+    ["/usr/bin/curl", `curl -s https://h/json?token=${SECRET}`, null, "curl"],
+    ["/usr/bin/curl", `curl https://h/x.js?token=${SECRET}`, null, "curl"],
+    ["/usr/bin/curl", `curl -H Authorization: Bearer ${SECRET} https://h/`, null, "curl"],
+    ["/usr/local/bin/mytool", `mytool --token ${SECRET}`, null, "mytool"],
+    ["/usr/local/bin/mytool", `mytool ${SECRET}`, null, "mytool"],
+    [N, `node ./drive.mjs?token=${SECRET}`, null, "node"],
+    [N, `node /a/b/c.js#${SECRET}`, null, "node"],
+    [N, `node token=${SECRET}/x.js`, null, "node"],
+    ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", `/Applications/Brave Browser.app/Contents/MacOS/Brave Browser --user-data-dir=/x?token=${SECRET}`, null, "Brave Browser"],
+    ["", "anything", null, null],
   ];
-  for (const [comm, args, want] of cases) {
-    const got = redactCommand(comm, args);
+  for (const [comm, args, cwd, want] of cases) {
+    const got = redactCommand(comm, args, cwd);
     assert.strictEqual(got, want, `${args} -> ${got}`);
-    assert.ok(!String(got).includes(SECRET) && !String(got).includes("token"), `leaked: ${got}`);
+    assert.ok(!String(got).includes(SECRET) && !/token|[?=:&#%]|https?/.test(String(got)), `leaked: ${got}`);
   }
 });
 
-test("psCommands on a real process whose arguments carry ?token= logs only `node <script>`", T, async () => {
+test("psCommands on real processes: names the helper (script parent/base, bare script via its cwd), never its ?token= arguments", T, async () => {
   const dir = tmp("ps-redact-");
+  const sub = path.join(dir, "drive");
+  fs.mkdirSync(sub);
   const script = path.join(dir, "own-relay-port.mjs");
   fs.writeFileSync(script, "setInterval(() => {}, 1e6);\n");
-  const child = spawn(process.execPath, [script, "https://app.example/?token=tok_SECRET123", "--jwt=eyJhbGciOi"], { stdio: "ignore" });
+  fs.writeFileSync(path.join(sub, "index.js"), "setInterval(() => {}, 1e6);\n");
+  const a = spawn(process.execPath, [script, "https://app.example/?token=tok_SECRET123", "--jwt=eyJhbGciOi"], { stdio: "ignore" });
+  const b = spawn(process.execPath, ["index.js", "?token=tok_SECRET123"], { stdio: "ignore", cwd: sub });
   try {
-    await waitFor(async () => (await psCommands([child.pid]))[child.pid] !== undefined, 3000, "child visible to ps");
-    const got = (await psCommands([child.pid]))[child.pid];
-    assert.strictEqual(got, "node own-relay-port.mjs");
+    await waitFor(async () => Object.keys(await psCommands([a.pid, b.pid])).length === 2, 3000, "children visible to ps");
+    const got = await psCommands([a.pid, b.pid]);
+    assert.strictEqual(got[a.pid], `node ${path.basename(dir)}/own-relay-port.mjs`);
+    assert.strictEqual(got[b.pid], "node drive/index.js", "a bare relative script is named with its cwd's folder");
   } finally {
-    child.kill("SIGKILL");
+    a.kill("SIGKILL");
+    b.kill("SIGKILL");
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -197,16 +224,62 @@ test("withFileLock: exclusive between holders, gives up after waitMs, never thro
   const lockPath = path.join(dir, "x.lock");
   try {
     let inner = null;
+    let innerRan = false;
+    let waited = 0;
     const outer = withFileLock(lockPath, () => {
       const t0 = Date.now();
-      inner = withFileLock(lockPath, () => { throw new Error("must not run"); }, { waitMs: 60 });
-      assert.ok(Date.now() - t0 >= 50, "the second taker waited");
+      inner = withFileLock(lockPath, () => { innerRan = true; }, { waitMs: 60 });
+      waited = Date.now() - t0;
     });
-    assert.strictEqual(outer, true);
-    assert.strictEqual(inner, false, "a held lock is not taken twice");
-    assert.strictEqual(withFileLock(lockPath, () => {}), true, "free again after release");
-    assert.strictEqual(withFileLock(lockPath, () => { throw new Error("boom"); }), false, "fn throwing → false, no throw");
-    assert.strictEqual(withFileLock(path.join(dir, "no", "such", "dir.lock"), () => {}), false);
+    assert.strictEqual(outer, "ran");
+    assert.strictEqual(inner, "busy", "a held lock is not taken twice");
+    assert.strictEqual(innerRan, false);
+    assert.ok(waited >= 50, "the second taker waited");
+    assert.strictEqual(withFileLock(lockPath, () => {}), "ran", "free again after release");
+    assert.strictEqual(withFileLock(lockPath, () => { throw new Error("boom"); }), "ran", "fn throwing → no throw");
+    assert.strictEqual(withFileLock(path.join(dir, "no", "such", "dir.lock"), () => {}), "error");
+    const dirLock = path.join(dir, "d.lock");
+    fs.mkdirSync(dirLock);
+    assert.strictEqual(withFileLock(dirLock, () => {}), "error", "a directory is an error, not contention");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ReapLog: a lock that cannot be opened (mode 000, a directory) does not stop rotation", () => {
+  for (const kind of ["mode000", "directory"]) {
+    const dir = tmp("reaplog-badlock-");
+    const file = path.join(dir, REAP_LOG_NAME);
+    const lock = `${file}.lock`;
+    try {
+      if (kind === "mode000") { fs.writeFileSync(lock, ""); fs.chmodSync(lock, 0o000); } else fs.mkdirSync(lock);
+      const log = new ReapLog({ file, slug: "p", maxBytes: 2000 });
+      for (let i = 0; i < 400; i++) log.write("reaped", { idleS: i });
+      assert.ok(fs.existsSync(`${file}.1`), `${kind}: rotated`);
+      assert.ok(fs.statSync(file).size <= 2000, `${kind}: current log within the cap (${fs.statSync(file).size} B)`);
+      assert.ok(fs.statSync(`${file}.1`).size <= 2000);
+      assert.strictEqual(readLog(file).slice(-1)[0].idleS, 399, `${kind}: the newest line was written`);
+    } finally {
+      try { fs.chmodSync(lock, 0o600); } catch {}
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("ReapLog: when rotation keeps failing, appends stop at ~2x the cap", () => {
+  const dir = tmp("reaplog-backstop-");
+  const file = path.join(dir, REAP_LOG_NAME);
+  try {
+    // `.1` is a non-empty directory: rename(file, .1) fails every time.
+    fs.mkdirSync(`${file}.1`);
+    fs.writeFileSync(path.join(`${file}.1`, "x"), "");
+    const log = new ReapLog({ file, slug: "p", maxBytes: 2000 });
+    let written = 0;
+    for (let i = 0; i < 400; i++) if (log.write("reaped", { idleS: i })) written++;
+    const size = fs.statSync(file).size;
+    assert.ok(size <= 4000, `the log grew past 2x the cap: ${size} B`);
+    assert.ok(size > 3800, `the log stopped well before 2x the cap: ${size} B`);
+    assert.ok(written < 400, "later writes report false");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

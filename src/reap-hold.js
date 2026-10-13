@@ -20,41 +20,111 @@
 //            "keepalive"   keepaliveAgeS
 //            "lsof-failed" reason
 //            "reaped"
-//    `command` is redacted to the executable's basename plus a script's
-//    basename ("node own-relay-port.mjs") — never arguments, which can carry
-//    tokens. Several relays share the file: appends are O_APPEND, and the
+//    `command` names the helper without arguments, which can carry tokens:
+//    the executable's basename plus its script as `parent/base`
+//    ("node lib/own-relay-port.mjs", "tsx scripts/drive.ts",
+//    "python3 -m helpers.cdp_watch"); see redactCommand. Several relays share the file: appends are O_APPEND, and the
 //    rotation (size check + rename) runs under a short lock on a sibling
 //    `reap-events.log.lock`, re-checking the size once the lock is held, so
 //    two relays never both rotate and overwrite a full `.1` with a near-empty
-//    one. Measurement only: no write error ever reaches the reaper.
+//    one. A lock that cannot be opened (not contention) does not stop
+//    rotation, and appends stop at ~2x the cap whatever happens. Measurement only: no write error ever reaches the reaper.
 
 const fs = require("node:fs");
 const path = require("node:path");
 const { execFile } = require("node:child_process");
+const { lsofCommand } = require("./cdp-clients.js");
 
 const KEEPALIVE_NAME = ".mcp-relay-keepalive";
 const REAP_LOG_NAME = "reap-events.log";
 const MAX_FUTURE_MS = 5000;
 const O_EXLOCK_DARWIN = 0x20;
 const SLEEP = new Int32Array(new SharedArrayBuffer(4));
-const SCRIPT_RE = /^[\w.@+-]+\.(?:mjs|cjs|js|ts|py|sh|rb|pl)$/;
+// Redaction: a name segment we may log. No "/", ":", "?", "=", "&", "#", "%".
+const SAFE_SEG = /^[\w@+-][\w.@+-]*$/;
+const SCRIPT_EXT = /\.(?:mjs|cjs|js|ts|mts|cts|tsx|jsx|py|sh|rb|pl)$/;
+const PY_EXE = /^python[\d.]*$/;
+const TOOLS = new Set(["npx", "tsx", "ts-node", "bunx", "pnpx"]);
+const NPX_LIKE = new Set(["npx", "bunx", "pnpx"]);
+// Options whose VALUE is the next token (so that value is never the script).
+const VALUE_OPTS = new Set([
+  "-r", "--require", "--import", "--loader", "--experimental-loader", "-C", "--conditions",
+  "--input-type", "--title", "--env-file", "--inspect-port", "--redirect-warnings",
+  "-W", "-X", "--package",
+]);
+// Options after which the rest is inline code, not a script.
+const CODE_OPTS = new Set(["-e", "--eval", "-p", "--print", "-c"]);
 
-/** "node own-relay-port.mjs": the executable's basename, plus the first
- *  non-option argument's basename when it is a script file name. Nothing else
- *  from the command line — arguments can carry tokens. */
-function redactCommand(comm, args) {
-  const exe = path.basename(String(comm || "").trim());
+/** A path-like argument → "parent/base" (or "base"), each segment SAFE_SEG;
+ *  null when it is not a path (URL, key=value, query string …). `cwd` names
+ *  the parent of a bare relative file. */
+function safePathLabel(tok, cwd) {
+  if (!tok || /[:?=&#%]/.test(tok)) return null;
+  const base = path.basename(tok);
+  if (!SAFE_SEG.test(base)) return null;
+  const dirPart = path.dirname(tok);
+  let parent = dirPart === "." ? (cwd ? path.basename(cwd) : null) : path.basename(dirPart);
+  if (parent && (!SAFE_SEG.test(parent) || parent === ".bin")) parent = null;
+  return parent ? `${parent}/${base}` : base;
+}
+
+const isPathy = (tok) => tok.includes("/") || SCRIPT_EXT.test(tok);
+
+/**
+ * Which helper is this — without anything that could carry a secret. The
+ * executable's basename, plus the script it runs as `parent/base` (a path
+ * argument, with or without an extension). `python -m <module>` keeps the
+ * module. A `.bin` shim or npx/tsx/ts-node keeps the tool name plus its own
+ * script/package. Option values (`--require X`, `-r X`, `--inspect=…`) are
+ * skipped; inline code (`-e`, `-c`) ends the search. Never an argument that is
+ * not a path or module name — no URLs, query strings, key=value or tokens.
+ */
+function redactCommand(comm, args, cwd = null) {
+  const commS = String(comm || "").trim();
+  const exe = path.basename(commS);
   if (!exe) return null;
   const a = String(args || "").trim();
-  const rest = a.startsWith(String(comm).trim()) ? a.slice(String(comm).trim().length) : a.replace(/^\S+/, "");
-  const script = rest.trim().split(/\s+/).find((t) => t && !t.startsWith("-"));
-  const base = script ? path.basename(script) : null;
-  return (base && SCRIPT_RE.test(base) ? `${exe} ${base}` : exe).slice(0, 120);
+  const rest = (commS && a.startsWith(commS) ? a.slice(commS.length) : a.replace(/^\S+/, "")).trim();
+  const toks = rest ? rest.split(/\s+/) : [];
+  let tool = TOOLS.has(exe) ? exe : null; // tsx / npx run directly
+  const parts = [];
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (CODE_OPTS.has(t)) break;
+    if (t === "-m" && PY_EXE.test(exe) && !tool) {
+      const mod = toks[i + 1];
+      if (mod && /^[\w.]+$/.test(mod)) parts.push("-m", mod);
+      break;
+    }
+    if (VALUE_OPTS.has(t)) { i++; continue; }
+    if (t.startsWith("-")) continue;
+    if (tool) {
+      // The tool's own target: a script path, or (npx-like) a package name.
+      const label = isPathy(t) ? safePathLabel(t, cwd)
+        : (NPX_LIKE.has(tool) && /^@?[\w.+-]+(?:\/[\w.+-]+)?$/.test(t) && !/[:?=&#%]/.test(t) ? t : null);
+      if (label) parts.push(label);
+      break;
+    }
+    if (!isPathy(t)) break; // a bare word may be an option's value — never log it
+    const label = safePathLabel(t, cwd);
+    if (!label) break;
+    const base = path.basename(t);
+    if (TOOLS.has(base) || path.basename(path.dirname(t)) === ".bin") {
+      tool = base; // a shim: name the tool, then look for ITS script
+      continue;
+    }
+    parts.push(label);
+    break;
+  }
+  const head = tool && !TOOLS.has(exe) ? tool : exe;
+  return [head, ...parts].join(" ").slice(0, 120);
 }
 
 /** Run fn under an exclusive lock on `lockPath` (darwin: O_EXLOCK; elsewhere
- *  an O_EXCL file, broken when > 10 s old). Gives up after `waitMs` and
- *  returns false without running fn. Never throws. */
+ *  an O_EXCL file, broken when > 10 s old). Returns "ran" (fn ran, even if it
+ *  threw), "busy" (still contended after `waitMs`; fn not run) or "error"
+ *  (the lock itself cannot be opened — mode 000, a directory, root-owned …;
+ *  fn not run). Never throws. */
 function withFileLock(lockPath, fn, { waitMs = 250, _fs = fs, _platform = process.platform } = {}) {
   const darwin = _platform === "darwin";
   const deadline = Date.now() + waitMs;
@@ -68,16 +138,17 @@ function withFileLock(lockPath, fn, { waitMs = 250, _fs = fs, _platform = proces
       if (!darwin && e.code === "EEXIST") {
         try { if (Date.now() - _fs.statSync(lockPath).mtimeMs > 10_000) _fs.unlinkSync(lockPath); } catch { /* raced */ }
       } else if (e.code !== "EAGAIN" && e.code !== "EWOULDBLOCK") {
-        return false;
+        return "error";
       }
-      if (Date.now() >= deadline) return false;
+      if (Date.now() >= deadline) return "busy";
       Atomics.wait(SLEEP, 0, 0, 5);
       continue;
     }
-    try { fn(); return true; } catch { return false; } finally {
+    try { fn(); } catch { /* fn's own failure */ } finally {
       try { _fs.closeSync(fd); } catch { /* closed */ }
       if (!darwin) { try { _fs.unlinkSync(lockPath); } catch { /* gone */ } }
     }
+    return "ran";
   }
 }
 
@@ -110,16 +181,37 @@ function psColumn(pids, col, { timeoutMs, _execFile }) {
   });
 }
 
+/** { pid → cwd } from one `lsof -a -d cwd` (to name the folder of a bare
+ *  `node index.js`); {} on any failure. Never throws or hangs. */
+function processCwds(pids, { timeoutMs, _execFile }) {
+  return new Promise((resolve) => {
+    const out = {};
+    try {
+      _execFile(lsofCommand(), ["-nP", "-w", "-a", "-d", "cwd", "-p", pids.join(","), "-F", "pn"],
+        { encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL" },
+        (err, stdout) => {
+          let pid = null;
+          for (const line of String(stdout || "").split("\n")) {
+            if (line.startsWith("p")) pid = Number(line.slice(1));
+            else if (line.startsWith("n") && pid) out[pid] = line.slice(1);
+          }
+          resolve(out);
+        });
+    } catch { resolve(out); }
+  });
+}
+
 /** { pid → redacted command } (see redactCommand); never throws or hangs. */
 async function psCommands(pids, { timeoutMs = 2000, _execFile = execFile } = {}) {
   const out = {};
   if (!pids.length) return out;
-  const [comm, args] = await Promise.all([
+  const [comm, args, cwds] = await Promise.all([
     psColumn(pids, "comm", { timeoutMs, _execFile }),
     psColumn(pids, "args", { timeoutMs, _execFile }),
+    processCwds(pids, { timeoutMs, _execFile }),
   ]);
   for (const pid of pids) {
-    if (comm[pid] !== undefined) out[pid] = redactCommand(comm[pid], args[pid]);
+    if (comm[pid] !== undefined) out[pid] = redactCommand(comm[pid], args[pid], cwds[pid] || null);
   }
   return out;
 }
@@ -149,10 +241,18 @@ class ReapLog {
       f.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
       const size = () => { try { return f.statSync(this.file).size; } catch { return 0; } };
       const over = () => { const n = size(); return n > 0 && n + line.length > this.maxBytes; };
+      const rotate = () => { if (over()) f.renameSync(this.file, `${this.file}.1`); };
       if (over()) {
         // Re-check under the lock: a peer relay may have rotated meanwhile.
-        this._lock(`${this.file}.lock`, () => { if (over()) f.renameSync(this.file, `${this.file}.1`); }, { _fs: f });
+        // A lock that cannot be opened at all (not contention) must not stop
+        // rotation forever: rotate without it, as before the lock existed.
+        if (this._lock(`${this.file}.lock`, rotate, { _fs: f }) === "error") {
+          try { rotate(); } catch { /* the backstop below still bounds the file */ }
+        }
       }
+      // Hard backstop: if rotation keeps failing (a .1 that cannot be
+      // replaced, a busy lock), stop appending at ~2x the cap.
+      if (size() + line.length > 2 * this.maxBytes) return false;
       f.appendFileSync(this.file, line, { mode: 0o600 });
       return true;
     } catch {
