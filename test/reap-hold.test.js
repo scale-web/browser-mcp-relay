@@ -219,6 +219,20 @@ test("psCommands on real processes: names the helper (script parent/base, bare s
   }
 });
 
+test("psCommands resolves {} within timeoutMs + 1 s when ps / lsof never call back", T, async () => {
+  const calls = [];
+  const never = (cmd, args) => { calls.push(cmd); };
+  const t0 = Date.now();
+  const got = await psCommands([123, 456], { timeoutMs: 200, _execFile: never });
+  const ms = Date.now() - t0;
+  assert.deepStrictEqual(got, {});
+  assert.ok(ms >= 1100 && ms < 2500, `resolved after ${ms} ms`);
+  assert.strictEqual(calls.length, 3, "ps comm + ps args + lsof cwd were all started");
+  const log = new ReapLog({ file: null, slug: "p", _ps: (pids) => psCommands(pids, { timeoutMs: 200, _execFile: never }) });
+  const h = await log.held([123], 1);
+  assert.strictEqual(h.changed, true, "held() resolves too");
+});
+
 test("withFileLock: exclusive between holders, gives up after waitMs, never throws", () => {
   const dir = tmp("lock-");
   const lockPath = path.join(dir, "x.lock");
@@ -524,6 +538,31 @@ test("relay: a hold is released (and logged) on an MCP call, on a keep-alive tak
     assert.strictEqual(r.child.exitCode, null);
   } finally {
     if (toucher) clearInterval(toucher);
+    if (isAlive(ext.pid)) ext.kill("SIGKILL");
+    if (r) await r.stop();
+    l.close();
+  }
+});
+
+test("relay: a ps / lsof that never exits cannot wedge the reaper — the hold resolves within the cap and a later reap still happens", T, async () => {
+  const l = await listener();
+  const ext = cdpClientChild(l.port);
+  let r;
+  try {
+    await waitFor(() => l.accepted() === 1, 3000, "ext connected");
+    r = await startRelay({ idleMinutes: "0.01", files: { "brave-port": String(l.port), "upstream-connects": "1", "reaper-tick-ms": "100", "ps-hang": "1" } });
+    await r.request("tools/list", {});
+    assert.strictEqual((await r.call()).isError, false);
+    await waitFor(() => relayLog(r).some((x) => x.event === "held"), 6000, "held() to resolve despite the hung ps (cap = 2 s + 1 s)");
+    assert.ok(fs.existsSync(path.join(r.dir, "ps-hung")), "precondition: the ps/lsof children really hung");
+    const held = relayLog(r).find((x) => x.event === "held");
+    assert.deepStrictEqual(held.heldBy, [{ pid: ext.pid, command: null }]);
+    const before = r.count(/external CDP client/g);
+    await waitFor(() => r.count(/external CDP client/g) > before, 3000, "the reaper keeps ticking");
+    ext.kill("SIGKILL");
+    await waitFor(() => r.count(REAPED) === 1, 6000, "a reap after the client left");
+    assert.strictEqual(r.child.exitCode, null);
+  } finally {
     if (isAlive(ext.pid)) ext.kill("SIGKILL");
     if (r) await r.stop();
     l.close();

@@ -164,10 +164,24 @@ function freshKeepaliveAgeMs(dir, idleMs, { now = Date.now(), _lstat = fs.lstatS
 }
 
 /** { pid → column text } from one `ps -o pid=,<col>=`; never throws or hangs. */
-function psColumn(pids, col, { timeoutMs, _execFile }) {
+/** Run `run(finish)`; resolve with what it passes to finish, or `{}` after
+ *  timeoutMs + 1 s. execFile's own timeout kills a slow child, but one stuck
+ *  in uninterruptible sleep (a dead mount) never exits, so its callback never
+ *  fires — and the reaper awaits this. Same hard cap as cdp-clients.js. */
+function capped(run, timeoutMs) {
   return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; clearTimeout(cap); resolve(v); };
+    const cap = setTimeout(() => finish({}), timeoutMs + 1000);
+    if (typeof cap.unref === "function") cap.unref();
+    try { run(finish); } catch { finish({}); }
+  });
+}
+
+function psColumn(pids, col, { timeoutMs, _execFile }) {
+  return capped((resolve) => {
     const out = {};
-    try {
+    {
       _execFile("/bin/ps", ["-o", `pid=,${col}=`, "-p", pids.join(",")],
         { encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL" },
         (err, stdout) => {
@@ -177,16 +191,17 @@ function psColumn(pids, col, { timeoutMs, _execFile }) {
           }
           resolve(out);
         });
-    } catch { resolve(out); }
-  });
+    }
+  }, timeoutMs);
 }
 
 /** { pid → cwd } from one `lsof -a -d cwd` (to name the folder of a bare
- *  `node index.js`); {} on any failure. Never throws or hangs. */
+ *  `node index.js`); {} on any failure. Never throws; resolves within
+ *  timeoutMs + 1 s even if lsof never exits. */
 function processCwds(pids, { timeoutMs, _execFile }) {
-  return new Promise((resolve) => {
+  return capped((resolve) => {
     const out = {};
-    try {
+    {
       _execFile(lsofCommand(), ["-nP", "-w", "-a", "-d", "cwd", "-p", pids.join(","), "-F", "pn"],
         { encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL" },
         (err, stdout) => {
@@ -197,11 +212,12 @@ function processCwds(pids, { timeoutMs, _execFile }) {
           }
           resolve(out);
         });
-    } catch { resolve(out); }
-  });
+    }
+  }, timeoutMs);
 }
 
-/** { pid → redacted command } (see redactCommand); never throws or hangs. */
+/** { pid → redacted command } (see redactCommand). Never throws; resolves
+ *  within timeoutMs + 1 s even if ps or lsof never exits. */
 async function psCommands(pids, { timeoutMs = 2000, _execFile = execFile } = {}) {
   const out = {};
   if (!pids.length) return out;

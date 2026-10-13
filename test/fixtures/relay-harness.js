@@ -34,6 +34,22 @@ const log = (m) => process.stderr.write(`HARNESS ${m}\n`);
   global.setInterval = (fn, ms, ...rest) => realSetInterval(fn, ms === want ? tickMs : ms, ...rest);
 })();
 
+// $HARNESS_DIR/ps-hang: the `ps` and `lsof -d cwd` children that name a
+// hold's holders never report back — as when one is stuck in uninterruptible
+// sleep — so the reaper's hard cap is all that ends the wait. Patched before
+// src/reap-hold.js captures execFile. The CDP-client lsof is untouched.
+if (fs.existsSync(path.join(dir, "ps-hang"))) {
+  const cp = require("node:child_process");
+  const realExecFile = cp.execFile;
+  cp.execFile = (cmd, args, ...rest) => {
+    if (cmd === "/bin/ps" || (Array.isArray(args) && args.includes("cwd"))) {
+      fs.appendFileSync(path.join(dir, "ps-hung"), `${cmd}\n`);
+      return { kill() {}, on() {} }; // never calls back
+    }
+    return realExecFile(cmd, args, ...rest);
+  };
+}
+
 function stubModule(absPath, exports) {
   require.cache[absPath] = { id: absPath, filename: absPath, loaded: true, exports };
 }
