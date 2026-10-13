@@ -212,3 +212,63 @@ test("L6: pruning spares upstream's pinned tab while it shows the user's page", 
   assert.strictEqual(users.closedByTest, false, "the user's tab is never pruned");
   assert.ok(others.every((p) => p.closedByTest));
 });
+
+test("r2: reusing the relay's own pinned tab on the same host keeps it the relay's (no false 'protected')", async (t) => {
+  const { clearActivePage } = require("../../src/own-tools/_active-page.js");
+  clearActivePage();
+  const up = fakeUpstream({ url: "https://site.example/a" });
+  const restore = up.install();
+  sync.markSynced("https://site.example/a"); // the relay put /a there
+  // The relay's Playwright handle on upstream's own tab: its goto moves upstream's page.
+  const pinned = navPage("https://site.example/a");
+  pinned.goto = async function (u) { this.gotoUrls.push(u); this._url = u; up.url = u; };
+  globalThis.__relayBridge = { context: { pages: () => [pinned], newPage: async () => { throw new Error("should not create"); } } };
+  t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
+
+  const first = await tabsNew.handler({ url: "https://site.example/b" });
+  assert.strictEqual(JSON.parse(first.content[first.content.length - 1].text).reused, true);
+  assert.strictEqual(sync.state().relayUrl, "https://site.example/b");
+  assert.strictEqual(sync.isDesynced(), false);
+  assert.strictEqual((await require("../../src/own-tools/_propagate-active-page.js").propagateActivePageToUpstream("https://other.example/x")).propagated, true);
+});
+
+test("r2: with upstream unreadable, tabs the relay created are still reused and pruned; others are spared", async (t) => {
+  const { clearActivePage } = require("../../src/own-tools/_active-page.js");
+  clearActivePage();
+  const users = navPage("https://user.example/signed-in");
+  const pages = [users];
+  let n = 0;
+  globalThis.__relayBridge = { context: { pages: () => pages, newPage: async () => { const p = navPage("about:blank"); p.n = ++n; pages.push(p); return p; } } };
+  const prevMax = process.env.BROWSER_RELAY_MAX_TABS;
+  process.env.BROWSER_RELAY_MAX_TABS = "2";
+  const restore = fakeUpstream({ fail: "upstream wedged" }).install();
+  t.after(() => {
+    globalThis.__relayBridge = undefined; clearActivePage(); restore();
+    if (prevMax === undefined) delete process.env.BROWSER_RELAY_MAX_TABS; else process.env.BROWSER_RELAY_MAX_TABS = prevMax;
+  });
+  await tabsNew.handler({ url: "https://a.example/1" });
+  const again = await tabsNew.handler({ url: "https://a.example/2" });
+  assert.strictEqual(JSON.parse(again.content[again.content.length - 1].text).reused, true, "a relay-created tab is reused");
+  await tabsNew.handler({ url: "https://b.example/" });
+  await tabsNew.handler({ url: "https://c.example/" });
+  assert.strictEqual(users.closedByTest, false, "the user's tab is spared");
+  assert.ok(pages.filter((p) => p !== users && p.closedByTest).length >= 1, "relay-created tabs are pruned");
+});
+
+test("r2: reusing a separate relay tab that merely shows the pinned URL does not move ownership off upstream's tab", async (t) => {
+  const { clearActivePage } = require("../../src/own-tools/_active-page.js");
+  clearActivePage();
+  const up = fakeUpstream({ url: "https://site.example/a" });
+  const restore = up.install();
+  sync.markSynced("https://site.example/a");
+  const relayTab = navPage("https://site.example/a"); // a different tab: its goto leaves upstream's page alone
+  globalThis.__relayBridge = { context: { pages: () => [relayTab], newPage: async () => { throw new Error("should not create"); } } };
+  t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
+
+  const res = await tabsNew.handler({ url: "https://site.example/b" });
+  const payload = JSON.parse(res.content[res.content.length - 1].text);
+  assert.strictEqual(payload.reused, true);
+  assert.strictEqual(payload.upstreamPropagated, true, "upstream's /a was still the relay's, so propagation moved it");
+  assert.strictEqual(up.url, "https://site.example/b");
+  assert.strictEqual(sync.isDesynced(), false);
+});

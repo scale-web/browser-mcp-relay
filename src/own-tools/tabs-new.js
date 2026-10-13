@@ -34,6 +34,12 @@ const { applyLocalConfigToEnv } = require("../local-config.js");
 const { setActivePage, getActivePageRaw } = require("./_active-page.js");
 const sync = require("./_upstream-sync.js");
 
+// Pages this relay process created (tabs_new's newPage). When upstream's URL
+// can't be read, only these (and about:blank tabs) may be reused or pruned:
+// the user's tab can't be told apart, but the 2026-07-16 tab leak must not
+// come back while upstream is unreadable.
+const created = new WeakSet();
+
 /** Host of an http(s) URL, else null (about:blank, chrome://, bad URLs). */
 function urlHost(url) {
   try {
@@ -150,10 +156,12 @@ module.exports = {
     const sparedUrl = async () => {
       if (force) return null;
       if (read === null) read = await sync.readUpstreamUrl();
-      if (typeof read.url !== "string") return undefined; // unknown: spare everything
+      if (typeof read.url !== "string") return undefined; // unknown: see `created`
       return sync.mayNavigate(read.url) ? null : read.url;
     };
-    const spareFilter = (spared) => (p) => spared === undefined || (spared !== null && p.url() === spared);
+    const spareFilter = (spared) => (p) => (spared === undefined
+      ? !(created.has(p) || p.url() === "about:blank")
+      : spared !== null && p.url() === spared);
 
     let page = null;
     let reused = false;
@@ -174,7 +182,15 @@ module.exports = {
         adoptedBlank = !!page;
       }
     }
-    if (!page) page = await bridge.context.newPage();
+    if (!page) {
+      page = await bridge.context.newPage();
+      created.add(page);
+    }
+    // Reusing the relay's own pinned tab (same host): the relay's goto moves
+    // upstream's page too, so it stays the relay's (review r2).
+    if (adoptedBlank && url) await sparedUrl(); // reads upstream's URL (unless forced)
+    const preUrl = reused || adoptedBlank ? page.url() : null;
+    const wasUpstreams = preUrl !== null && read !== null && read.url === preUrl && sync.mayNavigate(preUrl);
     // T0-7: track the page as active BEFORE goto so a goto failure still
     // leaves us in a usable state — subsequent own-tools target this new
     // tab, not the previous active page or pages[0]'s about:blank.
@@ -189,6 +205,10 @@ module.exports = {
         await page.goto(url, { waitUntil, timeout: timeoutMs });
       } catch (e) {
         navError = e.message || String(e);
+      }
+      if (wasUpstreams) {
+        const now = await sync.readUpstreamUrl();
+        if (now.url === page.url()) sync.claim(now.url);
       }
     }
 

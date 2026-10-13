@@ -186,3 +186,43 @@ test("H2 through the relay: a slow guarded call on the relay's page keeps the ol
     assert.strictEqual(sync.state().relayUrl, "https://site.example/login");
   } finally { restore(); }
 });
+
+test("r2 H2: a short execute on the relay's page never claims what it ends on (a sign-in wait returns when the user finishes)", async () => {
+  const { up, relay, restore } = setup("about:blank");
+  const orig = up.client.request;
+  up.client.request = async (m, p) => {
+    if (p && p.name === "execute" && p.arguments.code === "waitForSignIn") {
+      up.url = "https://site.example/dashboard"; // the user finished; execute returns at once
+      return { content: [{ type: "text", text: "{}" }] };
+    }
+    return orig(m, p);
+  };
+  try {
+    await propagateActivePageToUpstream("https://site.example/login");
+    await relay.handleToolsCall({ name: "execute", arguments: { code: "waitForSignIn" } });
+    assert.strictEqual(sync.state().relayUrl, "https://site.example/login");
+    assert.strictEqual((await propagateActivePageToUpstream("https://other.example/x")).propagated, false);
+    assert.strictEqual(up.url, "https://site.example/dashboard");
+  } finally { restore(); }
+});
+
+test("r2: a navigation_* from a page that is not the relay's, not opted in, does not claim", async () => {
+  const { up, restore } = setup("https://user.example/dashboard");
+  try {
+    const before = await sync.readUpstreamUrl();
+    up.url = "https://elsewhere.example/";
+    await sync.afterGuardedCall({ before, name: "navigation_go-to", optIn: false, ms: 10 });
+    assert.strictEqual(sync.state().relayUrl, null);
+  } finally { restore(); }
+});
+
+test("r2: a long interaction_* on the relay's page does not claim what it ends on", async () => {
+  const { up, restore } = setup("about:blank");
+  try {
+    await propagateActivePageToUpstream("https://site.example/a");
+    const before = await sync.readUpstreamUrl();
+    up.url = "https://site.example/dashboard";
+    await sync.afterGuardedCall({ before, name: "interaction_click", ms: sync.OWN_WINDOW_MS + 1 });
+    assert.strictEqual(sync.state().relayUrl, "https://site.example/a");
+  } finally { restore(); }
+});
