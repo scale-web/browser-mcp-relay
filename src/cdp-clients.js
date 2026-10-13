@@ -15,8 +15,21 @@
 // (server) sockets appear too, as `127.0.0.1:<port>->127.0.0.1:<ephemeral>`;
 // only sockets whose REMOTE end is 127.0.0.1:<port> are clients. IPv4 only on
 // purpose: Brave's CDP listener is bound to 127.0.0.1 (see cdp-identity.js).
+//
+// What keeps Brave's OWN sockets out is that client-socket test: Brave holds
+// only the server ends. Excluding its pid as well changes nothing today and is
+// kept only as a second guard.
+//
+// On darwin lsof lives in /usr/sbin, which a relay started with a trimmed PATH
+// (/usr/bin:/bin) does not search; the absolute path is used when it exists.
 
+const fs = require("node:fs");
 const { execFile } = require("node:child_process");
+
+/** The lsof to run: /usr/sbin/lsof on darwin when present, else PATH lookup. */
+function lsofCommand({ platform = process.platform, exists = fs.existsSync } = {}) {
+  return platform === "darwin" && exists("/usr/sbin/lsof") ? "/usr/sbin/lsof" : "lsof";
+}
 
 /** Client sockets to 127.0.0.1:<port> in lsof `-F pn` output: [{ pid, local, remote }]. */
 function parseLsofClients(stdout, port) {
@@ -35,7 +48,9 @@ function parseLsofClients(stdout, port) {
   return out;
 }
 
-/** parseLsofClients minus sockets owned by `excludePids` (relay, upstream, Brave). */
+/** parseLsofClients minus sockets owned by `excludePids` (the relay and its
+ *  upstream child; Brave's pid too, though its sockets are server ends that
+ *  parseLsofClients already drops). */
 function externalClients(stdout, port, excludePids = []) {
   const skip = new Set(excludePids.filter((p) => Number.isInteger(p)));
   return parseLsofClients(stdout, port).filter((c) => !skip.has(c.pid));
@@ -46,7 +61,7 @@ function externalClients(stdout, port, excludePids = []) {
  * `timeoutMs` (+1 s hard cap if the child never reports back).
  * Resolves { ok: true, clients } or { ok: false, reason }.
  */
-function listExternalCdpClients({ port, excludePids = [], timeoutMs = 3000, _execFile = execFile } = {}) {
+function listExternalCdpClients({ port, excludePids = [], timeoutMs = 3000, _execFile = execFile, _lsofPath = null } = {}) {
   return new Promise((resolve) => {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       resolve({ ok: false, reason: `no valid CDP port (${port})` });
@@ -63,7 +78,7 @@ function listExternalCdpClients({ port, excludePids = [], timeoutMs = 3000, _exe
     if (typeof cap.unref === "function") cap.unref();
     try {
       _execFile(
-        "lsof",
+        _lsofPath || lsofCommand(),
         ["-nP", "-w", `-iTCP@127.0.0.1:${port}`, "-sTCP:ESTABLISHED", "-F", "pn"],
         { encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 },
         (err, stdout, stderr) => {
@@ -86,4 +101,4 @@ function listExternalCdpClients({ port, excludePids = [], timeoutMs = 3000, _exe
   });
 }
 
-module.exports = { parseLsofClients, externalClients, listExternalCdpClients };
+module.exports = { lsofCommand, parseLsofClients, externalClients, listExternalCdpClients };

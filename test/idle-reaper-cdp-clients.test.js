@@ -21,7 +21,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 
-const { parseLsofClients, externalClients, listExternalCdpClients } = require("../src/cdp-clients.js");
+const { lsofCommand, parseLsofClients, externalClients, listExternalCdpClients } = require("../src/cdp-clients.js");
 
 const HARNESS = path.join(__dirname, "fixtures", "relay-harness.js");
 const MOCK_BDMCP = path.join(__dirname, "fixtures", "mock-bdmcp-session.js");
@@ -82,7 +82,7 @@ test("listExternalCdpClients runs the address-specific ESTABLISHED lsof and filt
     _execFile: stub((cb, call) => { seen = call; cb(null, LSOF_OUT, ""); }),
   });
   assert.deepStrictEqual(r, { ok: true, clients: [{ pid: 40001, local: "127.0.0.1:50003", remote: "127.0.0.1:9335" }] });
-  assert.strictEqual(seen.cmd, "lsof");
+  assert.strictEqual(seen.cmd, lsofCommand());
   assert.deepStrictEqual(seen.args, ["-nP", "-w", "-iTCP@127.0.0.1:9335", "-sTCP:ESTABLISHED", "-F", "pn"]);
   assert.strictEqual(seen.opts.timeout, 3000);
 });
@@ -110,6 +110,22 @@ test("lsof missing, erroring, timed out, throwing or never answering → { ok: f
     assert.match(r.reason, re, name);
     assert.ok(Date.now() - t0 < 2000, `${name}: must resolve within the hard cap`);
   }
+});
+
+test("lsofCommand: /usr/sbin/lsof on darwin when it exists, else a PATH lookup", () => {
+  assert.strictEqual(lsofCommand({ platform: "darwin", exists: (p) => p === "/usr/sbin/lsof" }), "/usr/sbin/lsof");
+  assert.strictEqual(lsofCommand({ platform: "darwin", exists: () => false }), "lsof");
+  assert.strictEqual(lsofCommand({ platform: "linux", exists: () => true }), "lsof");
+  assert.strictEqual(lsofCommand({ platform: "win32", exists: () => true }), "lsof");
+  if (process.platform === "darwin") assert.strictEqual(lsofCommand(), "/usr/sbin/lsof", "this Mac has /usr/sbin/lsof");
+});
+
+test("listExternalCdpClients runs lsofCommand() unless a binary is injected", async () => {
+  const seen = [];
+  const exec = stub((cb, call) => { seen.push(call.cmd); cb(null, "", ""); });
+  await listExternalCdpClients({ port: 9335, _execFile: exec });
+  await listExternalCdpClients({ port: 9335, _execFile: exec, _lsofPath: "/tmp/fake-lsof" });
+  assert.deepStrictEqual(seen, [lsofCommand(), "/tmp/fake-lsof"]);
 });
 
 test("an invalid port never runs lsof", async () => {
@@ -250,13 +266,13 @@ async function startRelay({ idleMinutes, files = {}, extraEnv = {} }) {
 
 const REAPED = /reaping Brave \+ upstream/g;
 
-test("relay: an external CDP client keeps Brave alive; once it disconnects the reaper reaps", T, async () => {
+async function externalClientKeepsBrave(extraEnv = {}) {
   const l = await listener();
   const ext = cdpClientChild(l.port);
   let r;
   try {
     await waitFor(() => l.accepted() === 1, 3000, "external client connected");
-    r = await startRelay({ idleMinutes: "0.01", files: { "brave-port": String(l.port), "upstream-connects": "1" } }); // ~0.6 s
+    r = await startRelay({ idleMinutes: "0.01", files: { "brave-port": String(l.port), "upstream-connects": "1" }, extraEnv }); // ~0.6 s
     await r.request("tools/list", {});
     const first = await r.call();
     assert.strictEqual(first.isError, false, first.text);
@@ -280,13 +296,18 @@ test("relay: an external CDP client keeps Brave alive; once it disconnects the r
     if (r) await r.stop();
     l.close();
   }
-});
+}
+
+test("relay: an external CDP client keeps Brave alive; once it disconnects the reaper reaps", T, () => externalClientKeepsBrave());
+
+test("relay: started with PATH=/usr/bin:/bin (no /usr/sbin) it still finds lsof and detects the external client", T,
+  () => externalClientKeepsBrave({ PATH: "/usr/bin:/bin" }));
 
 test("relay: a hung lsof neither crashes nor wedges the reaper — it falls back to reaping, logged once", T, async () => {
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), "relay-fake-lsof-"));
   const marker = path.join(bin, "calls");
   fs.writeFileSync(path.join(bin, "lsof"), `#!/bin/sh\necho x >> '${marker}'\nexec sleep 30\n`, { mode: 0o755 });
-  const r = await startRelay({ idleMinutes: "0.01", extraEnv: { PATH: `${bin}:/usr/bin:/bin` } });
+  const r = await startRelay({ idleMinutes: "0.01", files: { "lsof-bin": path.join(bin, "lsof") } });
   try {
     await r.request("tools/list", {});
     assert.strictEqual((await r.call()).isError, false);
@@ -299,6 +320,32 @@ test("relay: a hung lsof neither crashes nor wedges the reaper — it falls back
     assert.strictEqual(r.count(/check unavailable/g), 1, "the failure is logged once per relay");
     const calls = fs.readFileSync(marker, "utf8").trim().split("\n").length;
     assert.strictEqual(calls, 2, `one lsof per reap decision, no stacking (got ${calls})`);
+    assert.strictEqual(r.child.exitCode, null, "relay must stay up");
+  } finally {
+    await r.stop();
+    fs.rmSync(bin, { recursive: true, force: true });
+  }
+});
+
+test("relay: a tool call that lands WHILE lsof runs cancels that reap (the post-lsof re-check)", T, async () => {
+  // Slow fake lsof: 1.5 s, then "no sockets" (exit 1, no output). Idle 0.05 min
+  // = 3 s, ticks every 3 s. The call lands mid-lsof and resets the idle clock,
+  // so the next reap is ≥ 3 s after it; without the re-check the tick that
+  // started the lsof reaps right after it returns.
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "relay-slow-lsof-"));
+  const started = path.join(bin, "started");
+  fs.writeFileSync(path.join(bin, "lsof"), `#!/bin/sh\necho x >> '${started}'\nsleep 1.5\nexit 1\n`, { mode: 0o755 });
+  const r = await startRelay({ idleMinutes: "0.05", files: { "lsof-bin": path.join(bin, "lsof") } });
+  try {
+    await r.request("tools/list", {});
+    assert.strictEqual((await r.call()).isError, false);
+    await waitFor(() => fs.existsSync(started), 10000, "the reaper's lsof to start");
+    assert.strictEqual(r.count(REAPED), 0, "precondition: nothing reaped before the lsof");
+    const mid = await r.call();
+    assert.strictEqual(mid.isError, false, mid.text);
+    await new Promise((res) => setTimeout(res, 2000)); // lsof returns ~1.5 s after it started
+    assert.strictEqual(r.count(REAPED), 0, `reaped although a call landed mid-lsof:\n${r.stderr()}`);
+    assert.ok(!/check unavailable/.test(r.stderr()), "the slow lsof must have answered, not timed out");
     assert.strictEqual(r.child.exitCode, null, "relay must stay up");
   } finally {
     await r.stop();

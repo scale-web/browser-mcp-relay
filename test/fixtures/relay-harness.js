@@ -121,6 +121,19 @@ stubModule(path.join(SRC, "pool-shared.js"), {
 
 stubModule(path.join(SCRIPTS, "patch-bdmcp-bundle.js"), { applyPatch: () => ({ patched: true }) });
 
+// $HARNESS_DIR/lsof-bin = /abs/path: the relay's CDP-client check runs that
+// binary instead of lsof — everything else in cdp-clients.js stays real (the
+// relay resolves /usr/sbin/lsof absolutely on darwin, so PATH cannot do this).
+let lsofBin = null;
+try { lsofBin = fs.readFileSync(path.join(dir, "lsof-bin"), "utf8").trim(); } catch {}
+if (lsofBin) {
+  const realCdpClients = require(path.join(SRC, "cdp-clients.js"));
+  stubModule(path.join(SRC, "cdp-clients.js"), {
+    ...realCdpClients,
+    listExternalCdpClients: (opts) => realCdpClients.listExternalCdpClients({ ...opts, _lsofPath: lsofBin }),
+  });
+}
+
 function killCurrentBrave() {
   const h = current;
   fs.writeFileSync(path.join(dir, "brave-alive"), "dead");

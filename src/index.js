@@ -633,9 +633,12 @@ async function main() {
   // 127.0.0.1:<cdpPort>), which no MCP call reveals — the reaper killed Braves
   // mid-script 3x on 2026-10-12. So when a tick WOULD reap, it first lists the
   // ESTABLISHED client sockets to 127.0.0.1:<this Brave's cdpPort>
-  // (src/cdp-clients.js, one lsof, 3 s timeout). Any socket owned by a process
-  // other than the relay, the upstream child or the Brave main process counts
-  // as activity: activity is bumped and nothing is reaped. Only a connection
+  // (src/cdp-clients.js, one lsof, 3 s timeout). Only CLIENT ends count — a
+  // socket whose remote end is the CDP port — which is what keeps Brave's own
+  // (server-end) sockets out. Any client socket owned by a process other than
+  // the relay or the upstream child counts as activity: activity is bumped and
+  // nothing is reaped. (Brave's main pid is excluded too, as a second guard
+  // that changes nothing while Brave holds only server ends.) Only a connection
   // OPEN at the tick is seen — a script that connects and exits between ticks
   // leaves no trace. If lsof fails or times out (missing on Windows, a broken
   // PATH, a stalled system), that tick falls back to the pre-2026-10-12
