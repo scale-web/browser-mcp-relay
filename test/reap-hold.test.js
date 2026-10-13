@@ -15,7 +15,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { KEEPALIVE_NAME, REAP_LOG_NAME, freshKeepaliveAgeMs, psCommands, ReapLog } = require("../src/reap-hold.js");
+const { KEEPALIVE_NAME, REAP_LOG_NAME, freshKeepaliveAgeMs, redactCommand, withFileLock, psCommands, ReapLog } = require("../src/reap-hold.js");
+const { spawn } = require("node:child_process");
 const { isAlive, waitFor, listener, cdpClientChild, startRelay } = require("./helpers/reaper-relay.js");
 
 const T = { timeout: 45000 };
@@ -92,7 +93,7 @@ test("ReapLog rotates to .1 past the cap, keeping exactly one old file", () => {
     for (let i = 5; i < 10; i++) log.write("reaped", { idleS: i });
     assert.deepStrictEqual(readLog(`${file}.1`).map((l) => l.idleS), [4, 5, 6, 7], "the second rotation replaced .1");
     assert.deepStrictEqual(readLog(file).map((l) => l.idleS), [8, 9]);
-    assert.deepStrictEqual(fs.readdirSync(dir).sort(), [REAP_LOG_NAME, `${REAP_LOG_NAME}.1`], "only one old file kept");
+    assert.deepStrictEqual(fs.readdirSync(dir).filter((n) => !n.endsWith(".lock")).sort(), [REAP_LOG_NAME, `${REAP_LOG_NAME}.1`], "only one old file kept");
     assert.ok(fs.statSync(file).size <= 360);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -127,9 +128,14 @@ test("ReapLog.held: 'held' once per hold, again on a pid-set change, again after
     const c = await log.held([100], 40);
     assert.strictEqual(c.changed, true, "pid set changed");
     assert.strictEqual(c.since, a.since, "still the same hold");
-    assert.strictEqual(log.endHold(), true);
-    assert.strictEqual(log.endHold(), false, "no hold open");
-    assert.strictEqual((await log.held([100], 50)).changed, true, "a new hold after the old one ended");
+    assert.strictEqual(log.release("no-clients"), true);
+    assert.strictEqual(log.release("no-clients"), false, "no hold open");
+    assert.strictEqual((await log.held([100], 50)).changed, true, "a new hold by the SAME pids after the old one ended");
+    const rel = readLog(file).filter((l) => l.event === "released");
+    assert.strictEqual(rel.length, 1);
+    assert.strictEqual(rel[0].reason, "no-clients");
+    assert.deepStrictEqual(rel[0].pids, [100]);
+    assert.ok(typeof rel[0].heldS === "number" && rel[0].heldS >= 0 && rel[0].heldS < 5);
     const held = readLog(file).filter((l) => l.event === "held");
     assert.deepStrictEqual(held.map((l) => l.idleS), [10, 40, 50]);
     assert.deepStrictEqual(held[0].heldBy, [{ pid: 100, command: "cmd-100" }, { pid: 300, command: "cmd-300" }]);
@@ -146,10 +152,97 @@ test("ReapLog.held survives a throwing ps (command: null); psCommands reads real
     await log.held([7], 1);
     assert.deepStrictEqual(readLog(path.join(dir, REAP_LOG_NAME))[0].heldBy, [{ pid: 7, command: null }]);
     const real = await psCommands([process.pid]);
-    assert.match(real[process.pid], /node/);
-    assert.ok(real[process.pid].length <= 120);
+    assert.match(real[process.pid], /^node( [\w.@+-]+\.(mjs|cjs|js))?$/, real[process.pid]);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("redactCommand keeps the executable and script basenames only — never arguments", () => {
+  const SECRET = "tok_SECRET123";
+  const cases = [
+    ["/opt/homebrew/bin/node", `node /Users/x/repo/scripts/lib/own-relay-port.mjs --url=https://h/?token=${SECRET}`, "node own-relay-port.mjs"],
+    ["/opt/homebrew/bin/node", `/opt/homebrew/bin/node --inspect /a/b/xhr-capture-ghl.mjs https://app.example/?token=${SECRET}`, "node xhr-capture-ghl.mjs"],
+    ["/usr/bin/curl", `curl -s https://h/json?token=${SECRET}`, "curl"],
+    ["/usr/bin/curl", `curl https://h/x.js?token=${SECRET}`, "curl"],
+    ["/opt/homebrew/bin/node", `node -e require("net").connect(1)`, "node"],
+    ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", `/Applications/Brave Browser.app/Contents/MacOS/Brave Browser --user-data-dir=/x?token=${SECRET}`, "Brave Browser"],
+    ["/usr/bin/python3", `python3 /tmp/sniff.py ${SECRET}`, "python3 sniff.py"],
+    ["", "anything", null],
+  ];
+  for (const [comm, args, want] of cases) {
+    const got = redactCommand(comm, args);
+    assert.strictEqual(got, want, `${args} -> ${got}`);
+    assert.ok(!String(got).includes(SECRET) && !String(got).includes("token"), `leaked: ${got}`);
+  }
+});
+
+test("psCommands on a real process whose arguments carry ?token= logs only `node <script>`", T, async () => {
+  const dir = tmp("ps-redact-");
+  const script = path.join(dir, "own-relay-port.mjs");
+  fs.writeFileSync(script, "setInterval(() => {}, 1e6);\n");
+  const child = spawn(process.execPath, [script, "https://app.example/?token=tok_SECRET123", "--jwt=eyJhbGciOi"], { stdio: "ignore" });
+  try {
+    await waitFor(async () => (await psCommands([child.pid]))[child.pid] !== undefined, 3000, "child visible to ps");
+    const got = (await psCommands([child.pid]))[child.pid];
+    assert.strictEqual(got, "node own-relay-port.mjs");
+  } finally {
+    child.kill("SIGKILL");
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("withFileLock: exclusive between holders, gives up after waitMs, never throws", () => {
+  const dir = tmp("lock-");
+  const lockPath = path.join(dir, "x.lock");
+  try {
+    let inner = null;
+    const outer = withFileLock(lockPath, () => {
+      const t0 = Date.now();
+      inner = withFileLock(lockPath, () => { throw new Error("must not run"); }, { waitMs: 60 });
+      assert.ok(Date.now() - t0 >= 50, "the second taker waited");
+    });
+    assert.strictEqual(outer, true);
+    assert.strictEqual(inner, false, "a held lock is not taken twice");
+    assert.strictEqual(withFileLock(lockPath, () => {}), true, "free again after release");
+    assert.strictEqual(withFileLock(lockPath, () => { throw new Error("boom"); }), false, "fn throwing → false, no throw");
+    assert.strictEqual(withFileLock(path.join(dir, "no", "such", "dir.lock"), () => {}), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// 8 processes append concurrently across one rotation (~27 KB into a 20 KB
+// cap): exactly one rotation, `.1` is the FULL rotated file, no line lost or
+// torn. Unlocked, several writers see the file over the cap at once and the
+// second rename replaces a full `.1` with a near-empty one. Five rounds.
+test("ReapLog: 8 concurrent writers rotate once; .1 holds the full rotated file", T, async () => {
+  const SRC = path.resolve(__dirname, "..", "src", "reap-hold.js");
+  for (let round = 0; round < 5; round++) {
+    const dir = tmp("reaplog-conc-");
+    const file = path.join(dir, REAP_LOG_NAME);
+    const go = path.join(dir, "go");
+    try {
+      const kids = [];
+      for (let k = 0; k < 8; k++) {
+        kids.push(spawn(process.execPath, ["-e", `
+          const fs = require("fs");
+          const { ReapLog } = require(${JSON.stringify(SRC)});
+          const log = new ReapLog({ file: ${JSON.stringify(file)}, slug: "conc", maxBytes: 20000 });
+          while (!fs.existsSync(${JSON.stringify(go)})) {}
+          for (let i = 0; i < 40; i++) log.write("reaped", { idleS: i, k: ${k}, pad: "x".repeat(20) });
+        `], { stdio: "ignore" }));
+      }
+      await new Promise((res) => setTimeout(res, 300));
+      fs.writeFileSync(go, "");
+      await Promise.all(kids.map((c) => new Promise((res) => c.once("exit", res))));
+      const cur = readLog(file);
+      const old = readLog(`${file}.1`);
+      assert.strictEqual(old.length + cur.length, 320, `round ${round}: lines lost (.1=${old.length}, cur=${cur.length})`);
+      assert.ok(fs.statSync(`${file}.1`).size > 19000, `round ${round}: .1 is not the full rotated file (${fs.statSync(`${file}.1`).size} B)`);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   }
 });
 
@@ -243,16 +336,21 @@ test("relay: an external-client hold logs 'held' once, again when the pid set ch
     held = relayLog(r).filter((x) => x.event === "held");
     assert.deepStrictEqual(held[1].heldBy.map((h) => h.pid), [ext1.pid, ext2.pid].sort((a, b) => a - b));
 
-    // The sidecar's reapHeldBy rides its next write; a Brave death forces one.
-    await r.killBrave();
+    // Hold start/change are written to the sidecar at once.
     const side = sidecarOf(r);
     assert.deepStrictEqual(side.reapHeldBy && side.reapHeldBy.pids, held[1].heldBy.map((h) => h.pid));
     assert.match(side.reapHeldBy.since, /Z$/);
 
-    // Brave gone: the next tick reaps the upstream; the hold ends.
+    // The Brave going away ends the hold: "released", reapHeldBy cleared.
+    await r.killBrave();
+    assert.strictEqual(sidecarOf(r).reapHeldBy, null, "reapHeldBy cleared when the hold ends");
+    const rel = relayLog(r).filter((x) => x.event === "released");
+    assert.strictEqual(rel.length, 1);
+    assert.strictEqual(rel[0].reason, "brave-gone");
+    assert.ok(rel[0].heldS > 0, JSON.stringify(rel[0]));
     await waitFor(() => r.count(REAPED) === 1, 6000, "reap after the Brave died");
     const events = relayLog(r).map((x) => x.event);
-    assert.deepStrictEqual(events, ["held", "held", "reaped"], JSON.stringify(events));
+    assert.deepStrictEqual(events, ["held", "held", "released", "reaped"], JSON.stringify(events));
     assert.strictEqual(r.child.exitCode, null);
   } finally {
     for (const c of [ext1, ext2]) if (c && isAlive(c.pid)) c.kill("SIGKILL");
@@ -276,5 +374,85 @@ test("relay: an unwritable reap log changes nothing — the reap still happens a
   } finally {
     await r.stop();
     lsof.rm();
+  }
+});
+
+test("relay: one keep-alive touch holds for ONE idle window after the touch, not one window after the check", T, async () => {
+  // Window 6 s, reaper tick 100 ms (as in production, tick << window). The
+  // last MCP call is at A, the single touch at M = A + 1 s. The check at
+  // ~A + 6 s finds the keep-alive fresh; the reap must follow at ~M + 6 s.
+  // Resetting the idle clock to the CHECK time would hold until ~A + 12 s
+  // (= M + 11 s). Bounds leave ~2.5 s for a loaded machine on either side.
+  const lsof = countingLsof();
+  const r = await startRelay({ idleMinutes: "0.1", files: { "lsof-bin": lsof.file, "reaper-tick-ms": "100" } });
+  try {
+    await r.request("tools/list", {});
+    assert.strictEqual((await r.call()).isError, false);
+    await new Promise((res) => setTimeout(res, 1000));
+    const ka = path.join(r.profileDir, KEEPALIVE_NAME);
+    fs.writeFileSync(ka, "");
+    const touchedAt = fs.statSync(ka).mtimeMs;
+    await waitFor(() => r.count(REAPED) === 1, 20000, "reap after the keep-alive expires");
+    const reapedAt = Date.now();
+    const kept = relayLog(r).filter((l) => l.event === "keepalive");
+    assert.ok(kept.length >= 1, "precondition: the keep-alive held the reap at least once");
+    const after = reapedAt - touchedAt;
+    assert.ok(after >= 5800, `reaped ${after} ms after the touch — before the window ended`);
+    assert.ok(after <= 8500, `reaped ${after} ms after the touch — the keep-alive held past one window`);
+  } finally {
+    await r.stop();
+    lsof.rm();
+  }
+});
+
+test("relay: a hold is released (and logged) on an MCP call, on a keep-alive taking over, and when no client is left", T, async () => {
+  const l = await listener();
+  const ext = cdpClientChild(l.port);
+  let r;
+  let toucher;
+  try {
+    await waitFor(() => l.accepted() === 1, 3000, "ext connected");
+    r = await startRelay({ idleMinutes: "0.01", files: { "brave-port": String(l.port), "upstream-connects": "1", "reaper-tick-ms": "100" } });
+    await r.request("tools/list", {});
+    assert.strictEqual((await r.call()).isError, false);
+    const evs = () => relayLog(r);
+    const n = (e) => evs().filter((x) => x.event === e).length;
+    await waitFor(() => n("held") === 1, 6000, "hold #1");
+    assert.deepStrictEqual(sidecarOf(r).reapHeldBy.pids, [ext.pid]);
+
+    // 1. An MCP call ends the idle state → released (mcp-call), sidecar cleared.
+    assert.strictEqual((await r.call()).isError, false);
+    assert.strictEqual(n("released"), 1);
+    assert.strictEqual(evs().filter((x) => x.event === "released")[0].reason, "mcp-call");
+    assert.strictEqual(sidecarOf(r).reapHeldBy, null);
+    // … and the next hold by the same pid is a NEW hold.
+    await waitFor(() => n("held") === 2, 6000, "hold #2 by the same pid");
+
+    // 2. A keep-alive takes over → released (keepalive), then keepalive events.
+    const ka = path.join(r.profileDir, KEEPALIVE_NAME);
+    fs.writeFileSync(ka, "");
+    toucher = setInterval(() => { const t = Date.now() / 1000; try { fs.utimesSync(ka, t, t); } catch {} }, 100);
+    await waitFor(() => n("released") === 2, 6000, "release when the keep-alive takes over");
+    assert.strictEqual(evs().filter((x) => x.event === "released")[1].reason, "keepalive");
+    assert.strictEqual(sidecarOf(r).reapHeldBy, null);
+    await waitFor(() => n("keepalive") >= 1, 3000, "keepalive event");
+    clearInterval(toucher); toucher = null;
+    fs.rmSync(ka);
+    await waitFor(() => n("held") === 3, 6000, "hold #3 once the keep-alive is gone");
+
+    // 3. The last client leaves → released (no-clients), then the reap.
+    ext.kill("SIGKILL");
+    await waitFor(() => n("reaped") === 1, 6000, "reap after the client left");
+    const rel = evs().filter((x) => x.event === "released");
+    assert.deepStrictEqual(rel.map((x) => x.reason), ["mcp-call", "keepalive", "no-clients"]);
+    for (const x of rel) assert.ok(typeof x.heldS === "number" && x.heldS >= 0, JSON.stringify(x));
+    const seq = evs().map((x) => x.event).filter((e) => e !== "keepalive");
+    assert.deepStrictEqual(seq, ["held", "released", "held", "released", "held", "released", "reaped"], JSON.stringify(seq));
+    assert.strictEqual(r.child.exitCode, null);
+  } finally {
+    if (toucher) clearInterval(toucher);
+    if (isAlive(ext.pid)) ext.kill("SIGKILL");
+    if (r) await r.stop();
+    l.close();
   }
 });

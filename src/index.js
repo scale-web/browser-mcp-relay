@@ -609,6 +609,7 @@ async function main() {
       braveLaunchPromise = null;
       port = null;
       wsEndpoint = null;
+      endReapHold("brave-gone");
     }
     if (globalThis.__relayBridge && globalThis.__relayBridge.context === l.context) {
       globalThis.__relayBridge = null;
@@ -661,8 +662,13 @@ async function main() {
   // <userCacheRoot>/reap-events.log (src/reap-hold.js: one JSON line per
   // event — held once per hold and on a holder-pid change, keepalive,
   // lsof-failed, reaped; 0600; rotated past ~1 MB). The sidecar carries
-  // reapHeldBy {pids, since} while a CDP hold lasts. No log or sidecar failure
-  // ever changes a reap decision.
+  // reapHeldBy {pids, since} while a CDP hold lasts. A hold ENDS — "released",
+  // reapHeldBy cleared — when a check finds no clients, an MCP request
+  // arrives, a keep-alive takes over, lsof fails, a reap runs or the Brave
+  // goes away; the next hold, even by the same pids, logs a new "held". A
+  // fresh keep-alive sets the idle clock to its mtime (never later than now),
+  // not to the check time, so one touch holds for one window after the touch.
+  // No log or sidecar failure ever changes a reap decision.
   let lastActivityAt = Date.now();
   // In-flight request counter: the reaper must never fire while a call is
   // running, even one that outlives the idle threshold (a lighthouse run
@@ -675,8 +681,11 @@ async function main() {
   try { reapLogFile = path.join(pool.userCacheRoot(), REAP_LOG_NAME); } catch { /* no log */ }
   const reapLog = new ReapLog({ file: reapLogFile, slug: project });
   const idleSeconds = () => Math.round((Date.now() - lastActivityAt) / 1000);
-  function endReapHold() {
-    if (reapLog.endHold()) sidecar.update({ reapHeldBy: null });
+  // Hold end, for any reason, is logged ("released", with heldS) and clears
+  // the sidecar's reapHeldBy. Hold start/end are rare, so both are written to
+  // the sidecar at once rather than on its next periodic write.
+  function endReapHold(reason) {
+    if (reapLog.release(reason)) sidecar.update({ reapHeldBy: null }, { force: true });
   }
 
   let cdpClientCheckFailureLogged = false;
@@ -687,12 +696,16 @@ async function main() {
     const idleS = idleSeconds();
     const kaAge = freshKeepaliveAgeMs(dir, idleMs);
     if (kaAge !== null) {
-      bumpActivity();
+      // The activity is the TOUCH, not this check: one idle window after the
+      // last touch, never more (resetting to now would hold up to ~2 windows).
+      const now = Date.now();
+      lastActivityAt = Math.max(lastActivityAt, Math.min(now - kaAge, now));
+      endReapHold("keepalive");
       reapLog.write("keepalive", { keepaliveAgeS: Math.round(kaAge / 1000), idleS });
       process.stderr.write(`[mcp-relay] idle reaper: ${KEEPALIVE_NAME} touched ${Math.round(kaAge / 1000)}s ago — Brave kept, idle clock reset\n`);
       return true;
     }
-    if (!bridge || !port) { endReapHold(); return false; }
+    if (!bridge || !port) { endReapHold("brave-gone"); return false; }
     const excludePids = [process.pid, upstreamChild && upstreamChild.pid, sidecar.data.bravePid];
     const r = await listExternalCdpClients({ port, excludePids, timeoutMs: 3000 });
     if (!r.ok) {
@@ -701,14 +714,14 @@ async function main() {
         process.stderr.write(`[mcp-relay] idle reaper: external-CDP-client check unavailable (${r.reason}); falling back to MCP-only idleness for such ticks (logged once)\n`);
       }
       reapLog.write("lsof-failed", { reason: r.reason, idleS });
-      endReapHold();
+      endReapHold("lsof-failed");
       return false;
     }
-    if (r.clients.length === 0) { endReapHold(); return false; }
+    if (r.clients.length === 0) { endReapHold("no-clients"); return false; }
     bumpActivity();
     const pids = [...new Set(r.clients.map((c) => c.pid))];
     const h = await reapLog.held(pids, idleS);
-    if (h.changed) sidecar.update({ reapHeldBy: { pids: h.pids, since: h.since } });
+    if (h.changed) sidecar.update({ reapHeldBy: { pids: h.pids, since: h.since } }, { force: true });
     process.stderr.write(`[mcp-relay] idle reaper: external CDP client(s) on 127.0.0.1:${port} (pid ${pids.join(",")}) — Brave kept, idle clock reset\n`);
     return true;
   }
@@ -760,8 +773,8 @@ async function main() {
       if (inFlightRequests > 0) return;
       if (Date.now() - lastActivityAt < idleMs) return;
       if (!bridge && !upstreamChild) return;
+      endReapHold("reaped"); // defensive: every path that lets a reap through has already released
       reapLog.write("reaped", { idleS: idleSeconds() });
-      endReapHold();
       process.stderr.write(
         `[mcp-relay] idle ${idleMinutes}min — reaping Brave + upstream to reclaim RAM (both relaunch on next tool call; logins persist)\n`,
       );
@@ -875,11 +888,13 @@ async function main() {
   // immediately after it returns.
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     bumpActivity();
+    endReapHold("mcp-call");
     inFlightRequests++;
     try { return await relay.handleToolsList(); } finally { inFlightRequests--; bumpActivity(); }
   });
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     bumpActivity();
+    endReapHold("mcp-call");
     sidecar.update({ lastToolCallAt: new Date().toISOString() });
     inFlightRequests++;
     try { return await relay.handleToolsCall(req.params); } finally { inFlightRequests--; bumpActivity(); }

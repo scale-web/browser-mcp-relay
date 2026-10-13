@@ -20,6 +20,20 @@ const SCRIPTS = path.resolve(__dirname, "..", "..", "scripts");
 const dir = process.env.HARNESS_DIR;
 const log = (m) => process.stderr.write(`HARNESS ${m}\n`);
 
+// $HARNESS_DIR/reaper-tick-ms = N: the idle reaper's interval — the one
+// index.js arms with Math.min(60000, idleMs) — fires every N ms instead, so a
+// test can have a tick much shorter than the idle window, as in production
+// (45 min window, 1 min tick). Other intervals are untouched.
+(() => {
+  let tickMs = null;
+  try { tickMs = Number(fs.readFileSync(path.join(dir, "reaper-tick-ms"), "utf8")); } catch { return; }
+  const idleMs = parseFloat(process.env.BROWSER_RELAY_IDLE_MINUTES) * 60_000;
+  if (!(tickMs > 0) || !(idleMs > 0)) return;
+  const want = Math.min(60_000, idleMs);
+  const realSetInterval = global.setInterval;
+  global.setInterval = (fn, ms, ...rest) => realSetInterval(fn, ms === want ? tickMs : ms, ...rest);
+})();
+
 function stubModule(absPath, exports) {
   require.cache[absPath] = { id: absPath, filename: absPath, loaded: true, exports };
 }
