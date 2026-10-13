@@ -44,6 +44,7 @@ const { applyLocalConfigToEnv } = require("./local-config.js");
 const { loadVaultFromEnv } = require("./vault.js");
 const { attachAutofill } = require("./autofill-injector.js");
 const { listExternalCdpClients } = require("./cdp-clients.js");
+const { freshKeepaliveAgeMs, ReapLog, REAP_LOG_NAME, KEEPALIVE_NAME } = require("./reap-hold.js");
 
 // Layer local-config.json under env so resolveBdmcpEntry / launch flags see
 // it transparently. pool-shared.js applies the same overlay independently.
@@ -645,6 +646,23 @@ async function main() {
   // MCP-only rule and reaps, logged once per relay: never reaping would
   // silently remove the RAM bound for the life of the relay wherever lsof is
   // unusable, while a reap that ends one script is the old, known cost.
+  //
+  // Keep-alive file (2026-10-12, A51 follow-up): checked FIRST, before the
+  // lsof, because it is one lstat. `<claimed profile dir>/.mcp-relay-keepalive`
+  // (base or session clone — this claim's `dir`) that is a REGULAR file
+  // (lstat: symlinks and anything else are ignored) with an mtime less than
+  // one idle window old counts as activity: helpers `touch` it each time they
+  // use the Brave, so protection ends one idle window after the last touch and
+  // can never hold a Brave forever (an mtime > 5 s in the future is ignored).
+  // This covers what the lsof cannot: a script that connects and exits
+  // between ticks.
+  //
+  // Every hold and reap is recorded for measurement in
+  // <userCacheRoot>/reap-events.log (src/reap-hold.js: one JSON line per
+  // event — held once per hold and on a holder-pid change, keepalive,
+  // lsof-failed, reaped; 0600; rotated past ~1 MB). The sidecar carries
+  // reapHeldBy {pids, since} while a CDP hold lasts. No log or sidecar failure
+  // ever changes a reap decision.
   let lastActivityAt = Date.now();
   // In-flight request counter: the reaper must never fire while a call is
   // running, even one that outlives the idle threshold (a lighthouse run
@@ -653,11 +671,28 @@ async function main() {
   let inFlightRequests = 0;
   function bumpActivity() { lastActivityAt = Date.now(); }
 
+  let reapLogFile = null;
+  try { reapLogFile = path.join(pool.userCacheRoot(), REAP_LOG_NAME); } catch { /* no log */ }
+  const reapLog = new ReapLog({ file: reapLogFile, slug: project });
+  const idleSeconds = () => Math.round((Date.now() - lastActivityAt) / 1000);
+  function endReapHold() {
+    if (reapLog.endHold()) sidecar.update({ reapHeldBy: null });
+  }
+
   let cdpClientCheckFailureLogged = false;
-  /** True when a foreign process holds an ESTABLISHED CDP connection to the
-   *  current Brave (bumps activity). False when none does, or the check failed. */
-  async function externalCdpClientsSeen() {
-    if (!bridge || !port) return false;
+  /** True when the reap must be skipped: a fresh keep-alive file, or a foreign
+   *  process holding an ESTABLISHED CDP connection to the current Brave (both
+   *  bump activity). False when neither, or the CDP check failed. */
+  async function reapHeld(idleMs) {
+    const idleS = idleSeconds();
+    const kaAge = freshKeepaliveAgeMs(dir, idleMs);
+    if (kaAge !== null) {
+      bumpActivity();
+      reapLog.write("keepalive", { keepaliveAgeS: Math.round(kaAge / 1000), idleS });
+      process.stderr.write(`[mcp-relay] idle reaper: ${KEEPALIVE_NAME} touched ${Math.round(kaAge / 1000)}s ago — Brave kept, idle clock reset\n`);
+      return true;
+    }
+    if (!bridge || !port) { endReapHold(); return false; }
     const excludePids = [process.pid, upstreamChild && upstreamChild.pid, sidecar.data.bravePid];
     const r = await listExternalCdpClients({ port, excludePids, timeoutMs: 3000 });
     if (!r.ok) {
@@ -665,12 +700,16 @@ async function main() {
         cdpClientCheckFailureLogged = true;
         process.stderr.write(`[mcp-relay] idle reaper: external-CDP-client check unavailable (${r.reason}); falling back to MCP-only idleness for such ticks (logged once)\n`);
       }
+      reapLog.write("lsof-failed", { reason: r.reason, idleS });
+      endReapHold();
       return false;
     }
-    if (r.clients.length === 0) return false;
+    if (r.clients.length === 0) { endReapHold(); return false; }
     bumpActivity();
-    const pids = [...new Set(r.clients.map((c) => c.pid))].join(",");
-    process.stderr.write(`[mcp-relay] idle reaper: external CDP client(s) on 127.0.0.1:${port} (pid ${pids}) — Brave kept, idle clock reset\n`);
+    const pids = [...new Set(r.clients.map((c) => c.pid))];
+    const h = await reapLog.held(pids, idleS);
+    if (h.changed) sidecar.update({ reapHeldBy: { pids: h.pids, since: h.since } });
+    process.stderr.write(`[mcp-relay] idle reaper: external CDP client(s) on 127.0.0.1:${port} (pid ${pids.join(",")}) — Brave kept, idle clock reset\n`);
     return true;
   }
 
@@ -711,9 +750,9 @@ async function main() {
       if (!bridge && !upstreamChild) return;
       reapCheckRunning = true;
       try {
-        if (await externalCdpClientsSeen()) return;
+        if (await reapHeld(idleMs)) return;
       } catch (e) {
-        process.stderr.write(`[mcp-relay] idle reaper: external-CDP-client check threw: ${e.message}\n`);
+        process.stderr.write(`[mcp-relay] idle reaper: hold check threw: ${e.message}\n`);
       } finally {
         reapCheckRunning = false;
       }
@@ -721,6 +760,8 @@ async function main() {
       if (inFlightRequests > 0) return;
       if (Date.now() - lastActivityAt < idleMs) return;
       if (!bridge && !upstreamChild) return;
+      reapLog.write("reaped", { idleS: idleSeconds() });
+      endReapHold();
       process.stderr.write(
         `[mcp-relay] idle ${idleMinutes}min — reaping Brave + upstream to reclaim RAM (both relaunch on next tool call; logins persist)\n`,
       );

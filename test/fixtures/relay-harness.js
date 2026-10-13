@@ -106,6 +106,7 @@ stubModule(path.join(SRC, "pool-shared.js"), {
   gcSessionClones: () => 0,
   findBraveMainPid: () => null,
   sessionClonesRoot: () => path.join(dir, "clones"),
+  userCacheRoot: () => path.join(dir, "cache"),
   cloneBelongsTo: () => false,
   // $HARNESS_DIR/attachable = {"pid":1,"port":N,"wsEndpoint":"ws://…"} makes
   // ensureBrave take the attach path.
