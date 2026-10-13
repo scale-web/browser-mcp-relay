@@ -270,3 +270,31 @@ test("e2e: a tab the user navigated is not taken over by tabs_new; execute is re
     await r.stop();
   }
 });
+
+test("e2e (review r1 H1): after the user signs in inside upstream's tab, tabs_new on the same host opens a new tab instead of reusing it", ISO, async () => {
+  await startServer();
+  const home = homeTmp("home-");
+  const proj = path.join(home, "proj-desync-h1");
+  const base = profileOf(home, proj);
+  const r = await startRelay({ env: { HOME: home, CLAUDE_PROJECT_DIR: proj, ...RELAY_ENV() }, realUpstream: true });
+  let browser = null;
+  try {
+    const nav = await r.call("navigation_go-to", { url: U("site.test", "/login"), includeSnapshot: false }, 90000);
+    assert.ok(!nav.isError, nav.text);
+    const { chromium } = require("playwright-core");
+    browser = await chromium.connectOverCDP(`http://127.0.0.1:${sidecar(base).cdpPort}`);
+    const pinned = browser.contexts().flatMap((c) => c.pages()).find((p) => p.url() === U("site.test", "/login"));
+    assert.ok(pinned);
+    await pinned.goto(U("site.test", "/dashboard")); // the user signs in
+
+    const opened = await r.call("tabs_new", { url: U("site.test", "/reports") }, 60000);
+    assert.ok(!opened.isError, opened.text);
+    const payload = JSON.parse(opened.rest[opened.rest.length - 1].text);
+    assert.strictEqual(payload.reused, false, opened.text);
+    assert.strictEqual(pinned.url(), U("site.test", "/dashboard"), "the user's tab was not navigated");
+    assert.match(opened.text, /UPSTREAM DESYNC/);
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    await r.stop();
+  }
+});

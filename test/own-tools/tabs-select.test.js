@@ -171,3 +171,23 @@ test("tabs_select: selecting the tab upstream already shows syncs without reload
   }
 });
 
+
+test("tabs_select allowPinnedPage: reclaims upstream's tab and navigates it to the selected one", async () => {
+  const prevBridge = globalThis.__relayBridge;
+  const up = fakeUpstream({ url: "https://mine.example/spa-route" });
+  const restore = up.install();
+  globalThis.__relayBridge = makeFakeBridge(["https://example.com/"]);
+  try {
+    const refused = await tool.handler({ index: 0 });
+    assert.match(refused.content[0].text, /UPSTREAM DESYNC/);
+    assert.strictEqual(up.navs().length, 0);
+    const result = await tool.handler({ index: 0, allowPinnedPage: true });
+    assert.strictEqual(result.content.length, 1);
+    assert.strictEqual(JSON.parse(result.content[0].text).upstreamPropagated, true);
+    assert.strictEqual(up.url, "https://example.com/");
+    assert.strictEqual(sync.isDesynced(), false);
+  } finally {
+    globalThis.__relayBridge = prevBridge;
+    restore();
+  }
+});

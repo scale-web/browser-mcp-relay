@@ -80,7 +80,7 @@ test("C: upstream's tab on a page the relay did not put there is NOT navigated",
     assert.strictEqual(up.navs().length, 0, "the user's tab must not be navigated");
     assert.strictEqual(up.url, "https://user-signed-in.example/dashboard");
     assert.strictEqual(sync.isDesynced(), true);
-    assert.match(sync.warning(), /ask the user to close it/);
+    assert.match(sync.warning(), /reclaim the tab.*ask them first/);
   } finally { restore(); }
 });
 
@@ -156,5 +156,50 @@ test("propagateActivePageToUpstream: isError with no text still reported as fail
     const r = await propagateActivePageToUpstream("https://example.com/");
     assert.strictEqual(r.propagated, false);
     assert.match(r.reason, /returned isError/);
+  } finally { restore(); }
+});
+
+test("C: force (allowPinnedPage on tabs_*) reclaims the tab and navigates it", async () => {
+  const up = fakeUpstream({ url: "https://mine.example/spa-route" });
+  const restore = up.install();
+  try {
+    const r = await propagateActivePageToUpstream("https://example.com/", { force: true });
+    assert.strictEqual(r.propagated, true);
+    assert.strictEqual(up.url, "https://example.com/");
+    assert.strictEqual(sync.state().relayUrl, "https://example.com/");
+  } finally { restore(); }
+});
+
+test("M4: a navigation that errors after landing is a sync the relay owns", async () => {
+  const up = fakeUpstream();
+  const restore = up.install();
+  const orig = up.client.request;
+  up.client.request = async (m, p) => {
+    if (p.name === "navigation_go-to") { await orig(m, p); return { content: [{ type: "text", text: "Timeout waiting for load" }], isError: true }; }
+    return orig(m, p);
+  };
+  try {
+    const r = await propagateActivePageToUpstream("https://a.example/");
+    assert.strictEqual(r.propagated, true);
+    assert.match(r.reason, /landed despite: Timeout/);
+    assert.strictEqual(sync.isDesynced(), false);
+    assert.strictEqual(sync.state().relayUrl, "https://a.example/");
+  } finally { restore(); }
+});
+
+test("L5: when the landed URL can't be read, the relay owns the URL it asked for", async () => {
+  const up = fakeUpstream();
+  const restore = up.install();
+  const orig = up.client.request;
+  let navigated = false;
+  up.client.request = async (m, p) => {
+    if (navigated && p.name === "execute") throw new Error("read failed");
+    if (p.name === "navigation_go-to") navigated = true;
+    return orig(m, p);
+  };
+  try {
+    const r = await propagateActivePageToUpstream("https://a.example/");
+    assert.strictEqual(r.propagated, true);
+    assert.strictEqual(sync.state().relayUrl, "https://a.example/");
   } finally { restore(); }
 });

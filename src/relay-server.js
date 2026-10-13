@@ -219,8 +219,9 @@ class RelayServer {
           response = sync.refusal(name);
         } else {
           const before = guarded ? await sync.readUpstreamUrl() : null;
+          const t0 = Date.now();
           response = await upstream.request("tools/call", { name, arguments: fwdArgs });
-          if (guarded) await sync.afterGuardedCall(before);
+          if (guarded) await sync.afterGuardedCall({ before, name, optIn, ms: Date.now() - t0 });
           // Rule A: every upstream result says so while upstream's tab is not
           // the selected one.
           const warn = sync.warning();

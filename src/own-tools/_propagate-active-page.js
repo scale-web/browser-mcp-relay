@@ -61,10 +61,14 @@ const sync = require("./_upstream-sync.js");
  * - upstream's page shows a page the relay did not put there (left as is)
  * - upstream's navigation_go-to fails
  *
+ * `force` (the caller's allowPinnedPage on tabs_*): the caller says upstream's
+ * tab is its own, so rule C does not apply.
+ *
  * @param {string} url - target URL
+ * @param {{force?: boolean}} [opts]
  * @returns {Promise<{propagated: boolean, reason?: string, upstreamUrl?: string}>}
  */
-async function propagateActivePageToUpstream(url) {
+async function propagateActivePageToUpstream(url, { force = false } = {}) {
   // A blank tab is no navigation target, and asking upstream anything would
   // start its session (it opens a page of its own on its first call). Upstream
   // tools still act on another tab, though: the 2026-10-13 incident began with
@@ -85,12 +89,13 @@ async function propagateActivePageToUpstream(url) {
     return { propagated: false, reason };
   }
   const current = read.url;
+  if (force) sync.claim(current);
   if (current === url) {
     sync.markSynced(sync.mayNavigate(current) ? url : null);
     return { propagated: true, reason: "already showing", upstreamUrl: current };
   }
   if (!sync.mayNavigate(current)) {
-    const reason = "protected: upstream's tab shows a page the relay did not put there (likely the user's), so it was not navigated";
+    const reason = "protected: upstream's tab shows a page the relay did not put there (the user's, or one that changed its own URL), so it was not navigated";
     process.stderr.write(`[mcp-relay] tabs: upstream tab shows ${current}, not the relay's; left as is\n`);
     sync.markDesynced(url, current, reason, true);
     return { propagated: false, reason, upstreamUrl: current };
@@ -118,6 +123,13 @@ async function propagateActivePageToUpstream(url) {
     process.stderr.write(
       `[mcp-relay] tabs: upstream propagate to ${url} failed (continuing): ${e.message}\n`,
     );
+    // A navigation can fail after it committed (a load-state timeout, say):
+    // if upstream's tab now shows the URL, the relay put it there.
+    const landedAnyway = await sync.readUpstreamUrl();
+    if (landedAnyway.url === url) {
+      sync.markSynced(url);
+      return { propagated: true, reason: `landed despite: ${e.message}`, upstreamUrl: url };
+    }
     const reason = `upstream error: ${e.message}`;
     sync.markDesynced(url, null, reason);
     return { propagated: false, reason };

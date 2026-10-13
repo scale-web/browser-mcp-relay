@@ -68,7 +68,7 @@ function findReusablePage(pages, url, activePage) {
  * active page). cap <= 0 disables. Best-effort per page — a close failure
  * skips that page. Exported for tests; returns count closed.
  */
-async function pruneOldestTabs(pages, cap, keep) {
+async function pruneOldestTabs(pages, cap, keep, spare = () => false) {
   if (!Number.isFinite(cap) || cap <= 0) return 0;
   const open = pages.filter((p) => !p.isClosed());
   let excess = open.length - cap;
@@ -76,7 +76,7 @@ async function pruneOldestTabs(pages, cap, keep) {
   let closed = 0;
   for (const p of open) {
     if (excess <= 0) break;
-    if (keep.includes(p)) continue;
+    if (keep.includes(p) || spare(p)) continue;
     try {
       await p.close();
       closed++;
@@ -118,6 +118,10 @@ module.exports = {
         default: "load",
         description: "Playwright navigation lifecycle to wait for. Default 'load'. Use 'networkidle' for SPA-heavy sites.",
       },
+      allowPinnedPage: {
+        type: "boolean",
+        description: "Only when the relay reported UPSTREAM DESYNC and the page in upstream's tab is one YOU put there: lets the relay reuse and navigate that tab. Never when the user may be using it.",
+      },
       timeoutMs: {
         type: "integer",
         minimum: 100,
@@ -137,11 +141,30 @@ module.exports = {
     const bridge = globalThis.__relayBridge;
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
 
+    // Rule C (_upstream-sync.js) for the relay's OWN navigation too: never
+    // reuse (navigate) or prune the tab upstream is pinned to while it shows a
+    // page the relay did not put there. Tabs are matched across the two
+    // Playwright connections by URL. Read lazily: it starts upstream's session.
+    const force = _args.allowPinnedPage === true;
+    let read = null;
+    const sparedUrl = async () => {
+      if (force) return null;
+      if (read === null) read = await sync.readUpstreamUrl();
+      if (typeof read.url !== "string") return undefined; // unknown: spare everything
+      return sync.mayNavigate(read.url) ? null : read.url;
+    };
+    const spareFilter = (spared) => (p) => spared === undefined || (spared !== null && p.url() === spared);
+
     let page = null;
     let reused = false;
     let adoptedBlank = false;
     if (url && !_args.forceNew) {
-      page = findReusablePage(bridge.context.pages(), url, getActivePageRaw());
+      let candidates = bridge.context.pages();
+      if (findReusablePage(candidates, url, getActivePageRaw())) {
+        const spare = spareFilter(await sparedUrl());
+        candidates = candidates.filter((p) => !spare(p));
+      }
+      page = findReusablePage(candidates, url, getActivePageRaw());
       reused = !!page;
       if (!page) {
         // No same-host tab — adopt a residual about:blank (Brave always
@@ -180,7 +203,10 @@ module.exports = {
     let prunedTabs = 0;
     if (!reused && !adoptedBlank) {
       try {
-        prunedTabs = await pruneOldestTabs(bridge.context.pages(), maxTabsFromEnv(), [page]);
+        const cap = maxTabsFromEnv();
+        const open = bridge.context.pages().filter((p) => !p.isClosed()).length;
+        const spare = cap > 0 && open > cap ? spareFilter(await sparedUrl()) : () => false;
+        prunedTabs = await pruneOldestTabs(bridge.context.pages(), cap, [page], spare);
       } catch { /* best-effort */ }
     }
 
@@ -190,7 +216,7 @@ module.exports = {
       propagation = { propagated: false, reason: "skipped: this tab's navigation failed" };
       sync.markDesynced(page.url(), null, propagation.reason);
     } else {
-      propagation = await propagateActivePageToUpstream(url);
+      propagation = await propagateActivePageToUpstream(url, { force });
     }
 
     const pages = bridge.context.pages();

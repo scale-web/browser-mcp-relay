@@ -18,10 +18,16 @@ module.exports = {
   description: "Bring a specific tab to the front (active page) by its index.",
   inputSchema: {
     type: "object",
-    properties: { index: { type: "integer", minimum: 0 } },
+    properties: {
+      index: { type: "integer", minimum: 0 },
+      allowPinnedPage: {
+        type: "boolean",
+        description: "Only when the relay reported UPSTREAM DESYNC and the page in upstream's tab is one YOU put there: lets the relay navigate that tab to this one. Never when the user may be using it.",
+      },
+    },
     required: ["index"],
   },
-  handler: async ({ index }) => {
+  handler: async ({ index, allowPinnedPage }) => {
     const bridge = globalThis.__relayBridge;
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
     const pages = bridge.context.pages();
@@ -50,7 +56,7 @@ module.exports = {
     }
     // Propagate to upstream so content_take-screenshot etc. target this
     // tab's URL. Best-effort; about:blank is skipped to avoid churn.
-    const propagation = await propagateActivePageToUpstream(url);
+    const propagation = await propagateActivePageToUpstream(url, { force: allowPinnedPage === true });
     const content = [{ type: "text", text: JSON.stringify({
       selected: index,
       url,
