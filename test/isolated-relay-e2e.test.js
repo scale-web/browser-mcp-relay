@@ -150,34 +150,63 @@ test("shutdown order (owned Brave): a peer cannot claim the base until our Brave
   }
 });
 
-test("attach-first across relays: a relay killed uncleanly leaves its Brave; the next relay attaches to it (proven endpoint), tabs kept", ISO, async (t) => {
+// The orphan is kept alive DELIBERATELY. A Brave the relay LAUNCHED is driven
+// over --remote-debugging-pipe and exits when that relay is SIGKILLed (the pipe
+// closes), so with a launched Brave this test used to find no orphan and skip
+// (30 of 33 runs), and under load it raced: still exiting after a fixed 1 s,
+// so the second relay found nothing to attach to (Phase 1 review LOW #6).
+// Here the TEST launches the Brave on the project's base profile and holds its
+// pipe; relay A attaches to it, opens a tab and is SIGKILLed. That is the
+// orphan attach-first exists for: a Brave a dead relay leaves running. A
+// bounded poll then proves it alive AND attachable before relay B starts.
+test("attach-first across relays: a relay killed uncleanly leaves its Brave; the next relay attaches to it (proven endpoint), tabs kept", ISO, async () => {
+  const { chromium } = require("playwright-core");
+  const pool = require("../src/pool-shared.js");
   const home = homeTmp("home-");
   const proj = path.join(home, "proj-attach");
   const base = profileOf(home, proj);
-  const a = await startRelay({ env: { HOME: home, CLAUDE_PROJECT_DIR: proj, ...RELAY_ENV() } });
-  const opened = await a.call("tabs_new", { url: "data:text/html,KEEP-THIS-TAB" }, 90000);
-  assert.ok(!opened.isError, opened.text);
-  const bravePid = sidecar(base).bravePid;
-  a.child.kill("SIGKILL");
-  await a.exited;
-  await new Promise((res) => setTimeout(res, 1000));
-  if (!alive(bravePid)) {
-    // Measured 2026-10-12 (headless test Brave): it exits when its relay is
-    // SIGKILLed (the --remote-debugging-pipe closes), so there is nothing to
-    // attach to. Attach-first itself is covered against live Braves in
-    // isolated-brave.test.js.
-    t.skip("the test Brave exited with its relay (pipe closed) — no orphan to attach to");
-    return;
-  }
-  const b = await startRelay({ env: { HOME: home, CLAUDE_PROJECT_DIR: proj, ...RELAY_ENV() } });
+  fs.mkdirSync(base, { recursive: true });
+  const orphan = await chromium.launchPersistentContext(base, {
+    headless: true, executablePath: BRAVE, handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false,
+    args: ["--remote-debugging-port=0", ...require("../src/cdp-bridge.js").TEST_LAUNCH_ARGS],
+  });
+  let a, b;
   try {
+    await id.waitForDevToolsActivePort(base);
+    const bravePid = pool.findBraveMainPid(base);
+    assert.ok(bravePid && alive(bravePid), "precondition: the test Brave runs on the base profile");
+
+    a = await startRelay({ env: { HOME: home, CLAUDE_PROJECT_DIR: proj, ...RELAY_ENV() } });
+    const opened = await a.call("tabs_new", { url: "data:text/html,KEEP-THIS-TAB" }, 90000);
+    assert.ok(!opened.isError, opened.text);
+    assert.match(a.stderr(), new RegExp(`live Brave pid=${bravePid} already owns`), "relay A attached to the test Brave");
+    a.child.kill("SIGKILL");
+    await a.exited;
+
+    // Bounded poll (≤ 5 s): the orphan must be alive and PROVABLY attachable
+    // (DevToolsActivePort uuid == /json/version) when relay B starts.
+    let found = null;
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000) {
+      found = alive(bravePid) ? await pool.findAttachableBrave(base) : null;
+      if (found && found.pid === bravePid) break;
+      await new Promise((res) => setTimeout(res, 100));
+    }
+    assert.ok(found && found.pid === bravePid && alive(bravePid),
+      `the orphan Brave pid=${bravePid} must be alive and attachable within 5 s of relay A's death (found ${JSON.stringify(found)})`);
+
+    b = await startRelay({ env: { HOME: home, CLAUDE_PROJECT_DIR: proj, ...RELAY_ENV() } });
     const list = await b.call("tabs_list", {}, 90000);
     assert.ok(!list.isError, list.text);
     assert.match(b.stderr(), new RegExp(`live Brave pid=${bravePid} already owns`));
+    assert.doesNotMatch(b.stderr(), /launching Brave/, "relay B attached; it did not launch");
     assert.match(list.text, /KEEP-THIS-TAB/, "the orphan's tabs are still there");
     assert.strictEqual(sidecar(base).bravePid, bravePid);
   } finally {
-    await b.stop();
-    try { process.kill(bravePid, "SIGKILL"); } catch { /* closed */ }
+    // stop() is a no-op on an exited relay; it matters when an assertion
+    // fires while relay A (or B) is still running.
+    if (b) await b.stop();
+    if (a) await a.stop();
+    await orphan.close().catch(() => {});
   }
 });
