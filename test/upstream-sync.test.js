@@ -222,3 +222,14 @@ test("r3 LOW: go-back / go-forward land on a history entry the caller didn't cho
     assert.strictEqual(sync.state().relayUrl, "https://site.example/r?reloaded");
   } finally { restore(); }
 });
+
+test("r4: an opted-in reload of the user's page does not hand it to the relay", async () => {
+  const { up, restore } = setup("https://user.example/signed-in");
+  try {
+    const before = await sync.readUpstreamUrl();
+    await sync.afterGuardedCall({ before, name: "navigation_reload", optIn: true });
+    assert.strictEqual(sync.state().relayUrl, null);
+    assert.strictEqual((await propagateActivePageToUpstream("https://other.example/x")).propagated, false);
+    assert.strictEqual(up.url, "https://user.example/signed-in");
+  } finally { restore(); }
+});

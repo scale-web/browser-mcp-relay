@@ -124,17 +124,18 @@ function refusal(name) {
 }
 
 /**
- * After a guarded upstream call `name`: when it was a navigation_go-to or
- * navigation_reload (the caller chose where it went) and the pinned page was the relay's before it
- * (`before`, from readUpstreamUrl()) or the caller opted in, its new URL is
- * the relay's. Nothing else claims (see the header); a caller whose own
- * execute or click moved the tab reclaims it with allowPinnedPage on
- * tabs_select / tabs_new.
+ * After a guarded upstream call `name`: its new URL is the relay's when it was
+ * a navigation_go-to (the caller chose where it went) and the pinned page was
+ * the relay's before it (`before`, from readUpstreamUrl()) or the caller opted
+ * in; or a navigation_reload of a page that was already the relay's. Nothing
+ * else claims (see the header); a caller whose own execute or click moved the
+ * tab reclaims it with allowPinnedPage on tabs_select / tabs_new.
  */
 async function afterGuardedCall({ before, name, optIn = false } = {}) {
   const wasOwned = before && typeof before.url === "string" && mayNavigate(before.url);
-  const navigation = name === "navigation_go-to" || name === "navigation_reload";
-  if (!(navigation && (wasOwned || optIn))) return;
+  // A reload keeps the URL already there, so opting in to one reload is not choosing the page [review r4].
+  const claims = (name === "navigation_go-to" && (wasOwned || optIn)) || (name === "navigation_reload" && wasOwned);
+  if (!claims) return;
   const after = await readUpstreamUrl();
   if (typeof after.url === "string") relayUrl = after.url;
 }
