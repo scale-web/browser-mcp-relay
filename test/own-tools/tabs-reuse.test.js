@@ -305,3 +305,64 @@ test("r3: a failed navigation of upstream's own reused tab is not reported as a 
   assert.strictEqual(sync.isDesynced(), false, "it is the same tab upstream acts on");
   assert.doesNotMatch(res.content[0].text, /UPSTREAM DESYNC/);
 });
+
+// ───── MED-3 measurement: log only (register A55) ─────
+
+function collectEvents(t) {
+  const events = [];
+  const prev = globalThis.__relayEventLog;
+  globalThis.__relayEventLog = (event, fields) => { events.push({ event, ...fields }); return true; };
+  t.after(() => { globalThis.__relayEventLog = prev; });
+  return events;
+}
+
+test("MED-3 log: reuse of the relay's own tab, of one the user changed, and of a foreign tab", async (t) => {
+  const { clearActivePage } = require("../../src/own-tools/_active-page.js");
+  clearActivePage();
+  const events = collectEvents(t);
+  const foreign = navPage("https://b.example/theirs");
+  const pages = [foreign];
+  globalThis.__relayBridge = { context: { pages: () => pages, newPage: async () => { const p = navPage("about:blank"); pages.push(p); return p; } } };
+  const restore = fakeUpstream().install();
+  t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
+
+  await tabsNew.handler({ url: "https://a.example/1" });             // created
+  await tabsNew.handler({ url: "https://a.example/2" });             // reuses it, unchanged
+  pages[1]._url = "https://a.example/user-went-here";                // someone else moves it
+  await tabsNew.handler({ url: "https://a.example/3" });             // reuses it, changed
+  await tabsNew.handler({ url: "https://b.example/mine" });          // reuses the foreign tab
+  const reuse = events.filter((e) => e.event === "tab-reuse");
+  assert.deepStrictEqual(reuse.map((e) => [e.host, e.createdHere, e.changedSinceRelay, e.sameUrlAsUpstream]), [
+    ["a.example", true, false, true], // synced: upstream's tab shows the same URL
+    ["a.example", true, true, false],
+    ["b.example", false, null, false],
+  ]);
+  assert.ok(reuse.every((e) => !JSON.stringify(e).includes("/1") && !JSON.stringify(e).includes("theirs")), "host only, never a path");
+  const open = events.filter((e) => e.event === "tabs-open").pop();
+  assert.deepStrictEqual([open.open, open.createdHere, open.other], [2, 1, 1]);
+});
+
+test("MED-3 log: each pruned tab is logged; a throwing logger never breaks tabs_new", async (t) => {
+  const { clearActivePage } = require("../../src/own-tools/_active-page.js");
+  clearActivePage();
+  const events = collectEvents(t);
+  const old = [navPage("https://x.example/"), navPage("https://y.example/")];
+  const pages = [...old];
+  globalThis.__relayBridge = { context: { pages: () => pages, newPage: async () => { const p = navPage("about:blank"); pages.push(p); return p; } } };
+  const prevMax = process.env.BROWSER_RELAY_MAX_TABS;
+  process.env.BROWSER_RELAY_MAX_TABS = "1";
+  const restore = fakeUpstream().install();
+  t.after(() => {
+    globalThis.__relayBridge = undefined; clearActivePage(); restore();
+    if (prevMax === undefined) delete process.env.BROWSER_RELAY_MAX_TABS; else process.env.BROWSER_RELAY_MAX_TABS = prevMax;
+  });
+  await tabsNew.handler({ url: "https://z.example/", forceNew: true });
+  const pruned = events.filter((e) => e.event === "tab-prune");
+  assert.deepStrictEqual(pruned.map((e) => [e.host, e.createdHere]), [["x.example", false], ["y.example", false]]);
+
+  globalThis.__relayEventLog = () => { throw new Error("log broke"); };
+  const res = await tabsNew.handler({ url: "https://w.example/", forceNew: true });
+  assert.notStrictEqual(res.isError, true);
+  const reused = await tabsNew.handler({ url: "https://w.example/again" }); // the reuse path logs too
+  assert.strictEqual(JSON.parse(reused.content[reused.content.length - 1].text).reused, true);
+});

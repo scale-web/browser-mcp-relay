@@ -683,6 +683,8 @@ async function main() {
   let reapLogFile = null;
   try { reapLogFile = path.join(pool.userCacheRoot(), REAP_LOG_NAME); } catch { /* no log */ }
   const reapLog = new ReapLog({ file: reapLogFile, slug: project });
+  // Own tools log measurement events to the same file (tabs_new, A55 MED-3).
+  globalThis.__relayEventLog = (event, fields) => reapLog.write(event, fields);
   const idleSeconds = () => Math.round((Date.now() - lastActivityAt) / 1000);
   // Hold end, for any reason, is logged ("released", with heldS) and clears
   // the sidecar's reapHeldBy. Hold start/end are rare, so both are written to

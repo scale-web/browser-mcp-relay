@@ -39,6 +39,33 @@ const sync = require("./_upstream-sync.js");
 // the user's tab can't be told apart, but the 2026-07-16 tab leak must not
 // come back while upstream is unreadable.
 const created = new WeakSet();
+// The URL the relay last left each of its tabs on (after newPage / its own
+// goto). Measurement only (register A55 MED-3): a reused or pruned tab whose
+// URL has moved since was changed by someone else — the user, or the page.
+const relayLeft = new WeakMap();
+
+/**
+ * MED-3 measurement (log only, no behaviour change; reviewed with A51's log
+ * around 2026-10-19): one line per tab the relay reuses or prunes, saying
+ * whether this relay created it and whether its page changed since the relay
+ * last left it. Host only — never a path or query. Never throws.
+ */
+function logTab(event, p, upstreamUrl, extra = {}) {
+  try {
+    const log = globalThis.__relayEventLog;
+    if (typeof log !== "function") return;
+    const u = p.url();
+    log(event, {
+      host: urlHost(u) || (u === "about:blank" ? "about:blank" : "(non-http)"),
+      createdHere: created.has(p),
+      changedSinceRelay: relayLeft.has(p) ? relayLeft.get(p) !== u : null,
+      // Same URL as upstream's tab: with createdHere false, most likely upstream's
+      // own tab. A relay tab synced to it shows the same URL too.
+      sameUrlAsUpstream: typeof upstreamUrl === "string" ? upstreamUrl === u : null,
+      ...extra,
+    });
+  } catch { /* measurement must never break a tool */ }
+}
 
 /** Host of an http(s) URL, else null (about:blank, chrome://, bad URLs). */
 function urlHost(url) {
@@ -74,7 +101,7 @@ function findReusablePage(pages, url, activePage) {
  * active page). cap <= 0 disables. Best-effort per page — a close failure
  * skips that page. Exported for tests; returns count closed.
  */
-async function pruneOldestTabs(pages, cap, keep, spare = () => false) {
+async function pruneOldestTabs(pages, cap, keep, spare = () => false, onClose = () => {}) {
   if (!Number.isFinite(cap) || cap <= 0) return 0;
   const open = pages.filter((p) => !p.isClosed());
   let excess = open.length - cap;
@@ -84,6 +111,7 @@ async function pruneOldestTabs(pages, cap, keep, spare = () => false) {
     if (excess <= 0) break;
     if (keep.includes(p) || spare(p)) continue;
     try {
+      onClose(p);
       await p.close();
       closed++;
       excess--;
@@ -174,6 +202,7 @@ module.exports = {
       }
       page = findReusablePage(candidates, url, getActivePageRaw());
       reused = !!page;
+      if (reused) logTab("tab-reuse", page, read && read.url);
       if (!page) {
         // No same-host tab — adopt a residual about:blank (Brave always
         // opens one at launch) instead of leaving it around forever next
@@ -185,6 +214,7 @@ module.exports = {
     if (!page) {
       page = await bridge.context.newPage();
       created.add(page);
+      relayLeft.set(page, "about:blank");
     }
     // Reusing the relay's own pinned tab (same host): the relay's goto moves
     // upstream's page too, so it stays the relay's (review r2).
@@ -207,6 +237,7 @@ module.exports = {
       } catch (e) {
         navError = e.message || String(e);
       }
+      try { relayLeft.set(page, page.url()); } catch { /* closed mid-call */ }
       if (wasUpstreams) {
         const now = await sync.readUpstreamUrl();
         if (now.url === page.url()) {
@@ -230,7 +261,8 @@ module.exports = {
         const cap = maxTabsFromEnv();
         const open = bridge.context.pages().filter((p) => !p.isClosed()).length;
         const spare = cap > 0 && open > cap ? spareFilter(await sparedUrl()) : () => false;
-        prunedTabs = await pruneOldestTabs(bridge.context.pages(), cap, [page], spare);
+        prunedTabs = await pruneOldestTabs(bridge.context.pages(), cap, [page], spare,
+          (p) => logTab("tab-prune", p, read && read.url));
       } catch { /* best-effort */ }
     }
 
@@ -246,6 +278,14 @@ module.exports = {
     }
 
     const pages = bridge.context.pages();
+    try {
+      const open = pages.filter((p) => !p.isClosed());
+      const mine = open.filter((p) => created.has(p)).length;
+      const blank = open.filter((p) => !created.has(p) && p.url() === "about:blank").length;
+      if (typeof globalThis.__relayEventLog === "function") {
+        globalThis.__relayEventLog("tabs-open", { open: open.length, createdHere: mine, otherBlank: blank, other: open.length - mine - blank });
+      }
+    } catch { /* measurement only */ }
     const result = {
       content: [{
         type: "text",

@@ -293,6 +293,11 @@ test("e2e (review r1 H1): after the user signs in inside upstream's tab, tabs_ne
     assert.strictEqual(payload.reused, false, opened.text);
     assert.strictEqual(pinned.url(), U("site.test", "/dashboard"), "the user's tab was not navigated");
     assert.match(opened.text, /UPSTREAM DESYNC/);
+    // MED-3 measurement reaches the relay's real event log (host only).
+    const logText = fs.readFileSync(path.join(home, "Library", "Caches", "browser-mcp-relay", "reap-events.log"), "utf8");
+    const opens = logText.trim().split("\n").map((l) => JSON.parse(l)).filter((e) => e.event === "tabs-open");
+    assert.ok(opens.length >= 1 && opens[0].other >= 1, logText.slice(-500));
+    assert.ok(!logText.includes("/dashboard") && !logText.includes("/reports"), "no paths in the log");
   } finally {
     if (browser) await browser.close().catch(() => {});
     await r.stop();
