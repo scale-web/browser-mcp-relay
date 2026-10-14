@@ -359,10 +359,32 @@ test("MED-3 log: each pruned tab is logged; a throwing logger never breaks tabs_
   await tabsNew.handler({ url: "https://z.example/", forceNew: true });
   const pruned = events.filter((e) => e.event === "tab-prune");
   assert.deepStrictEqual(pruned.map((e) => [e.host, e.createdHere]), [["x.example", false], ["y.example", false]]);
+  const opens = events.filter((e) => e.event === "tabs-open").length;
+  await tabsNew.handler({ url: "https://z.example/again" }); // reuse: same counts
+  assert.strictEqual(events.filter((e) => e.event === "tabs-open").length, opens, "unchanged counts are not logged again");
 
   globalThis.__relayEventLog = () => { throw new Error("log broke"); };
   const res = await tabsNew.handler({ url: "https://w.example/", forceNew: true });
   assert.notStrictEqual(res.isError, true);
   const reused = await tabsNew.handler({ url: "https://w.example/again" }); // the reuse path logs too
   assert.strictEqual(JSON.parse(reused.content[reused.content.length - 1].text).reused, true);
+});
+
+test("MED-3 log: a prune whose close fails is not logged", async (t) => {
+  const { clearActivePage } = require("../../src/own-tools/_active-page.js");
+  clearActivePage();
+  const events = collectEvents(t);
+  const stuck = navPage("https://stuck.example/");
+  stuck.close = async () => { throw new Error("mid-close race"); };
+  const pages = [stuck];
+  globalThis.__relayBridge = { context: { pages: () => pages, newPage: async () => { const p = navPage("about:blank"); pages.push(p); return p; } } };
+  const prevMax = process.env.BROWSER_RELAY_MAX_TABS;
+  process.env.BROWSER_RELAY_MAX_TABS = "1";
+  const restore = fakeUpstream().install();
+  t.after(() => {
+    globalThis.__relayBridge = undefined; clearActivePage(); restore();
+    if (prevMax === undefined) delete process.env.BROWSER_RELAY_MAX_TABS; else process.env.BROWSER_RELAY_MAX_TABS = prevMax;
+  });
+  await tabsNew.handler({ url: "https://new.example/", forceNew: true });
+  assert.strictEqual(events.filter((e) => e.event === "tab-prune").length, 0);
 });

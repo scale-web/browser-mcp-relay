@@ -43,6 +43,7 @@ const created = new WeakSet();
 // goto). Measurement only (register A55 MED-3): a reused or pruned tab whose
 // URL has moved since was changed by someone else — the user, or the page.
 const relayLeft = new WeakMap();
+let lastTabsOpen = null;
 
 /**
  * MED-3 measurement (log only, no behaviour change; reviewed with A51's log
@@ -50,11 +51,11 @@ const relayLeft = new WeakMap();
  * whether this relay created it and whether its page changed since the relay
  * last left it. Host only — never a path or query. Never throws.
  */
-function logTab(event, p, upstreamUrl, extra = {}) {
+function logTab(event, p, upstreamUrl, extra = {}, url = null) {
   try {
     const log = globalThis.__relayEventLog;
     if (typeof log !== "function") return;
-    const u = p.url();
+    const u = url === null ? p.url() : url;
     log(event, {
       host: urlHost(u) || (u === "about:blank" ? "about:blank" : "(non-http)"),
       createdHere: created.has(p),
@@ -101,7 +102,7 @@ function findReusablePage(pages, url, activePage) {
  * active page). cap <= 0 disables. Best-effort per page — a close failure
  * skips that page. Exported for tests; returns count closed.
  */
-async function pruneOldestTabs(pages, cap, keep, spare = () => false, onClose = () => {}) {
+async function pruneOldestTabs(pages, cap, keep, spare = () => false, onClosed = () => {}) {
   if (!Number.isFinite(cap) || cap <= 0) return 0;
   const open = pages.filter((p) => !p.isClosed());
   let excess = open.length - cap;
@@ -111,8 +112,9 @@ async function pruneOldestTabs(pages, cap, keep, spare = () => false, onClose = 
     if (excess <= 0) break;
     if (keep.includes(p) || spare(p)) continue;
     try {
-      onClose(p);
+      const host = p.url(); // read before close: a closed page may not report it
       await p.close();
+      onClosed(p, host);
       closed++;
       excess--;
     } catch { /* mid-close race — skip */ }
@@ -262,7 +264,7 @@ module.exports = {
         const open = bridge.context.pages().filter((p) => !p.isClosed()).length;
         const spare = cap > 0 && open > cap ? spareFilter(await sparedUrl()) : () => false;
         prunedTabs = await pruneOldestTabs(bridge.context.pages(), cap, [page], spare,
-          (p) => logTab("tab-prune", p, read && read.url));
+          (p, u) => logTab("tab-prune", p, read && read.url, {}, u));
       } catch { /* best-effort */ }
     }
 
@@ -282,8 +284,12 @@ module.exports = {
       const open = pages.filter((p) => !p.isClosed());
       const mine = open.filter((p) => created.has(p)).length;
       const blank = open.filter((p) => !created.has(p) && p.url() === "about:blank").length;
-      if (typeof globalThis.__relayEventLog === "function") {
-        globalThis.__relayEventLog("tabs-open", { open: open.length, createdHere: mine, otherBlank: blank, other: open.length - mine - blank });
+      const counts = { open: open.length, createdHere: mine, otherBlank: blank, other: open.length - mine - blank };
+      const key = JSON.stringify(counts);
+      // Only when the counts change, so a busy lane cannot rotate A51's rare events out of the shared log.
+      if (key !== lastTabsOpen && typeof globalThis.__relayEventLog === "function") {
+        globalThis.__relayEventLog("tabs-open", counts);
+        lastTabsOpen = key;
       }
     } catch { /* measurement only */ }
     const result = {
