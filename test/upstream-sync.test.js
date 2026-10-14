@@ -130,26 +130,20 @@ test("reset: a new upstream child forgets the desync and the relay's page", () =
   assert.deepStrictEqual(sync.state(), { desynced: false, relayUrl: null });
 });
 
-test("H2: a guarded call longer than the ownership window does not hand the page to the relay", async () => {
+test("H2: execute and interaction_* never hand the page to the relay; a navigation_* from the relay's page does", async () => {
   const { up, restore } = setup("about:blank");
   try {
     await propagateActivePageToUpstream("https://site.example/login");
-    const before = await sync.readUpstreamUrl();
-    up.url = "https://site.example/dashboard"; // the user signed in while execute waited
-    await sync.afterGuardedCall({ before, name: "execute", ms: sync.OWN_WINDOW_MS + 1 });
-    assert.strictEqual(sync.state().relayUrl, "https://site.example/login");
-    assert.strictEqual((await propagateActivePageToUpstream("https://other.example/x")).propagated, false);
-    assert.strictEqual(up.url, "https://site.example/dashboard");
-    // A short call on the relay's page does move ownership.
-    up.url = "https://site.example/login";
-    const b2 = await sync.readUpstreamUrl();
-    up.url = "https://site.example/login?step=2";
-    await sync.afterGuardedCall({ before: b2, name: "interaction_click", ms: 50 });
-    assert.strictEqual(sync.state().relayUrl, "https://site.example/login?step=2");
-    // A slow navigation_* the caller chose from the relay's page is still the relay's.
+    for (const name of ["execute", "scenario-run", "interaction_click", "interaction_fill"]) {
+      const before = await sync.readUpstreamUrl();
+      up.url = "https://site.example/dashboard"; // the user signed in while the call waited
+      await sync.afterGuardedCall({ before, name });
+      assert.strictEqual(sync.state().relayUrl, "https://site.example/login", name);
+      up.url = "https://site.example/login";
+    }
     const b3 = await sync.readUpstreamUrl();
     up.url = "https://heavy.example/";
-    await sync.afterGuardedCall({ before: b3, name: "navigation_go-to", ms: sync.OWN_WINDOW_MS * 3 });
+    await sync.afterGuardedCall({ before: b3, name: "navigation_go-to" });
     assert.strictEqual(sync.state().relayUrl, "https://heavy.example/");
   } finally { restore(); }
 });
@@ -159,31 +153,30 @@ test("H2: opted in, a navigation_* the caller chose is the relay's; an execute i
   try {
     const before = await sync.readUpstreamUrl();
     up.url = "https://user.example/elsewhere";
-    await sync.afterGuardedCall({ before, name: "execute", optIn: true, ms: 10 });
+    await sync.afterGuardedCall({ before, name: "execute", optIn: true });
     assert.strictEqual(sync.state().relayUrl, null);
     up.url = "https://chosen.example/";
-    await sync.afterGuardedCall({ before, name: "navigation_go-to", optIn: true, ms: 10 });
+    await sync.afterGuardedCall({ before, name: "navigation_go-to", optIn: true });
     assert.strictEqual(sync.state().relayUrl, "https://chosen.example/");
   } finally { restore(); }
 });
 
-test("H2 through the relay: a slow guarded call on the relay's page keeps the old owner", async () => {
+test("r3 through the relay: a click that waits while the user signs in does not claim the page", async () => {
   const { up, relay, restore } = setup("about:blank");
   const orig = up.client.request;
   up.client.request = async (m, p) => {
-    if (p && p.name === "execute" && p.arguments.code === "slow") {
-      up.url = "https://site.example/dashboard";
-      const realNow = Date.now;
-      Date.now = () => realNow() + sync.OWN_WINDOW_MS + 5; // the call "took" longer than the window
-      setImmediate(() => { Date.now = realNow; });
+    if (p && p.name === "interaction_click") {
+      up.url = "https://site.example/dashboard"; // waitForNavigation resolved on the user's sign-in
       return { content: [{ type: "text", text: "{}" }] };
     }
     return orig(m, p);
   };
   try {
     await propagateActivePageToUpstream("https://site.example/login");
-    await relay.handleToolsCall({ name: "execute", arguments: { code: "slow" } });
+    await relay.handleToolsCall({ name: "interaction_click", arguments: { selector: "#go", waitForNavigation: true } });
     assert.strictEqual(sync.state().relayUrl, "https://site.example/login");
+    assert.strictEqual((await propagateActivePageToUpstream("https://other.example/x")).propagated, false);
+    assert.strictEqual(up.url, "https://site.example/dashboard");
   } finally { restore(); }
 });
 
@@ -211,18 +204,7 @@ test("r2: a navigation_* from a page that is not the relay's, not opted in, does
   try {
     const before = await sync.readUpstreamUrl();
     up.url = "https://elsewhere.example/";
-    await sync.afterGuardedCall({ before, name: "navigation_go-to", optIn: false, ms: 10 });
+    await sync.afterGuardedCall({ before, name: "navigation_go-to", optIn: false });
     assert.strictEqual(sync.state().relayUrl, null);
-  } finally { restore(); }
-});
-
-test("r2: a long interaction_* on the relay's page does not claim what it ends on", async () => {
-  const { up, restore } = setup("about:blank");
-  try {
-    await propagateActivePageToUpstream("https://site.example/a");
-    const before = await sync.readUpstreamUrl();
-    up.url = "https://site.example/dashboard";
-    await sync.afterGuardedCall({ before, name: "interaction_click", ms: sync.OWN_WINDOW_MS + 1 });
-    assert.strictEqual(sync.state().relayUrl, "https://site.example/a");
   } finally { restore(); }
 });

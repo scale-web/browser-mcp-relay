@@ -17,12 +17,12 @@
 //   C  propagation never navigates upstream's pinned page away from a page the
 //      relay did not put there (mayNavigate()). "Put there" = the pinned page
 //      showed about:blank, or the URL the relay last left it on (relayUrl).
-//      relayUrl moves only after the relay's own navigation, after a
-//      navigation_* the caller chose, or after a short interaction_* on a page
-//      the relay owned (afterGuardedCall()). Never after execute /
-//      scenario-run: one can wait for a person to sign in in that tab and
-//      return the moment they finish, so neither its result nor its duration
-//      says who put the page there (review r2). A user who navigates or signs in inside that
+//      relayUrl moves only after the relay's own navigation, or after a
+//      navigation_* the caller chose (afterGuardedCall()). Never after
+//      execute / scenario-run / interaction_*: each can wait (a script, an
+//      element, a navigation) while a person signs in in that tab and return
+//      the moment they finish, so neither its result nor its duration says who
+//      put the page there (reviews r2, r3). A user who navigates or signs in inside that
 //      tab changes its URL, so the relay stops owning it. A caller that knows
 //      the tab is its own reclaims it with allowPinnedPage on tabs_select /
 //      tabs_new.
@@ -33,9 +33,6 @@ const OPT_IN = "allowPinnedPage";
 const GUARDED_NAMES = new Set(["execute", "scenario-run"]);
 const GUARDED_PREFIXES = ["navigation_", "interaction_"];
 const READ_TIMEOUT_MS = 5000;
-// An interaction_* (a click, a fill) longer than this may have spanned a
-// person acting in that tab, so its result is not the relay's.
-const OWN_WINDOW_MS = 10000;
 
 let desync = null; // null = synced or unknown; else { activeUrl, upstreamUrl, reason }
 let relayUrl = null;
@@ -124,22 +121,17 @@ function refusal(name) {
 }
 
 /**
- * After a guarded upstream call `name` that took `ms`: the relay drove the
- * pinned page, so its new URL is the relay's, when
- *   - the call was a navigation_* (the caller chose where it went) and the
- *     page was the relay's before it (`before`, from readUpstreamUrl()) or the
- *     caller opted in; or
- *   - the call was an interaction_*, the page was the relay's before it, and
- *     it took at most OWN_WINDOW_MS.
- * execute / scenario-run never claim (see the header). Otherwise ownership
- * stays put; a caller whose own execute moved the tab reclaims it with
- * allowPinnedPage on tabs_select / tabs_new.
+ * After a guarded upstream call `name`: when it was a navigation_* (the caller
+ * chose where it went) and the pinned page was the relay's before it
+ * (`before`, from readUpstreamUrl()) or the caller opted in, its new URL is
+ * the relay's. Nothing else claims (see the header); a caller whose own
+ * execute or click moved the tab reclaims it with allowPinnedPage on
+ * tabs_select / tabs_new.
  */
-async function afterGuardedCall({ before, name, optIn = false, ms = 0 } = {}) {
+async function afterGuardedCall({ before, name, optIn = false } = {}) {
   const wasOwned = before && typeof before.url === "string" && mayNavigate(before.url);
   const navigation = typeof name === "string" && name.startsWith("navigation_");
-  const interaction = typeof name === "string" && name.startsWith("interaction_");
-  if (!(navigation && (wasOwned || optIn)) && !(interaction && wasOwned && ms <= OWN_WINDOW_MS)) return;
+  if (!(navigation && (wasOwned || optIn))) return;
   const after = await readUpstreamUrl();
   if (typeof after.url === "string") relayUrl = after.url;
 }
@@ -156,6 +148,6 @@ function reset() {
 }
 
 module.exports = {
-  OPT_IN, OWN_WINDOW_MS, isGuarded, stripOptIn, readUpstreamUrl, mayNavigate, markSynced, markDesynced,
+  OPT_IN, isGuarded, stripOptIn, readUpstreamUrl, mayNavigate, markSynced, markDesynced,
   isDesynced, state, warning, refusal, afterGuardedCall, claim, reset,
 };

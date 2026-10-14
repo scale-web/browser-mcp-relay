@@ -272,3 +272,36 @@ test("r2: reusing a separate relay tab that merely shows the pinned URL does not
   assert.strictEqual(up.url, "https://site.example/b");
   assert.strictEqual(sync.isDesynced(), false);
 });
+
+test("r3: adopting upstream's own blank tab keeps it the relay's (the adopt-blank read)", async (t) => {
+  const { clearActivePage } = require("../../src/own-tools/_active-page.js");
+  clearActivePage();
+  const up = fakeUpstream({ url: "about:blank" });
+  const restore = up.install();
+  const blank = navPage("about:blank");
+  blank.goto = async function (u) { this.gotoUrls.push(u); this._url = u; up.url = u; }; // it IS upstream's tab
+  globalThis.__relayBridge = { context: { pages: () => [blank], newPage: async () => { throw new Error("should not create"); } } };
+  t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
+
+  const res = await tabsNew.handler({ url: "https://site.example/a" });
+  assert.strictEqual(JSON.parse(res.content[res.content.length - 1].text).adoptedBlank, true);
+  assert.strictEqual(sync.state().relayUrl, "https://site.example/a");
+  assert.strictEqual((await require("../../src/own-tools/_propagate-active-page.js").propagateActivePageToUpstream("https://other.example/x")).propagated, true);
+});
+
+test("r3: a failed navigation of upstream's own reused tab is not reported as a desync", async (t) => {
+  const { clearActivePage } = require("../../src/own-tools/_active-page.js");
+  clearActivePage();
+  const up = fakeUpstream({ url: "https://site.example/a" });
+  const restore = up.install();
+  sync.markSynced("https://site.example/a");
+  const pinned = navPage("https://site.example/a");
+  pinned.goto = async () => { throw new Error("net::ERR_TIMED_OUT"); };
+  globalThis.__relayBridge = { context: { pages: () => [pinned], newPage: async () => { throw new Error("should not create"); } } };
+  t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
+
+  const res = await tabsNew.handler({ url: "https://site.example/b" });
+  assert.strictEqual(res.isError, true);
+  assert.strictEqual(sync.isDesynced(), false, "it is the same tab upstream acts on");
+  assert.doesNotMatch(res.content[0].text, /UPSTREAM DESYNC/);
+});

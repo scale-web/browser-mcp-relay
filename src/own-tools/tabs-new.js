@@ -191,6 +191,7 @@ module.exports = {
     if (adoptedBlank && url) await sparedUrl(); // reads upstream's URL (unless forced)
     const preUrl = reused || adoptedBlank ? page.url() : null;
     const wasUpstreams = preUrl !== null && read !== null && read.url === preUrl && sync.mayNavigate(preUrl);
+    let sameTab = false; // the page is upstream's own tab (it moved with our goto)
     // T0-7: track the page as active BEFORE goto so a goto failure still
     // leaves us in a usable state — subsequent own-tools target this new
     // tab, not the previous active page or pages[0]'s about:blank.
@@ -208,7 +209,10 @@ module.exports = {
       }
       if (wasUpstreams) {
         const now = await sync.readUpstreamUrl();
-        if (now.url === page.url()) sync.claim(now.url);
+        if (now.url === page.url()) {
+          sync.claim(now.url);
+          sameTab = true;
+        }
       }
     }
 
@@ -234,7 +238,9 @@ module.exports = {
     let propagation;
     if (navError) {
       propagation = { propagated: false, reason: "skipped: this tab's navigation failed" };
-      sync.markDesynced(page.url(), null, propagation.reason);
+      // Upstream's own tab is still the selected one, whatever it now shows [review r3 LOW].
+      if (sameTab) sync.markSynced(page.url());
+      else sync.markDesynced(page.url(), null, propagation.reason);
     } else {
       propagation = await propagateActivePageToUpstream(url, { force });
     }
