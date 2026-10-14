@@ -18,7 +18,9 @@
 //      relay did not put there (mayNavigate()). "Put there" = the pinned page
 //      showed about:blank, or the URL the relay last left it on (relayUrl).
 //      relayUrl moves only after the relay's own navigation, or after a
-//      navigation_* the caller chose (afterGuardedCall()). Never after
+//      navigation_go-to / navigation_reload the caller chose
+//      (afterGuardedCall()); go-back / go-forward land on a history entry the
+//      user may have put there (review r3). Never after
 //      execute / scenario-run / interaction_*: each can wait (a script, an
 //      element, a navigation) while a person signs in in that tab and return
 //      the moment they finish, so neither its result nor its duration says who
@@ -101,11 +103,12 @@ function state() {
 function warning() {
   if (!desync) return null;
   const where = desync.upstreamUrl ? ` (it shows ${desync.upstreamUrl})` : "";
-  const reclaim = `If you put that page there yourself (execute, a click, a redirect), repeat tabs_select / tabs_new with ${OPT_IN}: true to reclaim the tab; `
+  const reclaim = `If you put that page there yourself (execute, a click, a redirect), reclaim the tab with tabs_select({index, ${OPT_IN}: true}) `
+    + `(no reload), or tabs_new({url, ${OPT_IN}: true}); `
     + `if the user may be using it, ask them first.`;
   return `[mcp-relay] UPSTREAM DESYNC: the selected tab (${desync.activeUrl}) is NOT the tab upstream tools act on${where}; `
     + `${desync.reason}. Screenshots, snapshots and content_* read upstream's tab. `
-    + `execute, scenario-run, navigation_* and interaction_* are refused until a tabs_select / tabs_new syncs; `
+    + `execute, scenario-run, navigation_* and interaction_* are refused until a tabs_select / tabs_new syncs. `
     + (desync.protectedPage
       // Upstream re-pins only when its page closes, so no tabs_* call can move it.
       ? `Upstream tools stay on that tab while it is open. ${reclaim}`
@@ -121,8 +124,8 @@ function refusal(name) {
 }
 
 /**
- * After a guarded upstream call `name`: when it was a navigation_* (the caller
- * chose where it went) and the pinned page was the relay's before it
+ * After a guarded upstream call `name`: when it was a navigation_go-to or
+ * navigation_reload (the caller chose where it went) and the pinned page was the relay's before it
  * (`before`, from readUpstreamUrl()) or the caller opted in, its new URL is
  * the relay's. Nothing else claims (see the header); a caller whose own
  * execute or click moved the tab reclaims it with allowPinnedPage on
@@ -130,7 +133,7 @@ function refusal(name) {
  */
 async function afterGuardedCall({ before, name, optIn = false } = {}) {
   const wasOwned = before && typeof before.url === "string" && mayNavigate(before.url);
-  const navigation = typeof name === "string" && name.startsWith("navigation_");
+  const navigation = name === "navigation_go-to" || name === "navigation_reload";
   if (!(navigation && (wasOwned || optIn))) return;
   const after = await readUpstreamUrl();
   if (typeof after.url === "string") relayUrl = after.url;

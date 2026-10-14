@@ -208,3 +208,17 @@ test("r2: a navigation_* from a page that is not the relay's, not opted in, does
     assert.strictEqual(sync.state().relayUrl, null);
   } finally { restore(); }
 });
+
+test("r3 LOW: go-back / go-forward land on a history entry the caller didn't choose, so they never claim", async () => {
+  const { up, restore } = setup("about:blank");
+  try {
+    await propagateActivePageToUpstream("https://site.example/r");
+    const before = await sync.readUpstreamUrl();
+    up.url = "https://user.example/signed-in"; // forward lands on the user's page
+    await sync.afterGuardedCall({ before, name: "navigation_go-back-or-forward" });
+    assert.strictEqual(sync.state().relayUrl, "https://site.example/r");
+    up.url = "https://site.example/r?reloaded";
+    await sync.afterGuardedCall({ before: { url: "https://site.example/r" }, name: "navigation_reload" });
+    assert.strictEqual(sync.state().relayUrl, "https://site.example/r?reloaded");
+  } finally { restore(); }
+});
