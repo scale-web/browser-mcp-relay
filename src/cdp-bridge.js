@@ -10,6 +10,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { chromium } = require("playwright-core");
+const WebSocket = require("ws");
 const { applyLocalConfigToEnv } = require("./local-config.js");
 const cdpIdentity = require("./cdp-identity.js");
 
@@ -122,6 +123,70 @@ function clearSessionRestore(userDataDir, env = applyLocalConfigToEnv(process.en
   }
 }
 
+/** One CDP call on the browser endpoint, over a short-lived socket. */
+function cdpCall(wsEndpoint, method, params, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsEndpoint, { perMessageDeflate: false, handshakeTimeout: timeoutMs });
+    const timer = setTimeout(() => finish(reject, new Error(`${method}: no answer within ${timeoutMs}ms`)), timeoutMs);
+    function finish(settle, value) {
+      clearTimeout(timer);
+      try { ws.terminate(); } catch { /* already closed */ }
+      settle(value);
+    }
+    ws.once("open", () => ws.send(JSON.stringify({ id: 1, method, params })));
+    ws.on("message", (data) => {
+      let msg;
+      try { msg = JSON.parse(data.toString("utf8")); } catch { return; }
+      if (msg.id !== 1) return;
+      if (msg.error) finish(reject, new Error(`${method}: ${msg.error.message}`));
+      else finish(resolve, msg.result || {});
+    });
+    ws.once("error", (e) => finish(reject, e));
+  });
+}
+
+/**
+ * Open a headful Brave's FIRST window without activating Brave (2026-10-29).
+ * Chromium's startup window runs [NSApp activateIgnoringOtherApps:YES], which
+ * pulls a user out of a full-screen app's Space on every relaunch — `open -g`
+ * cannot stop it. So Brave starts with --no-startup-window and this opens the
+ * window as a BACKGROUND target (Chromium ShowInactive: no Space switch;
+ * measured live 2026-10-29). Playwright's launchPersistentContext waits for
+ * this first page, so it runs while that launch is pending.
+ *
+ * Talks only to a port proven to be THIS Brave (same check as below). If the
+ * background window fails it opens a normal one (the old behaviour: one focus
+ * jump) so the launch still completes. Never rejects; failures are logged.
+ */
+async function openFirstWindow(userDataDir, { timeoutMs = 30000, stopped = () => false } = {}) {
+  try {
+    // Poll in short slices so a launch that settles first (failed, or already
+    // has a page) ends the wait instead of leaving it running for timeoutMs.
+    const deadline = Date.now() + timeoutMs;
+    let file;
+    for (;;) {
+      try { file = await cdpIdentity.waitForDevToolsActivePort(userDataDir, { timeoutMs: 500 }); break; }
+      catch (e) {
+        if (stopped()) return { error: "launch settled first" };
+        if (Date.now() >= deadline) throw e;
+      }
+    }
+    const wsEndpoint = await cdpIdentity.verifyPortIdentity(file.port, file.browserPath, { timeoutMs: 1000 });
+    if (!wsEndpoint) throw new Error(`CDP identity check failed for 127.0.0.1:${file.port}`);
+    try {
+      await cdpCall(wsEndpoint, "Target.createTarget", { url: "about:blank", newWindow: true, background: true });
+      return { background: true };
+    } catch (e) {
+      process.stderr.write(`[mcp-relay] background first window failed (${e.message}) — opening a normal window\n`);
+      await cdpCall(wsEndpoint, "Target.createTarget", { url: "about:blank", newWindow: true });
+      return { background: false };
+    }
+  } catch (e) {
+    process.stderr.write(`[mcp-relay] could not open Brave's first window: ${e.message} — the launch fails at Playwright's launch timeout\n`);
+    return { error: e.message };
+  }
+}
+
 /**
  * Launch Brave for the slot. Returns a handle the caller passes back to
  * closeBrave on shutdown. Call with the profile's flock held, AFTER the
@@ -169,6 +234,15 @@ async function launchBrave({
   // The test hook KEEPS the mock keychain (see TEST_LAUNCH_ARGS above).
   const ignoreDefaultArgs = testLaunch ? [] : ["--use-mock-keychain"];
   if (testLaunch) args.push(...TEST_LAUNCH_ARGS);
+  // Headful: no startup window; openFirstWindow adds a background one (it
+  // would otherwise activate Brave and steal a full-screen Space). Playwright
+  // appends a positional about:blank for persistent contexts — drop it, or
+  // Brave opens that as a normal, activating window.
+  const backgroundFirstWindow = !headless;
+  if (backgroundFirstWindow) {
+    args.push("--no-startup-window");
+    ignoreDefaultArgs.push("about:blank");
+  }
   if (extensionPath) {
     args.push(`--load-extension=${extensionPath}`);
     args.push(`--disable-extensions-except=${extensionPath}`);
@@ -258,7 +332,11 @@ async function launchBrave({
   // would hand us a dead port — or one a different Brave has since taken.
   cdpIdentity.removeDevToolsActivePort(userDataDir);
 
-  const context = await chromium.launchPersistentContext(userDataDir, launchOpts);
+  const launching = chromium.launchPersistentContext(userDataDir, launchOpts);
+  let launchSettled = false;
+  launching.then(() => { launchSettled = true; }, () => { launchSettled = true; });
+  if (backgroundFirstWindow) openFirstWindow(userDataDir, { stopped: () => launchSettled });
+  const context = await launching;
 
   // Read the port back and PROVE the 127.0.0.1 listener is this Brave: its
   // /json/version must name the uuid Brave wrote into OUR profile dir. Fail
@@ -380,4 +458,5 @@ module.exports = {
   assertTestLaunchAllowed,
   TEST_LAUNCH_ARGS,
   _clearSessionRestore: clearSessionRestore,
+  _openFirstWindow: openFirstWindow,
 };
