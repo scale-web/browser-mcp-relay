@@ -173,7 +173,14 @@ async function openFirstWindow(userDataDir, { stopped = () => false } = {}) {
       }
       let file;
       try { file = await cdpIdentity.waitForDevToolsActivePort(userDataDir, { timeoutMs: 500 }); }
-      catch { continue; /* not written yet */ }
+      catch (e) {
+        // Not written yet (that wait already slept), or a read error such as
+        // EACCES/EMFILE that rejects at once: always yield, or this loop would
+        // starve the event loop and the launch could never settle.
+        problem = e.message;
+        await new Promise((r) => setTimeout(r, 250));
+        continue;
+      }
       wsEndpoint = await cdpIdentity.verifyPortIdentity(file.port, file.browserPath, { timeoutMs: 1000 });
       if (!wsEndpoint) {
         problem = `CDP identity check failed for 127.0.0.1:${file.port}`;

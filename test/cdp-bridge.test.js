@@ -38,8 +38,8 @@ function mockJsonVersion(uuid = MOCK_UUID) {
 
 // Stub for the `ws` module: records every socket the first-window path opens
 // and answers each CDP call from `replies` (an error object, a result,
-// { connectError } to fail the connection, { noReply }, or
-// { closeWithoutReply }), so no unit test
+// { connectError } to fail the connection, { noReply }, { closeWithoutReply },
+// or { junkFirst } to send another id's reply first), so no unit test
 // ever opens a real socket.
 function installWsStub(replies = []) {
   const { EventEmitter } = require("node:events");
@@ -61,9 +61,12 @@ function installWsStub(replies = []) {
       this.sent.push(msg);
       if (this.reply.noReply) return;
       if (this.reply.closeWithoutReply) { setImmediate(() => this.emit("close")); return; }
+      if (this.reply.junkFirst) {
+        setImmediate(() => this.emit("message", Buffer.from(JSON.stringify({ id: 999, error: { message: "not yours" } }))));
+      }
       setImmediate(() => this.emit("message", Buffer.from(JSON.stringify({ id: msg.id, ...this.reply }))));
     }
-    terminate() {}
+    terminate() { this.terminated = true; }
   }
   require.cache[wsPath] = { id: wsPath, filename: wsPath, loaded: true, exports: FakeWs };
   return {
@@ -601,6 +604,52 @@ test("cdpCall: a socket closed before the answer rejects at once, not at the tim
   });
 });
 
+test("first window: an unreadable DevToolsActivePort does not freeze the event loop", { timeout: 10000, skip: process.getuid && process.getuid() === 0 ? "root reads mode 000" : false }, async () => {
+  await withFirstWindowStubs([], async (fresh, sockets, udd) => {
+    writeMockActivePort(udd);
+    fs.chmodSync(path.join(udd, "DevToolsActivePort"), 0o000);
+    const t0 = Date.now();
+    const r = await fresh._openFirstWindow(udd, { stopped: stopAfter(800) });
+    assert.match(r.error, /launch settled first \(.*EACCES/);
+    assert.ok(Date.now() - t0 < 3000);
+    assert.strictEqual(sockets.length, 0);
+  });
+});
+
+test("first window: a non-page target (e.g. an extension worker) does not count as the window", async () => {
+  await withFirstWindowStubs(
+    [{ error: { message: "slow" } }, { result: { targetInfos: [{ type: "service_worker", targetId: "W" }] } }],
+    async (fresh, sockets, udd) => {
+      writeMockActivePort(udd);
+      const r = await fresh._openFirstWindow(udd);
+      assert.deepStrictEqual(r, { background: false });
+      assert.strictEqual(sockets.length, 3, "the normal-window fallback must still run");
+    },
+  );
+});
+
+test("first window: off macOS the launch args are unchanged", async () => {
+  const desc = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { ...desc, value: "linux" });
+  try {
+    await withMockChromium(async (fresh, captured) => {
+      await fresh.launchBrave({ userDataDir: SAFE_UDD, executablePath: "/fake/brave" });
+      assert.ok(!captured.launchOpts.args.includes("--no-startup-window"));
+      assert.ok(!captured.launchOpts.ignoreDefaultArgs.includes("about:blank"));
+    });
+  } finally {
+    Object.defineProperty(process, "platform", desc);
+  }
+});
+
+test("cdpCall: ignores another id's message and closes its socket", async () => {
+  await withFirstWindowStubs([{ junkFirst: true, result: { ok: 1 } }], async (fresh, sockets) => {
+    const r = await fresh._cdpCall("ws://127.0.0.1:1/x", "Target.getTargets", {}, 2000);
+    assert.deepStrictEqual(r, { ok: 1 });
+    assert.strictEqual(sockets[0].terminated, true);
+  });
+});
+
 test("cdpCall: no answer rejects at its timeout", async () => {
   await withFirstWindowStubs([{ noReply: true }], async (fresh) => {
     const t0 = Date.now();
@@ -609,11 +658,19 @@ test("cdpCall: no answer rejects at its timeout", async () => {
   });
 });
 
-test("first window: a different browser on the port gets NO CDP call", async () => {
+// Stops are driven by a TIMER in these loop tests: a loop that never yields to
+// the event loop never sees it, so a hot spin hangs the test (timeout) instead
+// of passing.
+function stopAfter(ms) {
+  let stop = false;
+  setTimeout(() => { stop = true; }, ms);
+  return () => stop;
+}
+
+test("first window: a different browser on the port gets NO CDP call", { timeout: 10000 }, async () => {
   await withFirstWindowStubs([], async (fresh, sockets, udd) => {
     writeMockActivePort(udd, "99999999-8888-7777-6666-555555555555");
-    const t0 = Date.now();
-    const r = await fresh._openFirstWindow(udd, { stopped: () => Date.now() - t0 > 1000 });
+    const r = await fresh._openFirstWindow(udd, { stopped: stopAfter(1000) });
     assert.match(r.error, /identity check failed/);
     assert.strictEqual(sockets.length, 0);
   });
