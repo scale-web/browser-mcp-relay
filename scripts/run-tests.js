@@ -39,29 +39,38 @@ if (files.length === 0) {
 
 // Forward any extra CLI args (e.g. `--test-reporter spec`) through.
 const extraArgs = process.argv.slice(2);
+// POSIX: own process group, so the watchdog can kill the per-file test
+// processes too (node --test runs each file in a child); the terminal's signals
+// no longer reach that group, so they are forwarded below. Windows has no
+// process groups for kill(): keep the plain child there, as before.
+const GROUP = process.platform !== "win32";
 const child = spawn(process.execPath, ["--test", ...extraArgs, ...files], {
   stdio: "inherit",
-  // Own process group, so the watchdog can kill the per-file test processes
-  // too (node --test runs each file in a child); Ctrl-C is forwarded below.
-  detached: true,
+  detached: GROUP,
   // Match the user's terminal — no color stripping etc.
 });
 
 // A test that starves its event loop cannot fail by its own timeout (those are
 // timers too), so a hang would stall the run forever: kill it and fail instead.
-const killGroup = (sig) => { try { process.kill(-child.pid, sig); } catch { /* already gone */ } };
+const SIGNAL_NUMS = { SIGINT: 2, SIGTERM: 15, SIGHUP: 1, SIGQUIT: 3 };
+const kill = (sig) => {
+  try { if (GROUP) process.kill(-child.pid, sig); else child.kill(sig); } catch { /* already gone */ }
+};
 const watchdog = setTimeout(() => {
   console.error("[run-tests] no result after 10 minutes — a test is hung; killing the run");
-  killGroup("SIGKILL");
+  kill("SIGKILL");
 }, 10 * 60 * 1000);
-for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => killGroup(sig));
+let forwarded = null; // a signal the user sent: exit as if it had killed us
+if (GROUP) {
+  for (const sig of Object.keys(SIGNAL_NUMS)) process.on(sig, () => { forwarded = sig; kill(sig); });
+}
 
 child.on("exit", (code, signal) => {
   clearTimeout(watchdog);
-  if (signal) {
+  const sig = forwarded || signal;
+  if (sig) {
     // Re-raise the signal as POSIX-style exit code.
-    const SIGNAL_NUMS = { SIGINT: 2, SIGTERM: 15, SIGHUP: 1, SIGQUIT: 3 };
-    const sigNum = SIGNAL_NUMS[signal];
+    const sigNum = SIGNAL_NUMS[sig];
     process.exit(sigNum ? 128 + sigNum : 1);
   }
   process.exit(code ?? 0);

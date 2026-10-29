@@ -58,6 +58,9 @@ test("braveIsFront: true only when THIS Brave (by pid) is the front app", async 
       assert.strictEqual(await quiet.braveIsFront(null), false, "pid unknown");
       quiet._run = async () => null; // lsappinfo failed
       assert.strictEqual(await quiet.braveIsFront(15467), false);
+      // pid unknown AND no front pid: null === null must not mean "in front"
+      assert.strictEqual(await quiet.braveIsFront(null), false);
+      assert.strictEqual(await quiet.braveIsFront(undefined), false);
     });
   } finally { quiet._run = orig; }
 });
