@@ -44,7 +44,15 @@ const child = spawn(process.execPath, ["--test", ...extraArgs, ...files], {
   // Match the user's terminal — no color stripping etc.
 });
 
+// A test that starves its event loop cannot fail by its own timeout (those are
+// timers too), so a hang would stall the run forever: kill it and fail instead.
+const watchdog = setTimeout(() => {
+  console.error("[run-tests] no result after 10 minutes — a test is hung; killing the run");
+  child.kill("SIGKILL");
+}, 10 * 60 * 1000);
+
 child.on("exit", (code, signal) => {
+  clearTimeout(watchdog);
   if (signal) {
     // Re-raise the signal as POSIX-style exit code.
     const SIGNAL_NUMS = { SIGINT: 2, SIGTERM: 15, SIGHUP: 1, SIGQUIT: 3 };

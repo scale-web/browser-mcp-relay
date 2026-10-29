@@ -33,6 +33,7 @@ const { propagateActivePageToUpstream } = require("./_propagate-active-page.js")
 const { applyLocalConfigToEnv } = require("../local-config.js");
 const { setActivePage, getActivePageRaw } = require("./_active-page.js");
 const sync = require("./_upstream-sync.js");
+const quiet = require("./_quiet-focus.js");
 
 // Pages this relay process created (tabs_new's newPage). When upstream's URL
 // can't be read, only these (and about:blank tabs) may be reused or pruned:
@@ -214,7 +215,8 @@ module.exports = {
       }
     }
     if (!page) {
-      page = await bridge.context.newPage();
+      // Background tab: newPage() would activate Brave (_quiet-focus.js).
+      page = await quiet.newQuietPage(bridge);
       created.add(page);
       relayLeft.set(page, "about:blank");
     }
@@ -229,7 +231,7 @@ module.exports = {
     // tab, not the previous active page or pages[0]'s about:blank.
     setActivePage(page);
     if (reused || adoptedBlank) {
-      try { await page.bringToFront(); } catch { /* headless / already front */ }
+      try { await quiet.raiseIfFront(page); } catch { /* headless / already front */ }
     }
 
     let navError = null;

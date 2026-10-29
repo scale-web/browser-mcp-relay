@@ -12,10 +12,11 @@
 const { propagateActivePageToUpstream } = require("./_propagate-active-page.js");
 const { setActivePage } = require("./_active-page.js");
 const sync = require("./_upstream-sync.js");
+const quiet = require("./_quiet-focus.js");
 
 module.exports = {
   name: "tabs_select",
-  description: "Bring a specific tab to the front (active page) by its index.",
+  description: "Select a tab (the active page for subsequent tools) by its index. It is raised on screen only when Brave is already the front app, so the user's focus is never taken.",
   inputSchema: {
     type: "object",
     properties: {
@@ -48,7 +49,10 @@ module.exports = {
     setActivePage(pages[index]);
     const url = pages[index].url();
     try {
-      await pages[index].bringToFront();
+      // Raising activates Brave and pulls a user out of a full-screen app,
+      // so only when Brave is already in front (_quiet-focus.js); the tab is
+      // live and tracked either way.
+      await quiet.raiseIfFront(pages[index]);
     } catch (e) {
       // bringToFront is cosmetic (just visual focus); failure shouldn't
       // block the active-page tracking. Log + continue with propagation.

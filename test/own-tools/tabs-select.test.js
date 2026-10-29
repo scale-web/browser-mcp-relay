@@ -3,6 +3,15 @@ const assert = require("node:assert");
 const tool = require("../../src/own-tools/tabs-select.js");
 const sync = require("../../src/own-tools/_upstream-sync.js");
 const { fakeUpstream } = require("../fixtures/fake-upstream-page.js");
+const quiet = require("../../src/own-tools/_quiet-focus.js");
+
+// Whether Brave is the frontmost app decides if tabs_select raises the tab
+// (_quiet-focus.js); pin it so these tests do not depend on this machine.
+function pinBraveFront(value) {
+  const orig = quiet.braveIsFront;
+  quiet.braveIsFront = async () => value;
+  return () => { quiet.braveIsFront = orig; };
+}
 
 test("tabs_select has required tool shape", () => {
   assert.strictEqual(tool.name, "tabs_select");
@@ -94,6 +103,7 @@ test("tabs_select: about:blank target skips upstream propagation and warns (the 
   const up = fakeUpstream({ url: "https://user-signed-in.example/dashboard" });
   const restore = up.install();
   globalThis.__relayBridge = makeFakeBridge(["about:blank", "https://user-signed-in.example/dashboard"]);
+  const unpin = pinBraveFront(true);
   try {
     const result = await tool.handler({ index: 0 });
     assert.strictEqual(result.isError, undefined);
@@ -103,9 +113,30 @@ test("tabs_select: about:blank target skips upstream propagation and warns (the 
     assert.strictEqual(payload.upstreamPropagated, false);
     assert.strictEqual(up.calls.length, 0);
     assert.strictEqual(sync.isDesynced(), true);
-    // bringToFront still called (Playwright-side focus)
+    // Brave in front → the tab is raised on screen
     assert.strictEqual(globalThis.__relayBridge._pages[0]._bringCalled, 1);
   } finally {
+    unpin();
+    globalThis.__relayBridge = prevBridge;
+    restore();
+  }
+});
+
+test("tabs_select: with another app in front the tab is selected but NOT raised (no focus steal)", async () => {
+  const prevBridge = globalThis.__relayBridge;
+  const up = fakeUpstream();
+  const restore = up.install();
+  globalThis.__relayBridge = makeFakeBridge(["about:blank", "file:///c/tmp/test.html"]);
+  const unpin = pinBraveFront(false);
+  try {
+    const result = await tool.handler({ index: 1 });
+    assert.strictEqual(result.isError, undefined);
+    const payload = JSON.parse(result.content[result.content.length - 1].text);
+    assert.strictEqual(payload.selected, 1);
+    assert.strictEqual(globalThis.__relayBridge._pages[1]._bringCalled, 0);
+    assert.strictEqual(require("../../src/own-tools/_active-page.js").getActivePageRaw(), globalThis.__relayBridge._pages[1]);
+  } finally {
+    unpin();
     globalThis.__relayBridge = prevBridge;
     restore();
   }
@@ -119,6 +150,7 @@ test("tabs_select: real URL triggers upstream navigation_go-to", async () => {
     "about:blank",
     "file:///c/tmp/test.html",
   ]);
+  const unpin = pinBraveFront(true);
   try {
     const result = await tool.handler({ index: 1 });
     assert.strictEqual(result.isError, undefined);
@@ -131,6 +163,7 @@ test("tabs_select: real URL triggers upstream navigation_go-to", async () => {
     assert.strictEqual(up.navs()[0].params.arguments.url, "file:///c/tmp/test.html");
     assert.strictEqual(globalThis.__relayBridge._pages[1]._bringCalled, 1);
   } finally {
+    unpin();
     globalThis.__relayBridge = prevBridge;
     restore();
   }

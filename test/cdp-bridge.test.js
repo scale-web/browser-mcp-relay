@@ -604,6 +604,14 @@ test("cdpCall: a socket closed before the answer rejects at once, not at the tim
   });
 });
 
+test("first window: a file that is merely not written yet is not reported as a problem", { timeout: 10000 }, async () => {
+  await withFirstWindowStubs([], async (fresh, sockets, udd) => {
+    const r = await fresh._openFirstWindow(udd, { stopped: stopAfter(700) });
+    assert.deepStrictEqual(r, { error: "launch settled first" });
+    assert.strictEqual(sockets.length, 0);
+  });
+});
+
 test("first window: an unreadable DevToolsActivePort does not freeze the event loop", { timeout: 10000, skip: process.getuid && process.getuid() === 0 ? "root reads mode 000" : false }, async () => {
   await withFirstWindowStubs([], async (fresh, sockets, udd) => {
     writeMockActivePort(udd);

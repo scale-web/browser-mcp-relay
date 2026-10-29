@@ -227,3 +227,53 @@ test("T1-10: tabs_new accepts waitUntil parameter and passes it to goto", async 
     globalThis.__relayBridge = prevBridge;
   }
 });
+
+// 2026-10-29: tabs_new must not take the user's screen (_quiet-focus.js).
+const quiet = require("../../src/own-tools/_quiet-focus.js");
+
+test("tabs_new: a NEW tab comes from newQuietPage (background), not context.newPage", async () => {
+  const prevBridge = globalThis.__relayBridge;
+  const up = fakeUpstream();
+  const restore = up.install();
+  const bridge = makeFakeBridge();
+  let newPageCalls = 0;
+  const realNewPage = bridge.context.newPage;
+  bridge.context.newPage = async () => { newPageCalls++; return realNewPage(); };
+  const origQuiet = quiet.newQuietPage;
+  const quietCalls = [];
+  quiet.newQuietPage = async (b) => { quietCalls.push(b); return realNewPage(); };
+  globalThis.__relayBridge = bridge;
+  try {
+    const result = await tool.handler({ url: "https://fresh.example/", forceNew: true });
+    assert.notStrictEqual(result.isError, true);
+    assert.strictEqual(quietCalls.length, 1);
+    assert.strictEqual(quietCalls[0], bridge);
+    assert.strictEqual(newPageCalls, 0);
+  } finally {
+    quiet.newQuietPage = origQuiet;
+    globalThis.__relayBridge = prevBridge;
+    restore();
+  }
+});
+
+test("tabs_new: an adopted tab is raised only when Brave is already in front", async () => {
+  for (const front of [false, true]) {
+    const prevBridge = globalThis.__relayBridge;
+    const up = fakeUpstream();
+    const restore = up.install();
+    let raised = 0;
+    const blank = { _url: "about:blank", url() { return this._url; }, isClosed: () => false,
+      async goto(u) { this._url = u; return null; }, async bringToFront() { raised++; } };
+    globalThis.__relayBridge = { context: { pages: () => [blank], newPage: async () => { throw new Error("should adopt"); } } };
+    const origFront = quiet.braveIsFront;
+    quiet.braveIsFront = async () => front;
+    try {
+      await tool.handler({ url: "https://adopt.example/" });
+      assert.strictEqual(raised, front ? 1 : 0, `front=${front}`);
+    } finally {
+      quiet.braveIsFront = origFront;
+      globalThis.__relayBridge = prevBridge;
+      restore();
+    }
+  }
+});

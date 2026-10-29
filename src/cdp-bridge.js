@@ -174,11 +174,13 @@ async function openFirstWindow(userDataDir, { stopped = () => false } = {}) {
       let file;
       try { file = await cdpIdentity.waitForDevToolsActivePort(userDataDir, { timeoutMs: 500 }); }
       catch (e) {
-        // Not written yet (that wait already slept), or a read error such as
-        // EACCES/EMFILE that rejects at once: always yield, or this loop would
-        // starve the event loop and the launch could never settle.
-        problem = e.message;
-        await new Promise((r) => setTimeout(r, 250));
+        // Not written yet: that wait already slept. A read error (EACCES,
+        // EMFILE, EIO) rejects at once: yield, or this loop would starve the
+        // event loop and the launch could never settle.
+        if (e.code) {
+          problem = e.message;
+          await new Promise((r) => setTimeout(r, 250));
+        }
         continue;
       }
       wsEndpoint = await cdpIdentity.verifyPortIdentity(file.port, file.browserPath, { timeoutMs: 1000 });
