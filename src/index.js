@@ -553,9 +553,11 @@ async function main() {
           });
           void guard;
           // Make the bridge available to own-tool handlers via globalThis.
-          // Shape: { context, cdpConnectUrl, port, wsEndpoint } — tool
-          // handlers (lighthouse_audit: port) read globalThis.__relayBridge.
-          globalThis.__relayBridge = { ...l, port: l.port };
+          // Shape: { context, cdpConnectUrl, port, wsEndpoint, bravePid } — tool
+          // handlers (lighthouse_audit: port; tabs_*: bravePid, to raise a tab
+          // only when THIS Brave is the front app) read globalThis.__relayBridge.
+          const bravePid = attachedPid || pool.findBraveMainPid(dir);
+          globalThis.__relayBridge = { ...l, port: l.port, bravePid };
           bridge = l;
           port = l.port;
           wsEndpoint = l.wsEndpoint;
@@ -563,7 +565,7 @@ async function main() {
           sidecar.update({
             braveAlive: true,
             cdpPort: l.port,
-            bravePid: attachedPid || pool.findBraveMainPid(dir),
+            bravePid,
           }, { force: true });
           // V1-5 (2026-06-01): invalidate the cached `bridge` when the
           // underlying Brave context/process dies. Without this listener, a

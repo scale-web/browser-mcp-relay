@@ -7,8 +7,10 @@
 // emulated) — so raising a tab is cosmetic for automation.
 //
 // So new tabs open in the BACKGROUND (CDP Target.createTarget
-// {background:true}), and a tab is raised only when Brave is already the
-// frontmost app (the user is looking at it; there is nothing to steal).
+// {background:true}), and a tab is raised only when THIS relay's Brave is
+// already the frontmost app (the user is looking at it; nothing to steal).
+// Matched by pid: the user's own Brave and other relays' Braves share its
+// bundle id (review 2026-10-29).
 // Not covered: pages upstream creates itself with its own Playwright.
 
 const { execFile } = require("node:child_process");
@@ -20,30 +22,33 @@ function run(cmd, args) {
   });
 }
 
-/** bundleID of the app whose ASN is `asn` in `lsappinfo list` output, else null. Pure. */
-function bundleOfAsn(asn, list) {
+/** pid of the app whose ASN is `asn` in `lsappinfo list` output, else null.
+ *  Matches an entry's HEAD line only: `parentASN=... ASN:...` lines inside other
+ *  entries name the same ASNs. Pure. */
+function pidOfAsn(asn, list) {
   if (!asn || !list) return null;
   for (const entry of list.split(/\n(?=\s*\d+\) ")/)) {
     const head = entry.split("\n").find((l) => l.trim()) || "";
     if (!head.includes(` ${asn}`)) continue;
-    const m = entry.match(/bundleID="([^"]*)"/);
-    return m ? m[1] : null;
+    const m = entry.match(/^\s*pid = (\d+)\b/m);
+    return m ? Number(m[1]) : null;
   }
   return null;
 }
 
-/** True when a Brave is the frontmost app. Off macOS: true (the steal is a
- *  macOS Spaces problem; behave as before). Unknown: false (do not raise). */
-async function braveIsFront() {
+/** True when the Brave with main pid `bravePid` is the frontmost app. Off
+ *  macOS: true (the steal is a macOS Spaces problem; behave as before).
+ *  Unknown pid or front app: false (do not raise). */
+async function braveIsFront(bravePid) {
   if (process.platform !== "darwin") return true;
+  if (!Number.isInteger(bravePid)) return false;
   const asn = ((await module.exports._run("lsappinfo", ["front"])) || "").trim();
-  const bundle = bundleOfAsn(asn, await module.exports._run("lsappinfo", ["list"]));
-  return typeof bundle === "string" && /^com\.brave\.Browser/.test(bundle);
+  return pidOfAsn(asn, await module.exports._run("lsappinfo", ["list"])) === bravePid;
 }
 
-/** bringToFront only when Brave is already in front. Returns whether it raised. */
-async function raiseIfFront(page) {
-  if (!(await module.exports.braveIsFront())) return false;
+/** bringToFront only when this Brave is already in front. Returns whether it raised. */
+async function raiseIfFront(page, bravePid) {
+  if (!(await module.exports.braveIsFront(bravePid))) return false;
   await page.bringToFront();
   return true;
 }
@@ -94,4 +99,4 @@ async function newQuietPage(bridge, { timeoutMs = 10000 } = {}) {
   }
 }
 
-module.exports = { braveIsFront, raiseIfFront, newQuietPage, _bundleOfAsn: bundleOfAsn, _cdpCall, _run: run };
+module.exports = { braveIsFront, raiseIfFront, newQuietPage, _pidOfAsn: pidOfAsn, _cdpCall, _run: run };

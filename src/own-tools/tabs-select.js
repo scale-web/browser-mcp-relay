@@ -16,7 +16,7 @@ const quiet = require("./_quiet-focus.js");
 
 module.exports = {
   name: "tabs_select",
-  description: "Select a tab (the active page for subsequent tools) by its index. It is raised on screen only when Brave is already the front app, so the user's focus is never taken.",
+  description: "Select a tab (the active page for subsequent tools) by its index. It is raised on screen only when this relay's Brave is already the front app, so the user's focus is never taken.",
   inputSchema: {
     type: "object",
     properties: {
@@ -52,7 +52,7 @@ module.exports = {
       // Raising activates Brave and pulls a user out of a full-screen app,
       // so only when Brave is already in front (_quiet-focus.js); the tab is
       // live and tracked either way.
-      await quiet.raiseIfFront(pages[index]);
+      await quiet.raiseIfFront(pages[index], bridge.bravePid);
     } catch (e) {
       // bringToFront is cosmetic (just visual focus); failure shouldn't
       // block the active-page tracking. Log + continue with propagation.

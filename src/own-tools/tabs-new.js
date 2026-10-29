@@ -230,9 +230,9 @@ module.exports = {
     // leaves us in a usable state — subsequent own-tools target this new
     // tab, not the previous active page or pages[0]'s about:blank.
     setActivePage(page);
-    if (reused || adoptedBlank) {
-      try { await quiet.raiseIfFront(page); } catch { /* headless / already front */ }
-    }
+    // Raise the tab only when this relay's Brave is already in front (the
+    // user is watching it) — a new tab is created in the background.
+    try { await quiet.raiseIfFront(page, bridge.bravePid); } catch { /* headless / already front */ }
 
     let navError = null;
     if (url) {

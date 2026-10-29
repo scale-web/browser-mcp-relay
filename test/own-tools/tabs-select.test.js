@@ -9,8 +9,11 @@ const quiet = require("../../src/own-tools/_quiet-focus.js");
 // (_quiet-focus.js); pin it so these tests do not depend on this machine.
 function pinBraveFront(value) {
   const orig = quiet.braveIsFront;
-  quiet.braveIsFront = async () => value;
-  return () => { quiet.braveIsFront = orig; };
+  const seen = [];
+  quiet.braveIsFront = async (pid) => { seen.push(pid); return value; };
+  const unpin = () => { quiet.braveIsFront = orig; };
+  unpin.seen = seen;
+  return unpin;
 }
 
 test("tabs_select has required tool shape", () => {
@@ -126,7 +129,7 @@ test("tabs_select: with another app in front the tab is selected but NOT raised 
   const prevBridge = globalThis.__relayBridge;
   const up = fakeUpstream();
   const restore = up.install();
-  globalThis.__relayBridge = makeFakeBridge(["about:blank", "file:///c/tmp/test.html"]);
+  globalThis.__relayBridge = { ...makeFakeBridge(["about:blank", "file:///c/tmp/test.html"]), bravePid: 4242 };
   const unpin = pinBraveFront(false);
   try {
     const result = await tool.handler({ index: 1 });
@@ -134,6 +137,7 @@ test("tabs_select: with another app in front the tab is selected but NOT raised 
     const payload = JSON.parse(result.content[result.content.length - 1].text);
     assert.strictEqual(payload.selected, 1);
     assert.strictEqual(globalThis.__relayBridge._pages[1]._bringCalled, 0);
+    assert.deepStrictEqual(unpin.seen, [4242], "asks about THIS relay's Brave pid");
     assert.strictEqual(require("../../src/own-tools/_active-page.js").getActivePageRaw(), globalThis.__relayBridge._pages[1]);
   } finally {
     unpin();

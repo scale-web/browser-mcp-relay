@@ -277,3 +277,32 @@ test("tabs_new: an adopted tab is raised only when Brave is already in front", a
     }
   }
 });
+
+
+test("tabs_new: a NEW tab is raised only when this relay's Brave is in front (asked by its pid)", async () => {
+  for (const front of [false, true]) {
+    const prevBridge = globalThis.__relayBridge;
+    const up = fakeUpstream();
+    const restore = up.install();
+    let raised = 0;
+    const fresh = { _url: "about:blank", url() { return this._url; }, isClosed: () => false,
+      async goto(u) { this._url = u; return null; }, async bringToFront() { raised++; } };
+    const pages = [];
+    globalThis.__relayBridge = { bravePid: 777, context: { pages: () => pages, newPage: async () => { throw new Error("use newQuietPage"); } } };
+    const origQuiet = quiet.newQuietPage;
+    quiet.newQuietPage = async () => { pages.push(fresh); return fresh; };
+    const origFront = quiet.braveIsFront;
+    const seen = [];
+    quiet.braveIsFront = async (pid) => { seen.push(pid); return front; };
+    try {
+      await tool.handler({ url: "https://new.example/", forceNew: true });
+      assert.strictEqual(raised, front ? 1 : 0, `front=${front}`);
+      assert.deepStrictEqual(seen, [777]);
+    } finally {
+      quiet.newQuietPage = origQuiet;
+      quiet.braveIsFront = origFront;
+      globalThis.__relayBridge = prevBridge;
+      restore();
+    }
+  }
+});

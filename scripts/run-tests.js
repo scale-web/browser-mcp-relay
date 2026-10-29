@@ -41,15 +41,20 @@ if (files.length === 0) {
 const extraArgs = process.argv.slice(2);
 const child = spawn(process.execPath, ["--test", ...extraArgs, ...files], {
   stdio: "inherit",
+  // Own process group, so the watchdog can kill the per-file test processes
+  // too (node --test runs each file in a child); Ctrl-C is forwarded below.
+  detached: true,
   // Match the user's terminal — no color stripping etc.
 });
 
 // A test that starves its event loop cannot fail by its own timeout (those are
 // timers too), so a hang would stall the run forever: kill it and fail instead.
+const killGroup = (sig) => { try { process.kill(-child.pid, sig); } catch { /* already gone */ } };
 const watchdog = setTimeout(() => {
   console.error("[run-tests] no result after 10 minutes — a test is hung; killing the run");
-  child.kill("SIGKILL");
+  killGroup("SIGKILL");
 }, 10 * 60 * 1000);
+for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => killGroup(sig));
 
 child.on("exit", (code, signal) => {
   clearTimeout(watchdog);
