@@ -37,8 +37,10 @@ function mockJsonVersion(uuid = MOCK_UUID) {
 }
 
 // Stub for the `ws` module: records every socket the first-window path opens
-// and answers each CDP call from `replies` (an error object or a result), so no
-// unit test ever opens a real socket.
+// and answers each CDP call from `replies` (an error object, a result,
+// { connectError } to fail the connection, { noReply }, or
+// { closeWithoutReply }), so no unit test
+// ever opens a real socket.
 function installWsStub(replies = []) {
   const { EventEmitter } = require("node:events");
   const wsPath = require.resolve("ws");
@@ -50,13 +52,16 @@ function installWsStub(replies = []) {
       this.url = url;
       this.sent = [];
       sockets.push(this);
-      setImmediate(() => this.emit("open"));
+      this.reply = replies[sockets.length - 1] || { result: { targetId: "T" } };
+      if (this.reply.connectError) setImmediate(() => this.emit("error", new Error(this.reply.connectError)));
+      else setImmediate(() => this.emit("open"));
     }
     send(data) {
       const msg = JSON.parse(data);
       this.sent.push(msg);
-      const r = replies[sockets.length - 1] || { result: { targetId: "T" } };
-      setImmediate(() => this.emit("message", Buffer.from(JSON.stringify({ id: msg.id, ...r }))));
+      if (this.reply.noReply) return;
+      if (this.reply.closeWithoutReply) { setImmediate(() => this.emit("close")); return; }
+      setImmediate(() => this.emit("message", Buffer.from(JSON.stringify({ id: msg.id, ...this.reply }))));
     }
     terminate() {}
   }
@@ -514,17 +519,15 @@ for (const off of ["0", "false", ""]) {
 // of their Space. Headless launches are unchanged.
 // ──────────────────────────────────────────────────────────────────
 
-test("first window: headful launch passes --no-startup-window, drops about:blank, and opens a background window on the proven endpoint", async () => {
+test("first window: headful launch passes --no-startup-window and drops about:blank", async () => {
   await withMockChromium(async (fresh, captured) => {
     await fresh.launchBrave({ userDataDir: SAFE_UDD, executablePath: "/fake/brave" });
     assert.ok(captured.launchOpts.args.includes("--no-startup-window"));
     assert.ok(captured.launchOpts.ignoreDefaultArgs.includes("about:blank"));
-    assert.ok(await waitFor(() => captured.ws.length === 1 && captured.ws[0].sent.length === 1), "one CDP call expected");
-    assert.strictEqual(captured.ws[0].url, `ws://127.0.0.1:${MOCK_PORT}/devtools/browser/${MOCK_UUID}`);
-    assert.deepStrictEqual(captured.ws[0].sent[0], {
-      id: 1, method: "Target.createTarget",
-      params: { url: "about:blank", newWindow: true, background: true },
-    });
+    // This mock's launch returns at once (as if a page already existed), so
+    // no extra window may be opened after it.
+    await new Promise((r) => setTimeout(r, 300));
+    assert.strictEqual(captured.ws.length, 0);
   });
 });
 
@@ -562,16 +565,55 @@ test("first window: if the background window fails, a normal window opens so the
     writeMockActivePort(udd);
     const r = await fresh._openFirstWindow(udd);
     assert.deepStrictEqual(r, { background: false });
-    assert.strictEqual(sockets.length, 2);
+    assert.strictEqual(sockets.length, 3);
     assert.strictEqual(sockets[0].sent[0].params.background, true);
-    assert.deepStrictEqual(sockets[1].sent[0].params, { url: "about:blank", newWindow: true });
+    assert.strictEqual(sockets[1].sent[0].method, "Target.getTargets");
+    assert.deepStrictEqual(sockets[2].sent[0].params, { url: "about:blank", newWindow: true });
+  });
+});
+
+test("first window: a background call that fails AFTER opening the window gets no second window", async () => {
+  await withFirstWindowStubs(
+    [{ error: { message: "slow" } }, { result: { targetInfos: [{ type: "page", targetId: "P" }] } }],
+    async (fresh, sockets, udd) => {
+      writeMockActivePort(udd);
+      const r = await fresh._openFirstWindow(udd);
+      assert.deepStrictEqual(r, { background: true, late: true });
+      assert.strictEqual(sockets.length, 2, "no normal (focus-stealing) window");
+    },
+  );
+});
+
+test("first window: a refused CDP connection is handled, not an uncaught 'error'", async () => {
+  await withFirstWindowStubs([{ connectError: "ECONNREFUSED" }], async (fresh, sockets, udd) => {
+    writeMockActivePort(udd);
+    const r = await fresh._openFirstWindow(udd);
+    assert.deepStrictEqual(r, { background: false });
+    assert.strictEqual(sockets.length, 3);
+  });
+});
+
+test("cdpCall: a socket closed before the answer rejects at once, not at the timeout", async () => {
+  await withFirstWindowStubs([{ closeWithoutReply: true }], async (fresh) => {
+    const t0 = Date.now();
+    await assert.rejects(fresh._cdpCall("ws://127.0.0.1:1/x", "Target.getTargets", {}, 5000), /socket closed before an answer/);
+    assert.ok(Date.now() - t0 < 1000);
+  });
+});
+
+test("cdpCall: no answer rejects at its timeout", async () => {
+  await withFirstWindowStubs([{ noReply: true }], async (fresh) => {
+    const t0 = Date.now();
+    await assert.rejects(fresh._cdpCall("ws://127.0.0.1:1/x", "Target.getTargets", {}, 150), /no answer within 150ms/);
+    assert.ok(Date.now() - t0 < 1000);
   });
 });
 
 test("first window: a different browser on the port gets NO CDP call", async () => {
   await withFirstWindowStubs([], async (fresh, sockets, udd) => {
     writeMockActivePort(udd, "99999999-8888-7777-6666-555555555555");
-    const r = await fresh._openFirstWindow(udd);
+    const t0 = Date.now();
+    const r = await fresh._openFirstWindow(udd, { stopped: () => Date.now() - t0 > 1000 });
     assert.match(r.error, /identity check failed/);
     assert.strictEqual(sockets.length, 0);
   });
@@ -582,7 +624,78 @@ test("first window: stops waiting once the launch has settled", async () => {
     const t0 = Date.now();
     const r = await fresh._openFirstWindow(udd, { stopped: () => true });
     assert.deepStrictEqual(r, { error: "launch settled first" });
-    assert.ok(Date.now() - t0 < 2000, "must not wait out the 30 s deadline");
+    assert.ok(Date.now() - t0 < 2000, "must return once the launch has settled");
     assert.strictEqual(sockets.length, 0);
   });
+});
+
+// A real Brave writes DevToolsActivePort hundreds of ms after spawn, and
+// Playwright's launchPersistentContext does not return until a first page
+// exists. This mock does both, so the first window must be opened WHILE the
+// launch is pending, and the file wait must survive a missed first slice.
+test("first window: opened while the launch is pending, after a late DevToolsActivePort", async () => {
+  const playwrightCorePath = require.resolve("playwright-core");
+  const cdpBridgePath = require.resolve("../src/cdp-bridge.js");
+  const origPlaywright = require.cache[playwrightCorePath];
+  const origCdpBridge = require.cache[cdpBridgePath];
+  const origFetch = global.fetch;
+  const wsStub = installWsStub();
+  const udd = fs.mkdtempSync(path.join(os.tmpdir(), "cdp-pending-"));
+  require.cache[playwrightCorePath] = {
+    id: playwrightCorePath, filename: playwrightCorePath, loaded: true,
+    exports: { chromium: { launchPersistentContext: async (dir) => {
+      setTimeout(() => writeMockActivePort(dir), 700);
+      const gotPage = await waitFor(() => wsStub.sockets.some((s) => s.sent.some((m) => m.method === "Target.createTarget")), 3000);
+      if (!gotPage) throw new Error("mock: no first page within 3 s");
+      return { close: async () => {} };
+    } } },
+  };
+  delete require.cache[cdpBridgePath];
+  global.fetch = mockJsonVersion();
+  try {
+    const h = await require("../src/cdp-bridge.js").launchBrave({ userDataDir: udd, executablePath: "/fake/brave" });
+    assert.strictEqual(h.port, MOCK_PORT);
+    assert.strictEqual(wsStub.sockets.length, 1);
+    assert.strictEqual(wsStub.sockets[0].url, `ws://127.0.0.1:${MOCK_PORT}/devtools/browser/${MOCK_UUID}`);
+    assert.deepStrictEqual(wsStub.sockets[0].sent[0], {
+      id: 1, method: "Target.createTarget",
+      params: { url: "about:blank", newWindow: true, background: true },
+    });
+  } finally {
+    if (origPlaywright) require.cache[playwrightCorePath] = origPlaywright; else delete require.cache[playwrightCorePath];
+    if (origCdpBridge) require.cache[cdpBridgePath] = origCdpBridge; else delete require.cache[cdpBridgePath];
+    global.fetch = origFetch;
+    wsStub.restore();
+    fs.rmSync(udd, { recursive: true, force: true });
+  }
+});
+
+// A failed launch must stop the first-window poller: otherwise it lingers and
+// can act on a LATER Brave's DevToolsActivePort in the same profile.
+test("first window: a failed launch stops the poller (no CDP call on a later file)", async () => {
+  const playwrightCorePath = require.resolve("playwright-core");
+  const cdpBridgePath = require.resolve("../src/cdp-bridge.js");
+  const origPlaywright = require.cache[playwrightCorePath];
+  const origCdpBridge = require.cache[cdpBridgePath];
+  const origFetch = global.fetch;
+  const wsStub = installWsStub();
+  const udd = fs.mkdtempSync(path.join(os.tmpdir(), "cdp-failed-"));
+  require.cache[playwrightCorePath] = {
+    id: playwrightCorePath, filename: playwrightCorePath, loaded: true,
+    exports: { chromium: { launchPersistentContext: async () => { throw new Error("mock: Brave exited"); } } },
+  };
+  delete require.cache[cdpBridgePath];
+  global.fetch = mockJsonVersion();
+  try {
+    await assert.rejects(require("../src/cdp-bridge.js").launchBrave({ userDataDir: udd, executablePath: "/fake/brave" }), /Brave exited/);
+    writeMockActivePort(udd);
+    await new Promise((r) => setTimeout(r, 1200));
+    assert.strictEqual(wsStub.sockets.length, 0);
+  } finally {
+    if (origPlaywright) require.cache[playwrightCorePath] = origPlaywright; else delete require.cache[playwrightCorePath];
+    if (origCdpBridge) require.cache[cdpBridgePath] = origCdpBridge; else delete require.cache[cdpBridgePath];
+    global.fetch = origFetch;
+    wsStub.restore();
+    fs.rmSync(udd, { recursive: true, force: true });
+  }
 });

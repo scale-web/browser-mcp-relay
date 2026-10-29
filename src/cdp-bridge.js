@@ -142,6 +142,7 @@ function cdpCall(wsEndpoint, method, params, timeoutMs = 5000) {
       else finish(resolve, msg.result || {});
     });
     ws.once("error", (e) => finish(reject, e));
+    ws.once("close", () => finish(reject, new Error(`${method}: socket closed before an answer`)));
   });
 }
 
@@ -158,25 +159,37 @@ function cdpCall(wsEndpoint, method, params, timeoutMs = 5000) {
  * background window fails it opens a normal one (the old behaviour: one focus
  * jump) so the launch still completes. Never rejects; failures are logged.
  */
-async function openFirstWindow(userDataDir, { timeoutMs = 30000, stopped = () => false } = {}) {
+async function openFirstWindow(userDataDir, { stopped = () => false } = {}) {
   try {
-    // Poll in short slices so a launch that settles first (failed, or already
-    // has a page) ends the wait instead of leaving it running for timeoutMs.
-    const deadline = Date.now() + timeoutMs;
-    let file;
-    for (;;) {
-      try { file = await cdpIdentity.waitForDevToolsActivePort(userDataDir, { timeoutMs: 500 }); break; }
-      catch (e) {
-        if (stopped()) return { error: "launch settled first" };
-        if (Date.now() >= deadline) throw e;
+    // Wait for THIS Brave's port and prove it, retrying until the launch
+    // settles (Playwright's own launch timeout bounds that): a slow cold start
+    // or one slow /json/version must not become a failed launch.
+    let wsEndpoint = null;
+    let problem = null;
+    while (!wsEndpoint) {
+      if (stopped()) {
+        if (problem) process.stderr.write(`[mcp-relay] could not open Brave's first window: ${problem}\n`);
+        return { error: `launch settled first${problem ? ` (${problem})` : ""}` };
+      }
+      let file;
+      try { file = await cdpIdentity.waitForDevToolsActivePort(userDataDir, { timeoutMs: 500 }); }
+      catch { continue; /* not written yet */ }
+      wsEndpoint = await cdpIdentity.verifyPortIdentity(file.port, file.browserPath, { timeoutMs: 1000 });
+      if (!wsEndpoint) {
+        problem = `CDP identity check failed for 127.0.0.1:${file.port}`;
+        await new Promise((r) => setTimeout(r, 250));
       }
     }
-    const wsEndpoint = await cdpIdentity.verifyPortIdentity(file.port, file.browserPath, { timeoutMs: 1000 });
-    if (!wsEndpoint) throw new Error(`CDP identity check failed for 127.0.0.1:${file.port}`);
+    // Playwright already has a first page (e.g. one an extension opened).
+    if (stopped()) return { error: "launch settled first" };
     try {
       await cdpCall(wsEndpoint, "Target.createTarget", { url: "about:blank", newWindow: true, background: true });
       return { background: true };
     } catch (e) {
+      // A slow answer may still have opened the window; a second, normal one
+      // would steal focus and leave two windows.
+      const { targetInfos = [] } = await cdpCall(wsEndpoint, "Target.getTargets", {}).catch(() => ({}));
+      if (targetInfos.some((t) => t.type === "page")) return { background: true, late: true };
       process.stderr.write(`[mcp-relay] background first window failed (${e.message}) — opening a normal window\n`);
       await cdpCall(wsEndpoint, "Target.createTarget", { url: "about:blank", newWindow: true });
       return { background: false };
@@ -238,7 +251,8 @@ async function launchBrave({
   // would otherwise activate Brave and steal a full-screen Space). Playwright
   // appends a positional about:blank for persistent contexts — drop it, or
   // Brave opens that as a normal, activating window.
-  const backgroundFirstWindow = !headless;
+  // macOS only: that is where the focus steal happens and was measured.
+  const backgroundFirstWindow = !headless && process.platform === "darwin";
   if (backgroundFirstWindow) {
     args.push("--no-startup-window");
     ignoreDefaultArgs.push("about:blank");
@@ -459,4 +473,5 @@ module.exports = {
   TEST_LAUNCH_ARGS,
   _clearSessionRestore: clearSessionRestore,
   _openFirstWindow: openFirstWindow,
+  _cdpCall: cdpCall,
 };
