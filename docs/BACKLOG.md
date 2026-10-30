@@ -148,7 +148,9 @@ If we want broader coverage, copy specific evasions selectively into our stealth
 
 ### `event.isTrusted` faking
 
-**Impossible.** Synthetic events from CDP fundamentally have `isTrusted=false`. Any patch that tries to fake this gets caught the moment it's proxy-detected. **Press-and-hold CAPTCHAs and similar will detect us regardless** — this is by browser design. The only solution is real hardware events (out of scope) or routing the user through them manually.
+~~**Impossible.** Synthetic events from CDP fundamentally have `isTrusted=false`. Any patch that tries to fake this gets caught the moment it's proxy-detected. **Press-and-hold CAPTCHAs and similar will detect us regardless** — this is by browser design. The only solution is real hardware events (out of scope) or routing the user through them manually.~~
+
+**Retracted 2026-10-30 — the premise was wrong, and there is nothing to fake.** A CDP `Input.dispatchMouseEvent` click already arrives with **`isTrusted=true`**: measured in plain Brave 156 and in the relay (Cloudflare relay recon, research A §2, "CDP click" column, 2026-10-29 — move/press/release on a local probe page). Only events dispatched from page JS are untrusted, and faking `isTrusted` in JS stays a non-goal. Into a cross-origin Turnstile iframe the result is still unmeasured (vault spec *Browser Work Behind Cloudflare — Spec v8* §10 #26). Challenges fail for other measured reasons (`navigator.webdriver === true`, CDP attachment — spec §1, §5.5); press-and-hold CAPTCHAs and Cloudflare widgets still go to the user (the `cf-challenge` skill).
 
 Per the LightningATC dossier (`recon_lightningatc_session_2026_05_10_pickup.md`): *"never auto-solve captchas/press-and-hold (`event.isTrusted=false` = instant flag)."* This is a known wall.
 
