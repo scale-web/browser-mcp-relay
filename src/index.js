@@ -46,6 +46,19 @@ const { loadVaultFromEnv } = require("./vault.js");
 const { attachAutofill } = require("./autofill-injector.js");
 const { listExternalCdpClients } = require("./cdp-clients.js");
 const { freshKeepaliveAgeMs, ReapLog, REAP_LOG_NAME, KEEPALIVE_NAME } = require("./reap-hold.js");
+// Spec v8 §5.6 (phase 1c): the plain-flags launch profile.
+const plainflagsMode = require("./plainflags-mode.js");
+const { createSigninLoader, SIGNIN_FILE } = require("./plainflags-signin.js");
+const { KNOWN_ACCOUNTS } = require("./known-accounts.js");
+const { createSigninPolicy, installSigninGuard, installSigninWatchdog } = require("./plainflags-signin-guard.js");
+const { createAskVerifier } = require("./plainflags-ask-verify.js");
+const { createPlainflagsPolicy } = require("./plainflags-policy.js");
+const { createLock } = require("./plainflags-lock.js");
+const { createClickCounter } = require("./challenge-clicks.js");
+const { plainflagsTools } = require("./own-tools/index.js");
+const challengeDetect = require("./own-tools/challenge-detect.js");
+const challengeClick = require("./own-tools/challenge-click.js");
+const cfCookiesClear = require("./own-tools/cf-cookies-clear.js");
 
 // Layer local-config.json under env so resolveBdmcpEntry / launch flags see
 // it transparently. pool-shared.js applies the same overlay independently.
@@ -104,11 +117,50 @@ function resolveBdmcpEntry() {
 // relay_status, and every mode change is announced in a tool result.
 const RELAY_INSTRUCTIONS =
   "Browser profile status: call relay_status; every mode change is announced in the tool result.";
+const RELAY_INSTRUCTIONS_PLAINFLAGS =
+  "PLAIN-FLAGS relay: a separate, unseeded browser profile for Cloudflare walls (cf-challenge skill) — a fixed tool list, " +
+  "no saved logins, known accounts' logins refused unless on the sign-in list. Call relay_status for details.";
 
 async function main() {
   // Test-only launch hook (spec v4 amendment 5): refuse to RUN — not just to
   // launch — unless HOME is a temp dir. A leftover flag fails loudly.
   if (testLaunchRequested(RELAY_ENV)) assertTestLaunchAllowed();
+
+  // Spec v8 §5.6: the profile mode — from the PROCESS env only (the MCP entry's
+  // env), never local-config.json (a key there is ignored and logged once).
+  {
+    const problem = plainflagsMode.modeProblem(process.env);
+    if (problem) throw new Error(problem);
+  }
+  const profileMode = plainflagsMode.profileMode(process.env);
+  const plain = profileMode === plainflagsMode.PLAINFLAGS;
+  if (plainflagsMode.localConfigHasModeKey()) process.stderr.write(`${plainflagsMode.LOCAL_CONFIG_IGNORED}\n`);
+  if (pool.CONFIG.profileMode !== undefined && pool.CONFIG.profileMode !== profileMode) {
+    throw new Error(`[mcp-relay] profile mode mismatch (pool-shared ${pool.CONFIG.profileMode}, relay ${profileMode}) — refusing`);
+  }
+  // Isolated-harness fixture (known accounts, sign-in file); null otherwise.
+  const pfFixture = plainflagsMode.testFixture(process.env);
+  const launchInputs = plainflagsMode.resolvedLaunchInputs({ relayEnv: RELAY_ENV, config: pool.CONFIG, processEnv: process.env });
+  const cacheRoot = pool.userCacheRoot();
+  // §5.6 (4): the plain-flags mode drives only its own unseeded dirs; the
+  // default mode never drives one of them.
+  const folderCheck = (d) => plainflagsMode.folderRefusal({
+    dir: d,
+    mode: profileMode,
+    cacheRoot,
+    registry: plain ? plainflagsMode.registryDirs(path.join(cacheRoot, plainflagsMode.REGISTRY_NAME)) : { dirs: [] },
+    standaloneDirs: [path.join(path.resolve(__dirname, ".."), ".browser-data"), path.join(cacheRoot, "browser-data")],
+    cookieSourceProfile: pool.CONFIG.configuredCookieSourceProfile,
+  });
+  for (const d of pool.CONFIG.poolDirs) {
+    const why = folderCheck(d);
+    if (why) throw new Error(why);
+  }
+  if (plain) {
+    // §5.6 (13): no proxy (any source), no insecure TLS, no extension.
+    const why = plainflagsMode.launchRefusal(launchInputs);
+    if (why) throw new Error(why);
+  }
 
   // 1. Claim slot — with retry (absorbs the reconnect race where the
   //    previous relay is mid-shutdown) and session-clone fallback (a second
@@ -116,6 +168,14 @@ async function main() {
   //    profile seeded from the base instead of dying with "pool exhausted").
   const claim = await pool.claimSlotWithRetry();
   const { dir, lock, role, release: releasePool, ephemeral, baseDir } = claim;
+  {
+    const why = folderCheck(dir);
+    if (why) {
+      try { releasePool(); } catch {}
+      if (claim.cleanup) { try { claim.cleanup(); } catch {} }
+      throw new Error(why);
+    }
+  }
   if (testLaunchRequested(RELAY_ENV)) {
     try { assertTestLaunchAllowed(dir); } catch (e) {
       try { releasePool(); } catch {}
@@ -162,7 +222,9 @@ async function main() {
         `[mcp-relay] WARNING: cookie source ${path.basename(src)} is ${ageDays.toFixed(1)} days old (threshold ${pool.CONFIG.cookieFreshnessWarnDays}d). Refresh by launching the dedicated cookie-source MCP and logging into the sites you need.\n`,
       );
     }
-    const copied = pool.snapshotCookiesFrom(src, dir);
+    // Plain-flags: a clone seeds only from the plain-flags base, never its
+    // Login Data* (§5.6 (4), review r8 #3); a regular claim has no source.
+    const copied = pool.snapshotCookiesFrom(src, dir, { excludeLoginData: plain });
     process.stderr.write(`[mcp-relay] snapshotted ${copied}/${pool.SNAPSHOT_FILES.length} profile files from ${path.basename(src)}\n`);
 
     // Directory snapshots (Local Storage, Session Storage, optional IndexedDB).
@@ -186,8 +248,9 @@ async function main() {
   // Empty vault → autofill is a no-op. Logged with counts only, never values.
   // Only emits a stderr line when at least one entry loaded, to keep startup
   // quiet for the common (vault-disabled) case.
-  const vault = loadVaultFromEnv();
-  const vsum = vault.summary();
+  // Plain-flags (§5.6 (6)(e)): vault autofill is OFF — no vault is loaded.
+  const vault = plain ? null : loadVaultFromEnv();
+  const vsum = vault ? vault.summary() : { totalEntries: 0 };
   if (vsum.totalEntries > 0) {
     process.stderr.write(
       `[mcp-relay] vault: ${vsum.totalEntries} entries across ${vsum.uniqueHosts} hosts; ` +
@@ -411,6 +474,8 @@ async function main() {
   let announcedMode = null;
   const takeNotices = () => {
     const out = [];
+    // Plain-flags: the mode on every tool result (spec v8 §5.6).
+    if (plain) out.push(plainflagsMode.MODE_LINE);
     if (announcedMode !== mode) {
       out.push(modeAnnouncement(mode, project));
       announcedMode = mode;
@@ -422,6 +487,56 @@ async function main() {
     const text = `[browser-mcp-relay] BLOCKED a Meta page (${host}) in this browser. Relay browsers never open Instagram/Facebook/Meta pages — use the Instagram/Meta Graph API, or the account owner's phone.`;
     if (!pendingNotices.includes(text)) pendingNotices.push(text);
   };
+  const pushNotice = (text) => { if (!pendingNotices.includes(text)) pendingNotices.push(text); };
+  const noteSigninBlocked = (host, account) => pushNotice(
+    `[browser-mcp-relay] BLOCKED a login page (${host}) in the plain-flags browser${account ? `: "${account}" is not on the sign-in list` : ""}. A known account's login is refused here until Trevor names it (plainflags-signin.json, his GO); use its API or the default relay.`,
+  );
+
+  // -- Plain-flags sign-in list, guard policy and shared click count (§5.6) --
+  let signinLoader = null;
+  let signinPolicy = null;
+  let clickCounter = null;
+  if (plain) {
+    const signinFile = (pfFixture && pfFixture.signinFile) || SIGNIN_FILE;
+    if (!(pfFixture && pfFixture.signinFile)) {
+      plainflagsMode.ensureSigninFile(signinFile, (m) => process.stderr.write(`[mcp-relay] ${m}\n`));
+    }
+    signinLoader = createSigninLoader({ path: signinFile });
+    // An entry counts only when its claude-ask record grants it (read-only).
+    const asks = createAskVerifier({
+      ...((pfFixture && pfFixture.asksDir) ? { root: pfFixture.asksDir } : {}),
+      requireTypedAnswer: plainflagsMode.requireTypedAnswer(process.env),
+    });
+    signinPolicy = createSigninPolicy({ accounts: (pfFixture && pfFixture.accounts) || KNOWN_ACCOUNTS, loader: signinLoader, verifyAsk: asks.verify });
+    clickCounter = createClickCounter({ root: pool.plainflagsProfilesRoot() });
+    challengeClick.configure({ counter: clickCounter });
+    cfCookiesClear.configure({ signin: signinLoader, accounts: signinPolicy.accounts, listedNames: () => signinPolicy.names() });
+    process.stderr.write(`[mcp-relay] PLAIN-FLAGS mode: sign-in list ${signinFile} (${signinPolicy.names().size} account(s) listed and verified); known accounts: ${signinPolicy.accounts.map((a) => a.name).join(", ")}\n`);
+  }
+  // The default relay classifies with the same VERIFIED list (no guard there).
+  const classifyList = signinPolicy || createSigninPolicy({ loader: createSigninLoader(), verifyAsk: createAskVerifier({ requireTypedAnswer: plainflagsMode.requireTypedAnswer(process.env) }).verify });
+  challengeDetect.configure({ mode: profileMode, signin: signinLoader, clicks: clickCounter, listedNames: () => classifyList.names() });
+  // §5.6 (14): each top-level navigation in this mode, host + time only.
+  const navLog = plain ? new ReapLog({ file: path.join(cacheRoot, "plainflags-navigations.log"), slug: project }) : null;
+  function installNavigationLog(context) {
+    const seen = new WeakSet();
+    const watch = (page) => {
+      if (seen.has(page)) return;
+      seen.add(page);
+      page.on("framenavigated", (frame) => {
+        if (frame !== page.mainFrame()) return;
+        let host;
+        try {
+          const u = new URL(frame.url());
+          if (u.protocol !== "http:" && u.protocol !== "https:") return;
+          host = u.hostname.toLowerCase();
+        } catch { return; }
+        navLog.write("navigation", { host });
+      });
+    };
+    for (const pg of context.pages()) watch(pg);
+    context.on("page", watch);
+  }
 
   // Status sidecar (spec v4 §1c) — cdpPort/bravePid for external consumers.
   const sidecar = new StatusSidecar({ dir, mode, onTick: () => checkRecordConflict() });
@@ -452,6 +567,18 @@ async function main() {
     return guard;
   }
 
+  async function armSigninGuard(l) {
+    const guard = await installSigninGuard({
+      wsEndpoint: l.wsEndpoint,
+      policy: signinPolicy,
+      log: (m) => process.stderr.write(`[mcp-relay] ${m}\n`),
+      onBlocked: noteSigninBlocked,
+    });
+    l.signinGuard = guard;
+    return guard;
+  }
+  let signinReinstallPromise = null;
+
   async function ensureBrave() {
     // BACKLOG "A Brave relaunched during a SIGTERM shutdown is never closed"
     // (spec v4 amendment 4): no launch or attach once shutdown has begun.
@@ -466,6 +593,14 @@ async function main() {
           guardReinstallPromise = armMetaGuard(b).finally(() => { guardReinstallPromise = null; });
         }
         await guardReinstallPromise;
+      }
+      if (plain && bridge.signinGuard && !bridge.signinGuard.alive()) {
+        const b = bridge;
+        if (!signinReinstallPromise) {
+          process.stderr.write(`[mcp-relay] plain-flags sign-in guard session lost — re-arming\n`);
+          signinReinstallPromise = armSigninGuard(b).finally(() => { signinReinstallPromise = null; });
+        }
+        await signinReinstallPromise;
       }
       return bridge;
     }
@@ -528,7 +663,7 @@ async function main() {
         } catch (reapErr) {
           process.stderr.write(`[mcp-relay] pre-launch reap failed (continuing): ${reapErr.message}\n`);
         }
-        const extensionPath = RELAY_ENV.BROWSER_LOAD_EXTENSIONS || null;
+        const extensionPath = launchInputs.extensionPath;
         // V0-1/V0-2: launchBrave resolves with a live Brave subprocess +
         // open BrowserContext. If anything between here and the bridge
         // assignment throws (attachAutofill exception, an exception in the
@@ -545,7 +680,8 @@ async function main() {
           headless: RELAY_ENV.BROWSER_HEADLESS_ENABLE === "true",
           extensionPath,
           executablePath: bravePath,
-          proxyUrl: RELAY_ENV.BROWSER_RELAY_PROXY_URL || pool.CONFIG.proxyUrl || null,
+          proxyUrl: launchInputs.proxyUrl,
+          profileMode,
         });
         }
         // Shutdown began while we were launching/attaching: this Brave would
@@ -565,7 +701,7 @@ async function main() {
           // creates via CDP attach share this context, so the framenavigated
           // event fires for them too — autofill works for both relay-driven
           // and BDMCP-driven navigations. No-op when the vault is empty.
-          attachAutofill(l.context, vault, (msg) => process.stderr.write(msg + "\n"));
+          if (vault) attachAutofill(l.context, vault, (msg) => process.stderr.write(msg + "\n"));
           // Meta guard, layers 2 + 3 — for EVERY Brave generation, attached
           // ones included. Fail closed: no guard, no browser.
           const guard = await armMetaGuard(l);
@@ -575,6 +711,23 @@ async function main() {
             log: (m) => process.stderr.write(`[mcp-relay] ${m}\n`),
           });
           void guard;
+          if (plain) {
+            // Sign-in guard layer 2 + the watchdog (§5.6 (6)(b), (h)); then (c)
+            // before the first tool call: every not-listed known account's
+            // cookies and storage are cleared. Fail closed: a throw closes
+            // this Brave (attachWithCleanupOnError).
+            const sg = await armSigninGuard(l);
+            installSigninWatchdog(l.context, {
+              policy: signinPolicy,
+              recentlyBlocked: (url) => !!(l.signinGuard && l.signinGuard.recentlyBlocked(url)),
+              onBlocked: (host) => noteSigninBlocked(host, null),
+              log: (m) => process.stderr.write(`[mcp-relay] ${m}\n`),
+            });
+            const cleared = await sg.clearAccounts(signinPolicy.notListed(), "launch");
+            const failed = cleared.filter((c) => c.errors.length > 0);
+            if (failed.length > 0) throw new Error(`[mcp-relay] plain-flags launch clear failed for ${failed.map((c) => c.account).join(", ")}: ${failed.flatMap((c) => c.errors).join("; ")}`);
+            installNavigationLog(l.context);
+          }
           // Make the bridge available to own-tool handlers via globalThis.
           // Shape: { context, cdpConnectUrl, port, wsEndpoint, bravePid } — tool
           // handlers (lighthouse_audit: port; tabs_*: bravePid, to raise a tab
@@ -643,6 +796,7 @@ async function main() {
       globalThis.__relayBridge = null;
     }
     if (l.metaGuard) { try { l.metaGuard.close(); } catch {} }
+    if (l.signinGuard) { try { l.signinGuard.close(); } catch {} }
     sidecar.update({ braveAlive: false, cdpPort: null, bravePid: null }, { force: true });
   }
 
@@ -845,7 +999,7 @@ async function main() {
 
   // relay_status's payload (own-tools/relay-status.js). Reads records and
   // sidecars only — never launches Brave or claims anything.
-  globalThis.__relayStatus = async () => (checkRecordConflict(), buildRelayStatus({
+  globalThis.__relayStatus = async () => (checkRecordConflict(), await refreshLock(), withPlainflagsStatus(buildRelayStatus({
     self: {
       sessionId: sidecar.data.sessionId,
       braveAlive: !!bridge,
@@ -859,18 +1013,59 @@ async function main() {
     clonesRoot: pool.sessionClonesRoot(),
     cloneBelongsTo: pool.cloneBelongsTo,
     metaGuard: bridge ? (bridge.metaGuard && bridge.metaGuard.alive() ? "active" : "down (re-armed on the next browser call)") : "not installed yet (no Brave)",
-  }));
+  })));
+  /** relay_status re-probes the lock when a Brave is up (it never launches one). */
+  async function refreshLock() {
+    // `policy` is declared below; relay_status only runs after it exists.
+    if (!plain || !bridge || !policy) return;
+    try { await policy.lock.probe(); } catch { /* status shows the last state */ }
+  }
+  /** Plain-flags fields on relay_status (the default relay's payload is unchanged). */
+  function withPlainflagsStatus(st) {
+    if (!plain) return st;
+    const sl = signinPolicy.status();
+    return {
+      ...st,
+      profileMode: "plainflags",
+      // `accounts` = listed AND verified against its claude-ask record; `refused` = entries that were not.
+      signinList: { file: signinLoader.path, accounts: sl.listed, refused: sl.refused, problem: sl.problem, recentChanges: sl.recentChanges },
+      signinGuard: bridge ? (bridge.signinGuard && bridge.signinGuard.alive() ? "active" : "down (re-armed on the next browser call)") : "not installed yet (no Brave)",
+      toolList: plainflagsMode.TOOL_ALLOWLIST,
+      lock: policy ? policy.lock.status() : null,
+      note: "Accident guards, not a security boundary: any local process can drive this Brave over its debugging port.",
+    };
+  }
   sidecar.start();
 
   // 4. Run MCP server (NO Brave, NO upstream yet — both spawn lazily).
-  const relay = new RelayServer({ getUpstream, ensureBrave, takeNotices });
+  const policy = plain
+    ? createPlainflagsPolicy({
+      signin: signinPolicy,
+      getGuard: () => (bridge && bridge.signinGuard) || null,
+      getUpstream,
+      notice: pushNotice,
+      log: (m) => process.stderr.write(`[mcp-relay] ${m}\n`),
+      // Review round 4 L7: screenshots go to a relay-private dir in this profile.
+      screenshotDir: path.join(dir, ".relay-screenshots"),
+      // Review round 3 A: the lock over every tab of THIS relay's Brave.
+      lock: createLock({
+        getContext: () => (bridge ? bridge.context : null),
+        accounts: signinPolicy.accounts,
+        notice: pushNotice,
+        log: (m) => process.stderr.write(`[mcp-relay] ${m}\n`),
+      }),
+    })
+    : null;
+  const relay = new RelayServer({ getUpstream, ensureBrave, takeNotices, policy });
   // Register Phase C own-tools. Each entry in ownTools is
-  // { name, description, inputSchema, handler }.
-  for (const tool of ownTools) {
+  // { name, description, inputSchema, handler }. challenge_click and
+  // cf_cookies_clear exist only in the plain-flags relay (§5.6 (8), (9)).
+  const registered = plain ? [...ownTools, ...plainflagsTools] : ownTools;
+  for (const tool of registered) {
     relay.registerOwnTool(tool);
   }
-  if (ownTools.length > 0) {
-    process.stderr.write(`[mcp-relay] registered ${ownTools.length} own-tools: ${ownTools.map(t => t.name).join(", ")}\n`);
+  if (registered.length > 0) {
+    process.stderr.write(`[mcp-relay] registered ${registered.length} own-tools: ${registered.map(t => t.name).join(", ")}\n`);
   }
 
   // 4b. Optional in-process Inspector. When BROWSER_RELAY_INSPECTOR_PORT is
@@ -911,7 +1106,7 @@ async function main() {
 
   const server = new Server(
     { name: "browser-mcp-relay", version: "0.1.0" },
-    { capabilities: { tools: {} }, instructions: RELAY_INSTRUCTIONS },
+    { capabilities: { tools: {} }, instructions: plain ? RELAY_INSTRUCTIONS_PLAINFLAGS : RELAY_INSTRUCTIONS },
   );
   // bumpActivity on entry AND exit of every request so a long-running call
   // (lighthouse can take minutes) never has the reaper fire mid-flight or
@@ -1038,6 +1233,7 @@ async function main() {
         const b = bridge;
         tasks.push(withTimeout(claim.cleanup ? closeBraveHard(b) : closeBrave(b), 8000, "closeBrave"));
         if (b.metaGuard) { try { b.metaGuard.close(); } catch {} }
+        if (b.signinGuard) { try { b.signinGuard.close(); } catch {} }
       }
       if (inspectorHandle) tasks.push(withTimeout(inspectorHandle.close(), 3000, "inspector"));
       const results = await Promise.all(tasks);

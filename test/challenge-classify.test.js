@@ -153,11 +153,11 @@ test("parseCurlHead keeps only the skill's header list — never set-cookie", ()
 
 // ── plainflagsEligible / route ──────────────────────────────────────────────
 
-test("phase 1: plainflagsEligible false with reason not-built for EVERY owner and kind; route never switch/try", () => {
-  assert.strictEqual(c.PLAINFLAGS_BUILT, false, "the 1c build flips this, not phase 1");
+test("phase 1c: PLAINFLAGS_BUILT is on; the not-built branch (built: false) still gives not-built for EVERY owner and kind", () => {
+  assert.strictEqual(c.PLAINFLAGS_BUILT, true, "phase 1c builds the plain-flags profile (D22 passed 2026-10-30)");
   for (const o of c.OWNERS) {
     for (const k of c.KINDS) {
-      const r = c.decideRoute({ owner: o, kind: k, url: "https://x.example.com/" });
+      const r = c.decideRoute({ owner: o, kind: k, url: "https://x.example.com/", built: false });
       assert.strictEqual(r.plainflagsEligible, false, `${o}/${k}`);
       assert.strictEqual(r.reason, "not-built", `${o}/${k}`);
       assert.ok(!/switch|plainflags-try/.test(r.route), `${o}/${k} → ${r.route}`);
@@ -167,9 +167,11 @@ test("phase 1: plainflagsEligible false with reason not-built for EVERY owner an
   }
 });
 
-test("mode built: HighLevel turnstile → switch-to-plainflags-server (default) / plainflags-try (plain-flags)", () => {
+test("mode built: HighLevel turnstile → default relay keeps the BASE route + switchTo (round 1 item 4) / plainflags-try (plain-flags)", () => {
   const d = c.decideRoute({ owner: "highlevel", kind: "turnstile", url: "https://go.example.com/form", built: true, mode: "default" });
-  assert.deepStrictEqual([d.plainflagsEligible, d.reason, d.route, d.clickBudget], [true, "eligible", "switch-to-plainflags-server", 0]);
+  assert.deepStrictEqual([d.plainflagsEligible, d.reason, d.route, d.clickBudget, d.switchTo, d.plainflagsServer],
+    [true, "eligible", "in-page-turnstile", 0, "browser-mcp-relay-plainflags", "available-if-registered"]);
+  assert.ok(!("fallbackRoute" in d));
   const p = c.decideRoute({ owner: "highlevel", kind: "turnstile", url: "https://go.example.com/form", built: true, mode: "plainflags", clickSpent: false });
   assert.deepStrictEqual([p.plainflagsEligible, p.route, p.clickBudget], [true, "plainflags-try", 1]);
   // no click count wired (the default) → no click budget
@@ -392,4 +394,20 @@ test("r2 #2: only a challenge frame visible, its parent a non-GHL frame → that
 test("r2 #4: a DNS answer longer than 253 chars is dropped", () => {
   const d = c.parseDig("a".repeat(300) + ".example.\n" + "ok.example.\n");
   assert.deepStrictEqual(d.cnames, ["ok.example"]);
+});
+
+// ── F1 (phase-1 accepted MEDIUM, fixed in 1c) ───────────────────────────────
+
+test("F1: a visible challenge frame needs a marked, FILLED parent with enough filled tokens — a hidden second widget is a wall", () => {
+  const top = { id: 0, isTop: true, host: "go.example.com" };
+  const form = (inputs) => ({ id: 1, parentId: 0, host: "api.leadconnectorhq.com", turnstileInputs: inputs });
+  const chl = (id, parentId = 1, extra = {}) => ({ id, parentId, challengeFrame: true, host: "challenges.cloudflare.com", ...extra });
+  assert.strictEqual(c.turnstilePassed([top, form([700]), chl(2)]), true, "one widget, filled (the invisible-mode GHL case)");
+  assert.strictEqual(c.turnstilePassed([top, form([700]), chl(2), chl(3)]), false, "two challenge frames under one filled token: the second widget's input is hidden (closed shadow root)");
+  assert.strictEqual(c.turnstilePassed([top, form([700, 650]), chl(2), chl(3)]), true);
+  assert.strictEqual(c.turnstilePassed([top, form([700]), { id: 3, parentId: 0, host: "x.example" }, chl(4, 3)]), false, "parent frame has no markers (its widget timed out / is hidden)");
+  assert.strictEqual(c.turnstilePassed([top, form([700]), chl(2, null)]), false, "parent not in the scan → fail closed");
+  assert.strictEqual(c.turnstilePassed([top, form([700]), { id: 2, challengeFrame: true, host: "challenges.cloudflare.com" }]), false, "no parentId at all → fail closed");
+  assert.strictEqual(c.turnstilePassed([top, form([700]), chl(2), chl(3, 1, { visible: false })]), true, "a challenge frame with no box is left out");
+  assert.strictEqual(c.tryOutcome("turnstile", [top, form([700]), chl(2), chl(3)]), "failed", "the outcome line uses the same rule");
 });

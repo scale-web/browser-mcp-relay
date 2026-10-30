@@ -70,13 +70,13 @@ function snapshot() {
     // session creates a clone; record the dir's inode, and its children below.
     put(p, typeof sig === "object" && sig.size === null ? { ino: sig.ino } : sig);
   }
-  for (const sub of ["profiles", "session-clones"]) {
+  for (const sub of ["profiles", "session-clones", "profiles-plainflags", "session-clones-plainflags"]) {
     const root = path.join(REAL_CACHE_ROOT, sub);
     for (const name of listNames(root) || []) {
       const d = path.join(root, name);
       const sig = lstatSig(d);
       put(d, typeof sig === "object" ? { ino: sig.ino } : sig);
-      if (sub === "profiles") {
+      if (sub === "profiles" || sub === "profiles-plainflags") {
         for (const lock of LOCK_NAMES) put(path.join(d, lock), lstatSig(path.join(d, lock)));
       }
     }

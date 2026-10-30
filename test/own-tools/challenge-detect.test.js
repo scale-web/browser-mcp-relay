@@ -167,7 +167,10 @@ test("(i) go.revivemyhair.com Turnstile in the form's cross-origin iframe → hi
   assert.strictEqual(body.row, 1);
   assert.strictEqual(body.ownerFrom, "frame api.leadconnectorhq.com");
   assert.strictEqual(body.kind, "turnstile");
-  assert.deepStrictEqual([body.plainflagsEligible, body.reason, body.route, body.clickBudget], [false, "not-built", "in-page-turnstile", 0]);
+  // Phase 1c, default relay: route unchanged from phase 1; the plain-flags server only suggested (round 1 item 4).
+  assert.deepStrictEqual([body.plainflagsEligible, body.reason, body.route, body.clickBudget, body.switchTo, body.plainflagsServer],
+    [true, "eligible", "in-page-turnstile", 0, "browser-mcp-relay-plainflags", "available-if-registered"]);
+  assert.ok(!body.notes.some((n) => /repeat this step/i.test(n)), "no note telling the session to use a server it may not have");
   assert.strictEqual(body.guidance.length, 3, "the §2 in-page branch: page-verify / backend via API / human step");
   assert.deepStrictEqual(body.errorCodes, ["600010"]);
   assert.ok(body.signals.frames.some((f) => f.challengeFrame && f.host === "challenges.cloudflare.com"));
@@ -205,7 +208,7 @@ test("(i) a *.scale-265.workers.dev interstitial → workersdev/report", async (
 test("(i) an agency-zone interstitial → agency, §3.3 (config bug)", async () => {
   setup({ url: "https://www.walletreminder.com/", head: HEADS.interstitial, pageOpts: { top: { title: "Just a moment..." } } });
   const { body } = await call({ lane: "L" });
-  assert.deepStrictEqual([body.owner, body.route, body.reason], ["agency", "§3.3", "not-built"]);
+  assert.deepStrictEqual([body.owner, body.route, body.reason], ["agency", "§3.3", "owner-route"]);
 });
 
 test("(i) a Shopify store with no wall → shopify/none, nothing appended", async () => {
@@ -219,7 +222,7 @@ test("(i) a Shopify store with no wall → shopify/none, nothing appended", asyn
 test("(i) a Shopify 429 → shopify/ratelimit, logged", async () => {
   setup({ url: "https://alaunderscrubs.com/cart", head: HEADS.shopify429, pageOpts: { top: { navStatus: 429 } } });
   const { body } = await call({ lane: "ALAUN-2" });
-  assert.deepStrictEqual([body.owner, body.kind, body.reason], ["shopify", "ratelimit", "not-built"]);
+  assert.deepStrictEqual([body.owner, body.kind, body.reason], ["shopify", "ratelimit", "owner-route"]);
   assert.strictEqual(logLines().length, 1);
 });
 
@@ -251,7 +254,7 @@ test("(i) a known account's login page is flagged in the raw signals", async () 
   setup({ url: "https://www.canva.com/login", head: HEADS.interstitial, pageOpts: { top: { title: "Just a moment..." } } });
   const { body } = await call({ lane: "L" });
   assert.strictEqual(body.signals.loginPageOf, "canva");
-  assert.strictEqual(body.reason, "not-built", "not-built wins in phase 1");
+  assert.deepStrictEqual([body.reason, body.plainflagsEligible], ["signin-not-listed", false], "a known account's login is never eligible while not listed");
 });
 
 test("(i) runs the REAL in-page probe: markers counted, token reported by length only", async () => {
@@ -420,11 +423,11 @@ test("lines carry the passed lane and are appended, never rewritten", async () =
 
 // ── the plain-flags switch, with the build constant on (the 1c path) ────────
 
-test("built mode (seam): HighLevel → switch-to-plainflags-server in default mode; sign-in list respected", async () => {
+test("built mode (seam): HighLevel → base route + switchTo in default mode; sign-in list respected", async () => {
   setup({ url: "https://go.example.com/f", head: HEADS.ghl, pageOpts: { top: { turnstileInputs: [0] } } });
   tool._setDeps({ built: true });
   let { body } = await call({ lane: "L" });
-  assert.deepStrictEqual([body.plainflagsEligible, body.reason, body.route], [true, "eligible", "switch-to-plainflags-server"]);
+  assert.deepStrictEqual([body.plainflagsEligible, body.reason, body.route, body.switchTo], [true, "eligible", "in-page-turnstile", "browser-mcp-relay-plainflags"]);
   setup({ url: "https://auth.hostinger.com/login", head: HEADS.interstitial, pageOpts: { top: { title: "Just a moment..." } } });
   tool._setDeps({ built: true });
   ({ body } = await call({ lane: "L" }));
@@ -435,12 +438,12 @@ test("built mode (seam): HighLevel → switch-to-plainflags-server in default mo
   assert.deepStrictEqual([body.plainflagsEligible, body.reason], [true, "eligible"]);
 });
 
-test("(iii) outcome is refused while the plain-flags profile is not built (production default) — nothing read or appended", async () => {
+test("(iii) outcome is refused in the DEFAULT relay (configure mode default, as index.js wires it) — nothing read or appended", async () => {
   setup({ url: "https://www.canva.com/", head: HEADS.vendor, jar: [JAR[0]] });
-  tool._setDeps({ outcomeEnabled: require("../../src/challenge-classify.js").PLAINFLAGS_BUILT });
+  tool.configure({ mode: "default" });
   const r = await tool.handler({ lane: "L", origin: "https://www.canva.com", stage: "outcome" });
   assert.strictEqual(r.isError, true);
-  assert.match(r.content[0].text, /not built yet/);
+  assert.match(r.content[0].text, /only the plain-flags relay/);
   assert.strictEqual(calls.cookies, 0, "nothing was read");
   assert.strictEqual(logText(), null, "nothing was appended");
   teardown();
@@ -482,7 +485,7 @@ test("r1 #2: a GHL form frame on an agency site → highlevel, never agency (no 
     children: [frame("https://api.leadconnectorhq.com/widget/form/abc", { turnstileInputs: [0] })],
   } });
   const { body } = await call({ lane: "L" });
-  assert.deepStrictEqual([body.owner, body.ownerFrom, body.route], ["highlevel", "frame api.leadconnectorhq.com", "in-page-turnstile"]);
+  assert.deepStrictEqual([body.owner, body.ownerFrom, body.route, body.switchTo], ["highlevel", "frame api.leadconnectorhq.com", "in-page-turnstile", "browser-mcp-relay-plainflags"]);
   assert.match(logLines()[0], /\| www\.revivemyhair\.com \| highlevel \| detected turnstile; next in-page-turnstile$/);
   assert.ok(!logText().includes("| agency |"));
 });
@@ -546,7 +549,7 @@ test("r1 #11a: the PRODUCTION default refuses stage outcome (no dep overrides)",
   globalThis.__relayBridge = { context: { pages: () => [] } };
   const r = await tool.handler({ lane: "L", origin: "https://www.canva.com", stage: "outcome" });
   assert.strictEqual(r.isError, true);
-  assert.match(r.content[0].text, /not built yet/);
+  assert.match(r.content[0].text, /only the plain-flags relay/);
 });
 
 test("r1 #11b: a host dig would read as an option (-x.example) never reaches dig", async () => {
@@ -650,4 +653,51 @@ test("r2 #8: the same lane + host + owner within 60 s appends nothing; after 60 
   t += 1000; // 60 s after the first
   assert.strictEqual((await call({ lane: "L" })).body.log.logged, true);
   assert.strictEqual(logLines().length, 3);
+});
+
+// ── F1 through the scan: ids / parentId from the frame tree ─────────────────
+
+test("F1 (scan): frames carry id/parentId; a filled form with TWO challenge frames (one widget's input hidden) is a wall, logged", async () => {
+  const top = frame("https://go.example.com/book", { title: "Book" });
+  const form = frame("https://api.leadconnectorhq.com/widget/form/x", { turnstileInputs: [TOKEN.length] });
+  form.parentFrame = () => top;
+  const chl = (vis) => ({ url: () => "https://challenges.cloudflare.com/x", parentFrame: () => form, evaluate: async () => { throw new Error("never"); },
+    frameElement: async () => ({ boundingBox: async () => (vis ? { x: 0, y: 0, width: 300, height: 65 } : null) }) });
+  const pg = (children) => ({ url: () => "https://go.example.com/book", mainFrame: () => top, frames: () => [top, form, ...children], isClosed: () => false, once() {} });
+  setup({ head: HEADS.ghl });
+  globalThis.__relayBridge = { context: { pages: () => [pg([chl(true)])] } };
+  setActivePage(pg([chl(true)]));
+  let { body } = await call({ lane: "L" });
+  assert.strictEqual(body.turnstilePassed, true, "one widget, filled");
+  assert.deepStrictEqual(body.signals.frames.map((f) => [f.id, f.parentId]), [[0, null], [1, 0], [2, 1]]);
+  assert.strictEqual(body.signals.frames[2].visible, true);
+  const p2 = pg([chl(true), chl(true)]);
+  globalThis.__relayBridge = { context: { pages: () => [p2] } };
+  setActivePage(p2);
+  ({ body } = await call({ lane: "L" }));
+  assert.strictEqual(body.turnstilePassed, false, "F1: the second widget is not proven solved");
+  assert.strictEqual(body.log.logged, true);
+  const p3 = pg([chl(true), chl(false)]);
+  globalThis.__relayBridge = { context: { pages: () => [p3] } };
+  setActivePage(p3);
+  ({ body } = await call({ lane: "L2" }));
+  assert.strictEqual(body.turnstilePassed, true, "a challenge frame with no box does not count");
+});
+
+test("configure(): plain-flags mode → plainflags-try with clickBudget from the shared count; default → switch, budget 0, outcome refused", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cfdetect-clicks-"));
+  const { createClickCounter } = require("../../src/challenge-clicks.js");
+  const clicks = createClickCounter({ root: dir });
+  setup({ url: "https://www.canva.com/", head: HEADS.interstitial, pageOpts: { top: { title: "Just a moment..." } } });
+  tool.configure({ mode: "plainflags", signin: createSigninLoader({ path: path.join(tmp, "plainflags-signin.json") }), clicks });
+  let { body } = await call({ lane: "L" });
+  assert.deepStrictEqual([body.route, body.clickBudget, body.fallbackRoute], ["plainflags-try", 1, "§3.4"]);
+  clicks.claim("www.canva.com", "L");
+  ({ body } = await call({ lane: "L2" }));
+  assert.strictEqual(body.clickBudget, 0, "spent by any plain-flags relay → no budget");
+  tool.configure({ mode: "default" });
+  ({ body } = await call({ lane: "L3" }));
+  assert.deepStrictEqual([body.route, body.clickBudget, body.switchTo], ["§3.4", 0, "browser-mcp-relay-plainflags"]);
+  const r = await tool.handler({ lane: "L", origin: "https://www.canva.com", stage: "outcome" });
+  assert.strictEqual(r.isError, true);
 });

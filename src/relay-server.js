@@ -73,7 +73,7 @@ class TrafficEmitter extends EventEmitter {
 }
 
 class RelayServer {
-  constructor({ getUpstream, ensureBrave, trafficEmitter, takeNotices } = {}) {
+  constructor({ getUpstream, ensureBrave, trafficEmitter, takeNotices, policy } = {}) {
     if (typeof getUpstream !== "function") {
       throw new Error("RelayServer: constructor expects { getUpstream } async function");
     }
@@ -87,6 +87,10 @@ class RelayServer {
     // consumed when a result is actually returned, so a thrown call never
     // swallows one.
     this.takeNotices = typeof takeNotices === "function" ? takeNotices : () => [];
+    // Plain-flags mode only (src/plainflags-policy.js, spec v8 §5.6): the tool
+    // allowlist, the sign-in guard's layer 1 and the typed-secret / body limits.
+    // The default relay passes none, and every path below is then unchanged.
+    this.policy = policy || null;
     this.ownTools = new Map(); // name → { name, description, inputSchema, handler, needsBrave }
     // Traffic emitter is always present so call sites don't need null-guards.
     // If the caller doesn't pass one, we make our own (no subscribers = no
@@ -153,7 +157,8 @@ class RelayServer {
         );
       }
     }
-    return { tools: [...upstreamTools, ...ownTools] };
+    const all = [...upstreamTools, ...ownTools];
+    return { tools: this.policy ? this.policy.filterToolsList(all) : all };
   }
 
   async handleToolsCall({ name, arguments: args }) {
@@ -191,8 +196,17 @@ class RelayServer {
       // Meta guard layer 1 (spec v4 §1d): refuse Meta URLs and Meta cookies
       // before any browser work — the agent gets the route, not a 403 page.
       const blocked = metaGuard.checkToolArgs(name, args);
+      let pre = null;
+      if (!blocked && this.policy) {
+        pre = await this.policy.beforeCall(name, args || {}, {
+          ensureBrave: async () => { if (this.ensureBrave && (!isOwn || own.needsBrave)) await this.ensureBrave(); },
+        });
+        if (!pre.refusal) args = pre.args;
+      }
       if (blocked) {
         response = blocked;
+      } else if (pre && pre.refusal) {
+        response = pre.refusal;
       } else if (isOwn) {
         // Own-tool handlers read globalThis.__relayBridge. ensureBrave
         // populates that — except for tools that never touch the browser
@@ -237,13 +251,20 @@ class RelayServer {
           }
         }
       }
+      if (this.policy && !blocked && !(pre && pre.refusal)) response = await this.policy.afterCall(name, response);
       if (response && response.isError) status = "error";
       const notices = response && Array.isArray(response.content) ? this.takeNotices() : [];
       if (notices.length > 0) {
         response = { ...response, content: [...notices.map((text) => ({ type: "text", text })), ...response.content] };
       }
-    } catch (e) {
+    } catch (e0) {
       // Forwarded-path failures bubble up as caller errors. Record + rethrow.
+      // Plain-flags (review round 4 L8): the message is filtered first (call
+      // log cut, lock withhold) — for the client AND the Inspector feed.
+      let e = e0;
+      if (this.policy && typeof this.policy.filterThrown === "function") {
+        try { e = await this.policy.filterThrown(name, e0); } catch { e = new Error("[mcp-relay] the call failed (its error was withheld: the plain-flags filter failed)"); }
+      }
       status = "error";
       const durationMs = Number(process.hrtime.bigint() - startHr) / 1_000_000;
       const responseEvent = {

@@ -51,10 +51,10 @@ const OWNER_ROUTE = Object.freeze({
   none: "none",
 });
 
-// The plain-flags mode is not built (D22: measured first, phase 1b; built in
-// 1c only if that passes). The 1c build flips this; until then every
-// plainflagsEligible is false with reason `not-built`.
-const PLAINFLAGS_BUILT = false;
+// The plain-flags mode exists in this relay build (spec v8 §5.6, phase 1c —
+// built after the D22 measurement PASSED on 2026-10-30). Phase 1 shipped it
+// false (every plainflagsEligible false, reason `not-built`).
+const PLAINFLAGS_BUILT = true;
 
 // Bounds on anything read from curl, dig or the page (review r2 #4).
 const MAX_HOST_LEN = 253;
@@ -156,13 +156,35 @@ function classifyKind({ frames = [], navStatus = null } = {}) {
  * A Turnstile has passed — not a wall (review r1 #7) — only when EVERY frame
  * showing a widget holds a token input and every such input is filled
  * (review r2 #3): one filled form beside an unsolved one is still a wall.
+ *
+ * And (phase-1 accepted MEDIUM F1, fixed in 1c): every VISIBLE
+ * challenges.cloudflare.com frame must hang under a marked, filled frame that
+ * holds at least as many filled token inputs as it has visible challenge
+ * frames. A widget whose input the scan cannot see (a closed shadow root, a
+ * frame that timed out) still shows its challenge frame, so a second, unsolved
+ * widget next to a solved one no longer reads as passed. A challenge frame
+ * whose parent is not in the scan (`parentId` missing) fails closed; one known
+ * to have no box (`visible: false`) is left out.
  */
 function turnstilePassed(frames) {
-  const marked = (frames || []).filter(hasMarkers);
-  return marked.length > 0 && marked.every((f) => {
+  frames = frames || [];
+  const marked = frames.filter(hasMarkers);
+  const filled = (f) => (f.turnstileInputs || []).filter((n) => n > 0).length;
+  if (!(marked.length > 0 && marked.every((f) => {
     const ins = f.turnstileInputs || [];
     return ins.length > 0 && ins.every((n) => n > 0);
-  });
+  }))) return false;
+  const perParent = new Map();
+  for (const f of frames) {
+    if (!f.challengeFrame || f.visible === false) continue;
+    if (f.parentId === undefined || f.parentId === null) return false;
+    perParent.set(f.parentId, (perParent.get(f.parentId) || 0) + 1);
+  }
+  for (const [pid, n] of perParent) {
+    const parent = frames.find((f) => f.id === pid);
+    if (!parent || !hasMarkers(parent) || filled(parent) < n) return false;
+  }
+  return true;
 }
 
 /** DNS answers that rows 1/2 read: CNAME/A of HighLevel or Shopify. */
@@ -321,9 +343,12 @@ function decideRoute({ owner, kind, url, built = PLAINFLAGS_BUILT, mode = "defau
   const login = matchLoginUrl(url);
   if (login && !signinNames.has(login.account.name)) return no("signin-not-listed", { signinAccount: login.account.name });
   if (mode === "plainflags") {
-    return { plainflagsEligible: true, reason: "eligible", route: "plainflags-try", clickBudget: clickSpent ? 0 : 1 };
+    return { plainflagsEligible: true, reason: "eligible", route: "plainflags-try", clickBudget: clickSpent ? 0 : 1, fallbackRoute: base };
   }
-  return { plainflagsEligible: true, reason: "eligible", route: "switch-to-plainflags-server", clickBudget: 0 };
+  // Default relay (review round 1 item 4): `route` stays the base route — the
+  // phase-1 behaviour — and the plain-flags server is only SUGGESTED, in its
+  // own fields: the session may have no such server (its MCP entry is Trevor's GO).
+  return { plainflagsEligible: true, reason: "eligible", route: base, clickBudget: 0, switchTo: "browser-mcp-relay-plainflags", plainflagsServer: "available-if-registered" };
 }
 
 /** One origin → the cookie-name state of §5.2 from a Storage.getCookies list. */

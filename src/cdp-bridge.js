@@ -13,6 +13,7 @@ const { chromium } = require("playwright-core");
 const WebSocket = require("ws");
 const { applyLocalConfigToEnv } = require("./local-config.js");
 const cdpIdentity = require("./cdp-identity.js");
+const plainflagsMode = require("./plainflags-mode.js");
 
 // ── Test-only launch hook (spec v4 amendment 5) ─────────────────────────────
 // BROWSER_RELAY_TEST_LAUNCH keeps Playwright's --use-mock-keychain (so a test
@@ -209,33 +210,21 @@ async function openFirstWindow(userDataDir, { stopped = () => false } = {}) {
   }
 }
 
+/** BROWSER_RELAY_INSECURE_TLS as launchBrave reads it (the process env). */
+function insecureTlsForced(env = process.env) {
+  const v = env.BROWSER_RELAY_INSECURE_TLS;
+  return Boolean(v) && v !== "0" && v !== "false";
+}
+
 /**
- * Launch Brave for the slot. Returns a handle the caller passes back to
- * closeBrave on shutdown. Call with the profile's flock held, AFTER the
- * attach-first check and the pre-launch reap (this deletes DevToolsActivePort,
- * so a live orphan must have been attached or reaped first).
- *
- * @param {object} opts
- * @param {string} opts.userDataDir — pool slot dir (absolute)
- * @param {boolean} [opts.headless]
- * @param {string|null} [opts.extensionPath] — passed via --load-extension
- * @param {string} [opts.executablePath] — overrides bundled chromium
- * @param {string|null} [opts.proxyUrl] — when set, Brave inherits HTTP_PROXY /
- *   HTTPS_PROXY env so its outbound traffic routes through an HTTP proxy you
- *   control (e.g. a local debug proxy like Charles, mitmproxy, powhttp). The
- *   user's system proxy stays untouched — only this launched Brave opts in.
- * @returns {Promise<{ context, port: number, wsEndpoint: string, cdpConnectUrl: string }>}
+ * The Brave command-line half of the launch options. Pure. The default mode's
+ * output is exactly what launchBrave built before the plain-flags build
+ * (test/plainflags-mode.test.js pins it); plain-flags (spec v8 §5.6 (1)–(3))
+ * adds `--enable-automation` to ignoreDefaultArgs and
+ * `--disable-blink-features=AutomationControlled` to args, after everything
+ * else, and keeps `--remote-debugging-port=0` (D23).
  */
-async function launchBrave({
-  userDataDir,
-  headless = false,
-  extensionPath = null,
-  executablePath,
-  proxyUrl = null,
-}) {
-  cdpIdentity.requireAbsoluteDir(userDataDir);
-  const testLaunch = testLaunchRequested();
-  if (testLaunch) assertTestLaunchAllowed(userDataDir);
+function buildLaunchArgs({ headless = false, extensionPath = null, testLaunch = false, platform = process.platform, mode = plainflagsMode.DEFAULT } = {}) {
   // Port 0: never a fixed port. Two Braves can no longer be handed the same
   // number, so neither can fall back to [::1] and be mistaken for the other.
   // No --remote-debugging-address: Brave binds 127.0.0.1.
@@ -261,7 +250,7 @@ async function launchBrave({
   // appends a positional about:blank for persistent contexts — drop it, or
   // Brave opens that as a normal, activating window.
   // macOS only: that is where the focus steal happens and was measured.
-  const backgroundFirstWindow = !headless && process.platform === "darwin";
+  const backgroundFirstWindow = !headless && platform === "darwin";
   if (backgroundFirstWindow) {
     args.push("--no-startup-window");
     ignoreDefaultArgs.push("about:blank");
@@ -271,13 +260,61 @@ async function launchBrave({
     args.push(`--disable-extensions-except=${extensionPath}`);
     ignoreDefaultArgs.push("--disable-extensions");
   }
+  if (mode === plainflagsMode.PLAINFLAGS) {
+    ignoreDefaultArgs.push(...plainflagsMode.PLAINFLAGS_IGNORE_DEFAULT_ARGS);
+    args.push(...plainflagsMode.PLAINFLAGS_ARGS);
+  }
+  return { args, ignoreDefaultArgs, backgroundFirstWindow };
+}
+
+/**
+ * Launch Brave for the slot. Returns a handle the caller passes back to
+ * closeBrave on shutdown. Call with the profile's flock held, AFTER the
+ * attach-first check and the pre-launch reap (this deletes DevToolsActivePort,
+ * so a live orphan must have been attached or reaped first).
+ *
+ * @param {object} opts
+ * @param {string} opts.userDataDir — pool slot dir (absolute)
+ * @param {boolean} [opts.headless]
+ * @param {string|null} [opts.extensionPath] — passed via --load-extension
+ * @param {string} [opts.executablePath] — overrides bundled chromium
+ * @param {string|null} [opts.proxyUrl] — when set, Brave inherits HTTP_PROXY /
+ *   HTTPS_PROXY env so its outbound traffic routes through an HTTP proxy you
+ *   control (e.g. a local debug proxy like Charles, mitmproxy, powhttp). The
+ *   user's system proxy stays untouched — only this launched Brave opts in.
+ * @param {"default"|"plainflags"} [opts.profileMode] — spec v8 §5.6; the
+ *   plain-flags mode refuses a proxy, insecure TLS or an extension, and
+ *   prepares the profile (password saving off, Login Data* deleted) first.
+ * @returns {Promise<{ context, port: number, wsEndpoint: string, cdpConnectUrl: string }>}
+ */
+async function launchBrave({
+  userDataDir,
+  headless = false,
+  extensionPath = null,
+  executablePath,
+  proxyUrl = null,
+  profileMode = plainflagsMode.DEFAULT,
+}) {
+  cdpIdentity.requireAbsoluteDir(userDataDir);
+  const testLaunch = testLaunchRequested();
+  if (testLaunch) assertTestLaunchAllowed(userDataDir);
+  const { args, ignoreDefaultArgs, backgroundFirstWindow } = buildLaunchArgs({
+    headless, extensionPath, testLaunch, platform: process.platform, mode: profileMode,
+  });
   // TLS-cert acceptance is opt-in: a configured proxy implies a MITM cert,
   // and BROWSER_RELAY_INSECURE_TLS is the explicit override for a transparent
   // corporate proxy. Anything else gets normal certificate validation.
-  const insecureTlsEnv = process.env.BROWSER_RELAY_INSECURE_TLS;
-  const insecureTlsForced = Boolean(insecureTlsEnv) && insecureTlsEnv !== "0" && insecureTlsEnv !== "false";
-  const allowInsecureTls = Boolean(proxyUrl) || insecureTlsForced;
-  if (insecureTlsForced && !proxyUrl) {
+  const insecureTlsForcedNow = insecureTlsForced(process.env);
+  const allowInsecureTls = Boolean(proxyUrl) || insecureTlsForcedNow;
+  if (profileMode === plainflagsMode.PLAINFLAGS) {
+    // Spec v8 §5.6 (13): refuse on the values THIS launch would use.
+    const refusal = plainflagsMode.launchRefusal({ proxyUrl, allowInsecureTls, extensionPath });
+    if (refusal) throw new Error(refusal);
+    // §5.6 (4): password saving off, Login Data* gone — in this relay's own dir.
+    const prep = plainflagsMode.preparePlainflagsProfile(userDataDir);
+    process.stderr.write(`[mcp-relay] plain-flags profile: password-manager prefs written; deleted ${prep.deleted.length} Login Data file(s)\n`);
+  }
+  if (insecureTlsForcedNow && !proxyUrl) {
     process.stderr.write(
       "[mcp-relay] BROWSER_RELAY_INSECURE_TLS set with no proxy — this Brave accepts ANY TLS cert; only do this on a network you trust\n",
     );
@@ -336,6 +373,9 @@ async function launchBrave({
     process.stderr.write(
       `[mcp-relay] proxy whitelist ACTIVE — Brave traffic routes through ${proxyUrl}\n`,
     );
+  }
+  if (profileMode === plainflagsMode.PLAINFLAGS) {
+    for (const k of Object.keys(sanitizedEnv)) if (plainflagsMode.PROXY_ENV_RE.test(k)) delete sanitizedEnv[k];
   }
   launchOpts.env = sanitizedEnv;
 
@@ -473,6 +513,8 @@ async function closeBrave(handle) {
 
 module.exports = {
   launchBrave,
+  buildLaunchArgs,
+  insecureTlsForced,
   attachBrave,
   closeBrave,
   closeBraveHard,

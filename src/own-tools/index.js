@@ -38,4 +38,12 @@ const tools = [
   require("./relay-status.js"),
 ];
 
-module.exports = { tools };
+// Registered ONLY in the plain-flags relay (spec v8 §5.6 (8), (9)): the default
+// relay's rule is zero clicks, and a whole-site cookie clear there would log a
+// lane out. Kept out of `tools` so the default tool list is unchanged.
+const plainflagsTools = [
+  require("./challenge-click.js"),
+  require("./cf-cookies-clear.js"),
+];
+
+module.exports = { tools, plainflagsTools };

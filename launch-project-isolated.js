@@ -33,6 +33,14 @@
  *   under session-clones/, removed at exit.
  * - Effect is per relay launch (next session per project). A project's first
  *   launch under this wrapper starts a FRESH Brave profile → one-time re-login.
+ * - Plain-flags mode (spec v8 §5.6 (4); BROWSER_RELAY_PROFILE_MODE=plainflags in
+ *   the PROCESS env — the `browser-mcp-relay-plainflags` MCP entry's env — never
+ *   a local-config.json key, which is ignored and logged): the profile is
+ *   ~/Library/Caches/browser-mcp-relay/profiles-plainflags/<project-slug>/ — a
+ *   separate root, NEVER written into the registry and never seeded from a
+ *   logged-in profile; a temp-path project gets an ephemeral dir under
+ *   session-clones-plainflags/. The relay itself refuses any other pool dir in
+ *   that mode (src/plainflags-mode.js folderRefusal).
  */
 const fs = require("node:fs");
 const os = require("node:os");
@@ -48,6 +56,14 @@ const slug = (path.basename(proj).replace(/[^a-zA-Z0-9_-]/g, "-").toLowerCase())
 const cacheRoot = path.join(os.homedir(), "Library", "Caches", "browser-mcp-relay");
 const profilesRoot = path.join(cacheRoot, "profiles");
 const regPath = path.join(cacheRoot, "project-registry.json");
+
+// The profile mode, from the process env only (spec v8 §5.6 (13)).
+const plainflagsMode = require(path.join(__dirname, "src", "plainflags-mode.js"));
+{
+  const problem = plainflagsMode.modeProblem(process.env);
+  if (problem) { process.stderr.write(`${problem}\n`); process.exit(1); }
+}
+const profileMode = plainflagsMode.profileMode(process.env);
 
 // The test hook is refused BEFORE this wrapper writes anything (Phase 1 review:
 // with a real HOME it registered the project and created its profile dir, and
@@ -96,7 +112,19 @@ function isTempProject(p) {
 
 let slot;
 let dir;
-if (isTempProject(proj)) {
+if (profileMode === plainflagsMode.PLAINFLAGS) {
+  // Never the registered profile, never the registry (spec v8 §5.6 (4)).
+  if (isTempProject(proj)) {
+    dir = path.join(cacheRoot, plainflagsMode.CLONES_DIRNAME, `${slug}-p${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
+    fs.mkdirSync(dir, { recursive: true });
+    process.env.BROWSER_RELAY_EPHEMERAL_POOL_DIR = "1";
+    process.stderr.write(`[relay-wrapper] project=${slug} PLAIN-FLAGS, temp path — ephemeral unseeded profile dir=${dir}\n`);
+  } else {
+    dir = path.join(cacheRoot, plainflagsMode.PROFILES_DIRNAME, slug);
+    try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+    process.stderr.write(`[relay-wrapper] project=${slug} PLAIN-FLAGS — separate unseeded profile (not registered) dir=${dir}\n`);
+  }
+} else if (isTempProject(proj)) {
   // Unregistered ephemeral profile, named like a session clone so a crashed
   // relay's leftover is GC'd like one; the relay removes it at exit.
   dir = path.join(cacheRoot, "session-clones", `${slug}-p${process.pid}-${Math.random().toString(36).slice(2, 8)}`);

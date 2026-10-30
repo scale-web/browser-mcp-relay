@@ -311,9 +311,12 @@ function noFragment(u) {
 
 /**
  * @param {import('playwright-core').BrowserContext} context
- * @param {{ recentlyBlocked?: (url: string) => boolean, onBlocked: (host: string) => void, log?: Function }} hooks
+ * @param {{ recentlyBlocked?: (url: string) => boolean, onBlocked: (host: string) => void, log?: Function,
+ *   classify?: (url: string) => { blocked: boolean, host: string|null }, marker?: string, label?: string }} hooks
+ *   `classify` / `marker` / `label` default to the Meta lists, the Meta 403 page's marker attribute and
+ *   "meta-guard"; the plain-flags sign-in guard (spec v8 §5.6 (6)(h)) passes its own.
  */
-function installWatchdog(context, { recentlyBlocked = () => false, onBlocked, log = () => {} }) {
+function installWatchdog(context, { recentlyBlocked = () => false, onBlocked, log = () => {}, classify = classifyUrl, marker = "data-relay-meta-guard", label = "meta-guard" }) {
   const watched = new WeakSet();
   const watch = (page) => {
     if (watched.has(page)) return;
@@ -321,10 +324,10 @@ function installWatchdog(context, { recentlyBlocked = () => false, onBlocked, lo
     page.on("framenavigated", (frame) => {
       if (frame !== page.mainFrame()) return;
       const url = frame.url();
-      const v = classifyUrl(url);
+      const v = classify(url);
       if (!v.blocked) return;
       const evict = () => {
-        log(`meta-guard watchdog: main frame reached ${v.host} (not via Fetch — service worker?); sending it to about:blank`);
+        log(`${label} watchdog: main frame reached ${v.host} (not via Fetch — service worker?); sending it to about:blank`);
         onBlocked(v.host);
         page.goto("about:blank").catch(() => {});
       };
@@ -341,14 +344,16 @@ function installWatchdog(context, { recentlyBlocked = () => false, onBlocked, lo
       const stampId = `${Date.now()}-${Math.random()}`;
       let stamped = false;
       const read = () => Promise.race([
-        frame.evaluate(({ id, first }) => {
+        frame.evaluate((a) => {
+          "use strict";
+          const { id, first, attr } = a;
           const d = document;
-          const mark = d.documentElement ? d.documentElement.getAttribute("data-relay-meta-guard") : null;
+          const mark = d.documentElement ? d.documentElement.getAttribute(attr) : null;
           // The document's ORIGINAL URL: replaceState cannot change it.
           const nav = (performance.getEntriesByType && performance.getEntriesByType("navigation")[0] || {}).name || null;
           if (first) { d.__relayGuardStamp = id; return { mark, same: true, nav }; }
           return { mark, same: d.__relayGuardStamp === id, nav };
-        }, { id: stampId, first: !stamped }).catch(() => null),
+        }, { id: stampId, first: !stamped, attr: marker }).catch(() => null),
         new Promise((r) => setTimeout(() => r(null), 500)),           // a hung page still meets the deadline
       ]);
       const check = () => {

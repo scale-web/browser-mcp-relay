@@ -34,6 +34,7 @@ const processShim = require("./process-shim.js");
 const { applyLocalConfigToEnv } = require("./local-config.js");
 const profileLock = require("./profile-lock.js");
 const cdpIdentity = require("./cdp-identity.js");
+const plainflagsMode = require("./plainflags-mode.js");
 
 // ───────────────────────────── Constants ─────────────────────────────
 
@@ -197,12 +198,23 @@ function userCacheRoot(env = process.env) {
  * Mutating the returned object is safe — each call returns a fresh
  * object; nothing else in the module reads from it.
  */
-function loadConfig({ env = process.env, repoRoot = path.resolve(__dirname, "..") } = {}) {
-  const wrapperConfig = upstreamWrapper && upstreamWrapper.CONFIG ? upstreamWrapper.CONFIG : null;
+function loadConfig({
+  env = process.env,
+  repoRoot = path.resolve(__dirname, ".."),
+  // Spec v8 §5.6: from the PROCESS env only, never from `env` below (which
+  // carries every local-config.json key).
+  mode = plainflagsMode.profileMode(),
+  // Test seams: a fixture local-config.json / wrapper CONFIG.
+  _localConfigPath,
+  _wrapperConfig,
+} = {}) {
+  const wrapperConfig = _wrapperConfig !== undefined
+    ? _wrapperConfig
+    : (upstreamWrapper && upstreamWrapper.CONFIG ? upstreamWrapper.CONFIG : null);
 
   // Layer local-config.json under env vars. Real env values win; otherwise
   // the file's value (if any) is used. Auto-detection still runs underneath.
-  env = applyLocalConfigToEnv(env);
+  env = applyLocalConfigToEnv(env, _localConfigPath ? { path: _localConfigPath, refresh: true } : {});
 
   // Brave path resolution order (V1-2):
   //   1. BROWSER_RELAY_BRAVE_PATH (env override)  — explicit, always wins
@@ -302,6 +314,12 @@ function loadConfig({ env = process.env, repoRoot = path.resolve(__dirname, ".."
     proxyUrl = wrapperConfig.proxyUrl;
   }
 
+  // Plain-flags mode (§5.6 (4)): never seeded from a logged-in profile — the
+  // wrapper's cookieSourceProfile is forced to null (kept aside, so the relay
+  // can refuse a pool dir that IS that profile).
+  const configuredCookieSourceProfile = cookieSourceProfile;
+  if (mode === plainflagsMode.PLAINFLAGS) cookieSourceProfile = null;
+
   return {
     bravePath,
     braveDetectError,
@@ -309,6 +327,8 @@ function loadConfig({ env = process.env, repoRoot = path.resolve(__dirname, ".."
     poolDirs,
     slotRoles,
     cookieSourceProfile,
+    configuredCookieSourceProfile,
+    profileMode: mode,
     cookieFreshnessWarnDays,
     staleAfterMs,
     standalone: !env.BROWSER_RELAY_POOL_DIR && !wrapperConfig,
@@ -570,8 +590,18 @@ function claimSlot() {
 
 const SESSION_CLONES_DIRNAME = "session-clones";
 
-function sessionClonesRoot(env = process.env) {
-  return path.join(userCacheRoot(env), SESSION_CLONES_DIRNAME);
+/** The clone root of this relay's profile mode. Plain-flags clones get their
+ *  own root (spec v8 §5.6 (4), review r7 #9): clone names are
+ *  `<basename(base)>-p<pid>-<nonce>`, so under one root a plain-flags clone and
+ *  a same-named default clone would look alike. `mode` comes from the PROCESS
+ *  env, never from `env` (which may carry local-config keys). */
+function sessionClonesRoot(env = process.env, mode = plainflagsMode.profileMode()) {
+  return path.join(userCacheRoot(env), mode === plainflagsMode.PLAINFLAGS ? plainflagsMode.CLONES_DIRNAME : SESSION_CLONES_DIRNAME);
+}
+
+/** The plain-flags profiles root (one dir per project slug, never registered). */
+function plainflagsProfilesRoot(env = process.env) {
+  return path.join(userCacheRoot(env), plainflagsMode.PROFILES_DIRNAME);
 }
 
 /** Create a unique clone dir for this process. The pid keys GC (dir is
@@ -847,10 +877,12 @@ function reapDirUnderFlock(dir, opts = {}) {
  * standalone mode (sourceProfile is null). Returns the count of files copied
  * — caller can log it.
  */
-function snapshotCookiesFrom(srcProfile, dstProfile) {
+function snapshotCookiesFrom(srcProfile, dstProfile, { excludeLoginData = false } = {}) {
   if (!srcProfile || !fs.existsSync(srcProfile)) return 0;
   let copied = 0;
   for (const rel of SNAPSHOT_FILES) {
+    // Plain-flags clones never get the base's saved passwords (§5.6 (4), r8 #3).
+    if (excludeLoginData && plainflagsMode.isLoginDataPath(rel)) continue;
     const s = path.join(srcProfile, rel);
     const d = path.join(dstProfile, rel);
     try {
@@ -933,6 +965,7 @@ module.exports = {
   claimSlotWithRetry,
   tryClaimDir,
   sessionClonesRoot,
+  plainflagsProfilesRoot,
   createSessionCloneDir,
   cloneBelongsTo,
   gcSessionClones,
