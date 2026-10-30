@@ -383,9 +383,9 @@ const OWN_TOOL_META = {
   file_upload: { sourceFile: "file-upload.js", category: "forms" },
   form_fill: { sourceFile: "form-fill.js", category: "forms" },
   capture_xhr: { sourceFile: "capture-xhr.js", category: "network" },
+  challenge_detect: { sourceFile: "challenge-detect.js", category: "network" },
   cookies_export: { sourceFile: "cookies-export.js", category: "session" },
   cookies_import: { sourceFile: "cookies-import.js", category: "session" },
-  stealth_apply: { sourceFile: "stealth-apply.js", category: "session" },
   download_capture: { sourceFile: "download-capture.js", category: "downloads" },
   extract_structured: { sourceFile: "extract-structured.js", category: "data" },
   // Storage tools (added 2026-05-09) — auth tokens for modern OAuth-style apps

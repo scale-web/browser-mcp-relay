@@ -22,9 +22,9 @@ const { withActivePage } = require("./_active-page.js");
  * the override UA we just set. Anti-bot vendors use that mismatch as a
  * detection signal.
  *
- * This pairs with stealth_apply's T1-A patch which synthesizes the JS-side
- * `navigator.userAgentData` from the SAME string. Together they keep the
- * HTTP-header side and the JS-side aligned.
+ * This paired with stealth_apply's T1-A patch, which synthesized the JS-side
+ * `navigator.userAgentData` from the SAME string. stealth_apply was deleted
+ * 2026-10-30 (spec v8 §5.3, D3); only this HTTP-header half remains.
  *
  * Pure helper — exported as a test seam.
  *
@@ -136,7 +136,8 @@ module.exports = {
     if (userAgent) {
       // T2-A (v0.3.5): also pass userAgentMetadata so the HTTP-side
       // Sec-CH-UA-* headers align with the JS-side navigator.userAgentData
-      // that stealth_apply T1-A synthesizes. Without this, sites that read
+      // (which stealth_apply T1-A synthesized until its deletion on
+      // 2026-10-30 — spec v8 D3). Without this, sites that read
       // the headers see Brave's defaults while JS-side reports the override
       // — instant mismatch flag. CDP's setUserAgentOverride accepts a
       // userAgentMetadata arg with the full UA decomposition; we synthesize

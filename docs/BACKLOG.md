@@ -6,7 +6,8 @@ This file is the canonical source for "what's known but not yet shipped." Items 
 
 ## Contents
 
-- [Stealth — Tier 2 (opinionated)](#stealth--tier-2-opinionated)
+- [Stealth — Tier 2 (mostly deleted 2026-10-30)](#stealth--tier-2-mostly-deleted-2026-10-30)
+- [Stealth — Tier 2.5 (not to be built)](#stealth--tier-25-not-to-be-built)
 - [Stealth — Tier 3 (architectural)](#stealth--tier-3-architectural)
 - [Stealth — Tier 4 (anti-patterns)](#stealth--tier-4-anti-patterns)
 - [Field reports — not yet reproduced](#field-reports--not-yet-reproduced)
@@ -27,20 +28,24 @@ This file is the canonical source for "what's known but not yet shipped." Items 
 
 **TODO:** file an upstream issue at https://github.com/serkan-ozal/browser-devtools-mcp/issues. The fix is one line: extend the `HttpResourceType` enum to include the 6 missing values. Once shipped + bumped in our `package.json` dep range, we can delete `scripts/patch-bdmcp-bundle.js` and its tests.
 
-## Stealth — Tier 2 (SHIPPED in v0.3.5 — 2026-05-10)
+> **2026-10-30 — every stealth tier below now defers to vault spec *Browser Work Behind Cloudflare — Spec v8* (`04 - Recon/2026-10-29 Cloudflare Relay Challenge Recon/04 - Playbooks/`).** Cloudflare walls are handled by the `challenge_detect` tool and the `cf-challenge` skill (REFERENCE "Cloudflare walls"), not by JS patches. The measured cause of walls here is the launch (`navigator.webdriver === true` from `--enable-automation` plus `--remote-debugging-port=0`) and CDP attachment (spec §1); the option that addresses it — a separate plain-flags profile that clears `webdriver` with a launch flag — is spec §5.6, built only if its measurement passes (D22). Each tier says below what changed.
 
-The four stealth-fingerprint patches in Tier 2 shipped together. The fifth Tier 2 item (humanlike interaction tools) was different scope and ship-gated separately as Tier 2.5 below.
+## Stealth — Tier 2 (mostly deleted 2026-10-30)
+
+~~The four stealth-fingerprint patches in Tier 2 shipped together.~~ They shipped together in v0.3.5 (2026-05-10). **Three of the four were deleted on 2026-10-30 with `stealth_apply`** (spec v8 §5.3, decision D3, ruled *"Delete it (Recommended)"*): its patches contradicted the real browser — 3 fake plugins vs 7 real (measured), a WebGL renderer spoofed as "Apple M1" on an "Apple M1 Max" (code) — and its one recorded pass was confounded. The fifth Tier 2 item (humanlike interaction) is Tier 2.5 below.
 
 | Patch | Ship | Status |
 |---|---|---|
-| HTTP-side `Sec-CH-UA-*` via `userAgentMetadata` (T2-A) | v0.3.5 | ✅ shipped |
-| Chrome runtime expansion — `loadTimes` / `csi` / `app` (T2-B) | v0.3.5 | ✅ shipped |
-| Full permissions overrides — 17 permission types (T2-C) | v0.3.5 | ✅ shipped |
-| WebGL renderer + vendor override — UA-aware (T2-D) | v0.3.5 | ✅ shipped |
+| HTTP-side `Sec-CH-UA-*` via `userAgentMetadata` (T2-A) | v0.3.5 | ✅ kept — lives in `emulate_device`, untouched |
+| Chrome runtime expansion — `loadTimes` / `csi` / `app` (T2-B) | v0.3.5 | ❌ deleted 2026-10-30 (D3) |
+| Full permissions overrides — 17 permission types (T2-C) | v0.3.5 | ❌ deleted 2026-10-30 (D3) |
+| WebGL renderer + vendor override — UA-aware (T2-D) | v0.3.5 | ❌ deleted 2026-10-30 (D3) — the measured contradiction |
 
-See `src/own-tools/stealth-apply.js` + `src/own-tools/emulate-device.js` (T2-A's `synthesizeUserAgentMetadata`) for the implementations.
+See `src/own-tools/emulate-device.js` (T2-A's `synthesizeUserAgentMetadata`). ~~`src/own-tools/stealth-apply.js`~~ is gone; its last version is `git show e41224c:src/own-tools/stealth-apply.js`.
 
-## Stealth — Tier 2.5 (deferred with explicit ship gate)
+## Stealth — Tier 2.5 (not to be built)
+
+**2026-10-30 — recommended not to build** (spec v8 §9 and decision D26: a recommendation, not yet ruled). Its own ship gate below is still unmet (no target has been shown flagging behaviour); the spec's plain-flags try clicks at most once; and CDP `Input` clicks already arrive `isTrusted=true` (measured), so there is nothing for humanlike input to fix on a Cloudflare widget. The entry stays as the record of what was considered.
 
 ### `humanlike_click` + `humanlike_type` tools
 
@@ -62,6 +67,8 @@ See `src/own-tools/stealth-apply.js` + `src/own-tools/emulate-device.js` (T2-A's
 ## Stealth — Tier 3 (architectural)
 
 Big lifts. Different scope from JS patches.
+
+**2026-10-30 — for Cloudflare walls, spec v8 §9 picks neither item here.** Attaching to a browser a human has solved a challenge in is weighed there and the recommendation is to keep the one-click human step in the user's own Brave (D25, recommendation); the browser-side fix it does pursue is the separate plain-flags profile (§5.6, D29 ruled, built only if the D22 measurement passes), which keeps Playwright. Removing CDP auto-attach and focus emulation needs leaving Playwright and is "leave" (§9). Both items below stay deferred for non-Cloudflare targets; their ship gates referred to "Tier 1+2 stealth", which no longer exists — read them as "the default relay is provably blocked and the Cloudflare route does not apply".
 
 ### Real-Brave-attach mode (CloakBrowser pattern)
 
@@ -124,6 +131,8 @@ reputation rather than TLS/JA3 fingerprinting, and attach mode does nothing for 
 
 These are tempting but counterproductive. Documented here so we don't accidentally implement them later.
 
+**2026-10-30:** spec v8 §9 also recommends excluding **CAPTCHA-solving services** (client page content to a third party with no BAA — D27) and **proxies / Firecrawl `proxy: "stealth"`** (no use case; the relay's proxy setting turns off TLS validation — D28). Both are recommendations, open; ask the user before using either.
+
 ### `puppeteer-extra-stealth` integration
 
 **Don't.** The library packs 25+ evasions, but:
@@ -132,7 +141,7 @@ These are tempting but counterproductive. Documented here so we don't accidental
 - The "puppeteer-stealth fingerprint" itself is signature-detected by sophisticated vendors now (the stealth library has its own tells in how it mutates objects)
 - Adds a heavy dep with regular churn
 
-If we want broader coverage, copy specific evasions selectively into our stealth-apply.js, vetted against Brave's behavior.
+~~If we want broader coverage, copy specific evasions selectively into our stealth-apply.js, vetted against Brave's behavior.~~ **Retracted 2026-10-30:** `stealth-apply.js` is deleted (D3) because selectively copied evasions did exactly what this section warns about — they contradicted the real browser (plugins, WebGL). There is no evasion file to grow; see spec v8 §9.
 
 ### Canvas randomization
 

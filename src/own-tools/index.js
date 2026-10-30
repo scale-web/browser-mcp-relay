@@ -25,7 +25,6 @@ const tools = [
   require("./capture-xhr.js"),
   require("./cookies-export.js"),
   require("./cookies-import.js"),
-  require("./stealth-apply.js"),
   require("./download-capture.js"),
   require("./extract-structured.js"),
   // Local / session storage — auth tokens for many modern SaaS apps
@@ -33,6 +32,8 @@ const tools = [
   require("./storage-get-local.js"),
   require("./storage-set-local.js"),
   require("./storage-clear-local.js"),
+  // Cloudflare walls: classify + route, never click (spec v8 §5.2).
+  require("./challenge-detect.js"),
   // Which profile (BASE / CLONE) this session drives. Never launches Brave.
   require("./relay-status.js"),
 ];

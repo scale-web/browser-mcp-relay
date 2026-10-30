@@ -15,6 +15,7 @@ The slim README at the root of the repo is for getting up and running. This file
 - [Optional features](#optional-features)
   - [Proxy whitelist](#proxy-whitelist)
   - [Credential vault + autofill](#credential-vault--autofill)
+- [Cloudflare walls](#cloudflare-walls)
 - [Stealth model](#stealth-model)
 - [Inspector](#inspector)
 - [Platform support](#platform-support)
@@ -68,13 +69,18 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 |---|---|---|---|
 | `capture_xhr` | Record XHR/fetch responses | `urlFilter` (regex) | Reverse-engineer a site API while logged in |
 
+#### 🧱 Cloudflare walls (added 2026-10-30)
+
+| Tool | Purpose | Notable arg | Example use case |
+|---|---|---|---|
+| `challenge_detect` | Say whose Cloudflare wall this is and where to route it (never clicks, never reloads); logs it to the shared CF-WALL log (then do not append another). See [Cloudflare walls](#cloudflare-walls) | `lane` (required); `origin` + `stage: "pre"\|"outcome"` | A GHL form's Turnstile never passes → owner `highlevel`, route `in-page-turnstile` with the three ways on |
+
 #### 🍪 Session & cookies
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
 | `cookies_export` | Export cookies as JSON | `urls` (filter) | Save an authed session for later |
 | `cookies_import` | Import cookies into the context | `cookies` | Restore an authed session |
-| `stealth_apply` | Anti-detection patches (Tier 1) | `languages` | Defeat trivial bot checks + the bottom 70% of fingerprint surface |
 
 #### 💾 Downloads
 
@@ -520,34 +526,69 @@ The vault loads CSVs at startup, indexes by hostname + registrable domain, and f
 
 ---
 
+## Cloudflare walls
+
+When a page shows *"Verify you are human"*, *"Just a moment…"*, a Turnstile widget, a 429 or an Access login, **follow the `cf-challenge` skill** — it is the session-facing rulebook. The design behind it, with the evidence, is spec v8 (vault `04 - Recon/2026-10-29 Cloudflare Relay Challenge Recon/04 - Playbooks/Browser Work Behind Cloudflare — Spec v8`). **Rule zero: zero clicks on a challenge in the relay, no reloads, no retries** — one detection, one classification, one route. Logins are always typed by the user.
+
+### Whose wall it is — first matching row wins (spec §2)
+
+| # | Signal | `owner` | Route |
+|---|---|---|---|
+| 1 | `x-ghl-serve-region:` header, or CNAME `sites.ludicrous.cloud`, or A `162.159.140.166` | `highlevel` | §3.1 — HighLevel API first; widget-only cases go to a one-click human step |
+| 2 | `powered-by: Shopify` or `shopify-complexity-score:`, or A `23.227.38.x`, or CNAME `shops.myshopify.com` | `shopify` | §3.2 — you tripped the rate limit: stop that store for 10 min, then pace |
+| 3 | `302` to `*.cloudflareaccess.com` | `access` | §3.3 — a login, not a bot check |
+| 4 | The test host `cf-test.automatedscalinghq.com` | `agency-test` | `expected` — log it, carry on; not counted |
+| 5 | Registrable domain is one of the 8 agency zones (the skill's list) | `agency` | §3.3 — a zone config bug: fix or report, never work around |
+| 6 | Host ends `.scale-265.workers.dev` | `workersdev` | `report` |
+| 7 | Anything else with `cf-ray:` (or a Cloudflare challenge seen in the page) | `vendor` | §3.4 — the vendor's API, else a human step |
+| — | none of the above | `none` | `none` — no wall |
+
+Rows 1 and 4 sit above row 5 on purpose: `go.revivemyhair.com` and `aloeheath.com` are on agency nameservers but served by HighLevel, and the test host is meant to challenge. Nameservers never decide row 5.
+
+### `challenge_detect`
+
+Read-only except the lines it appends. `lane` is **required** in every shape — the relay has no lane of its own; pass your `claude-ask whoami` lane (letters, digits, `.` `_` `/` `-`). A call without one is refused before anything is read.
+
+| Shape | Arguments | What it does | Appends |
+|---|---|---|---|
+| (i) classify | `{lane}` on the loaded page | Scans **every frame of the frame tree** in the browser (a GHL form's widget sits in the form's cross-origin iframe; the `challenges.cloudflare.com` frame itself is recognised by URL and never evaluated in), and reads the page's response headers with a separate `curl -sI` (the skill's step 1A; no query string sent) plus `dig` CNAME/A. Applies the table above | one detection line, **only when the page shows a wall** (below) |
+| (ii) pre read | `{lane, origin, stage: "pre"}` **before** navigating; no page needed | Reads that origin's Cloudflare cookies from the jar with CDP `Storage.getCookies` (every partition) and remembers the state for that lane + origin for 10 minutes (memory only — a relay restart forgets it; expired entries are dropped on the next call) | nothing |
+| (iii) outcome | `{lane, origin, stage: "outcome"}` after a plain-flags try (`origin` required; the active page must be on it) | Reads the page again (token filled / interstitial cleared → `passed`). **Refused until the plain-flags profile is built** | one outcome line with the cookie state from (ii) — `cfCookies=unknown` when there is no pre read for that lane + origin, or it is older than 10 min. A pre read is used once |
+
+**What decides what.** The **kind** comes from the browser only: the page title (*"Just a moment…"*), the interstitial's `_cf_chl_opt`, the Turnstile markers in any frame, and the page's own navigation status (`429` → `ratelimit`). The curl read is another client — different TLS fingerprint, none of the browser's cookies — so it decides the **owner** only (rows 1, 2 and 7); its status, `cf-mitigated` and any `302` to Access are returned in `signals.curl` and never make a kind, an owner of `access` or a log line. `access` means the browser itself is on a `*.cloudflareaccess.com` login page. When the widget sits in a **child frame on another host**, that frame decides the owner (`ownerFrom: "frame <host>"`), and rows 5/6 are never read off the top host then — so a GHL form on an agency site is `highlevel`, not `agency`. HighLevel's widget domains (`leadconnectorhq.com`, `msgsndr.com`) are `highlevel` by name; any other widget-frame host (up to 3 per call) gets its own `dig` CNAME/A, and rows 1–2 are applied to that answer before the host lists — so a GHL form served from the location's white-label domain (CNAME `sites.ludicrous.cloud` / A `162.159.140.166`) is `highlevel` too. A HighLevel frame (by domain or DNS) wins whenever one holds the widget, wherever it sits in the frame order; otherwise markers in the top document mean the page itself decides, then the first marked child, then a challenge frame's parent. A child frame on the page's own host counts as the page.
+
+**A wall** — and so a log line — is a Cloudflare owner (not `none`) plus, in the browser, an interstitial, a Turnstile without a token, or a 429; or the browser on an Access login. A Turnstile has passed only when **every** frame showing a widget holds a token input and all are filled: `turnstilePassed: true`, route `none`, nothing appended. One filled form beside an unsolved one is still a wall. A 429 off Cloudflare (owner `none`) is not logged.
+
+Returns (shape i): `owner`, `row`, `ownerFrom`, `kind` (`interstitial` \| `turnstile` \| `ratelimit` \| `none`), `turnstilePassed`, `plainflagsEligible`, `reason` (`eligible` \| `not-built` \| `owner-route` \| `kind` \| `signin-not-listed`), `route`, `clickBudget`, `cfCookies`, `cookies`, `errorCodes`, `notes`, the raw `signals` (navigation status, curl's read, the skill's header list, DNS answers, the widget frame's host, each frame's marker counts, whether the page is a known account's login page) so a misclassification can be seen, and `log`. **`route`:** `none` when there is no wall, for every owner (Access aside: `§3.3`); `in-page-turnstile` for a Turnstile widget, with `guidance` — spec §2 step 2's three ways on: verify the page only (no submission needed), exercise the backend through the official API (for HighLevel after the §3.1 B0 GO), or the real widget path via the §4 one-click human step; otherwise the owner's route (a spec §3 section, `expected` for the test host, `report` for `workersdev`) — and, once the plain-flags profile exists, `switch-to-plainflags-server` / `plainflags-try`.
+
+**`errorCodes`** (`600010` = bot detection, benign; `110200` = sitekey/hostname mismatch, a real outage — report it) are a plain text match on each readable frame's body: they can false-match any page text containing those digits (a phone number), and a code rendered **inside the `challenges.cloudflare.com` frame is not read** (that frame is never evaluated in). Treat them as a hint; the Turnstile error itself is authoritative.
+
+**`cfCookies`:** `none` = no `cf_clearance` / `__cf_bm` / `_cfuvid` for that site and no `challenges.cloudflare.com` cookie partitioned under it; `partitioned` = a `cf_clearance` with a CHIPS `partitionKey`, or a challenge-host cookie partitioned under the site; `present` = otherwise; `unknown` = not read. **Names, domain, path, flags and partition site only — never a cookie value**, and a Turnstile token only as its length. Response headers are limited to the skill's list (never `set-cookie`), `location` to its host.
+
+**Not built yet (phase 1):** the separate plain-flags profile waits for a measurement (spec D22), so **`plainflagsEligible` is always `false` with `reason: not-built`** and `route` never says switch or try; `clickBudget` is `0`; shape (iii) is refused. The known-account list (`src/known-accounts.js`: login matchers, cookie origins, session-cookie names, `federating`, `signsInVia` — every entry still *unconfirmed*, spec §10 #25) and the loader for the sign-in allowlist file `plainflags-signin.json` (`src/plainflags-signin.js`; missing or malformed → empty; re-read when the file changes) ship now and are used only to classify — nothing enforces them until the plain-flags build, which also creates that file, empty.
+
+### The CF-WALL log
+
+One shared, append-only file for every lane — the cross-lane count that gates spec phase 2: `~/ObsidianVault/[AGENCY] Automated Scaling/Claude Important/04 - Recon/2026-10-29 Cloudflare Relay Challenge Recon/00 - Summary/CF-WALL Log.md` (override: `BROWSER_RELAY_CF_WALL_LOG`). Created with the skill's frontmatter if missing (written to a temp file and linked into place, so it never appears without its header; a failed write leaves no temp file); lines are only ever appended. A log path that is a **symlink to a missing file is refused** (`logged: false`) rather than created through. Values read from curl, dig and the page are bounded (20 headers of ≤200 chars, 20 DNS answers, hosts ≤253 chars). The route field of a detection line says what was seen and where it goes next:
+
+```
+YYYY-MM-DDTHH:MM:SSZ | <lane> | <host> | <owner> | <route taken>
+2026-10-30T17:00:00Z | CRO-33 | go.example.com | highlevel | detected turnstile; next in-page-turnstile
+2026-10-30T17:01:30Z | CRO-33 | ala-b2b.scale-265.workers.dev | access | detected access-login; next §3.3
+2026-10-30T17:02:10Z | CRO-33 | www.example.com | vendor | plainflags: failed → handoff; cfCookies=none; clicks=0
+```
+
+**When `challenge_detect` logged, its result's `log.note` reads exactly *"This is the wall's CF-WALL line — do not append another. A subagent: tell your parent it is already written."*** — that line is the wall's line; do not also append one by hand. A repeat detection of the same lane + host + owner within 60 s appends nothing and returns `logged: false, duplicateOf: <timestamp>` (per relay process). Only when the result says `logged: false` (no wall detected, or the file could not be written — no vault on this machine) does a session write the line itself, per the skill. Host only — no path, no query. On an Access login page the host is the **protected app's**, taken from the login URL (`<team>.cloudflareaccess.com/cdn-cgi/access/login/<app host>`); when the URL does not name it, the line carries the Access host itself.
+
+---
+
 ## Stealth model
 
-`stealth_apply` is an opt-in tool that injects anti-detection JavaScript patches into every page load in the active context. **Off by default** — call the tool once per session to enable. The relay's intent is to be honest about what stealth covers and where the limits are, since pretending to defeat detection you don't is worse than not trying.
+**Retracted 2026-10-30 — `stealth_apply` is deleted** (spec v8 §5.3, decision D3, ruled by the user 2026-10-30: *"Delete it (Recommended)"*). Until then this section described an opt-in tool that injected JavaScript patches into every page (a `navigator.webdriver` getter, fake `navigator.plugins`, a `languages` override, a permissions fix, a synthesized `navigator.userAgentData`, `toString` disguises, AudioContext jitter, `window.chrome` stubs, 17 permission overrides and a WebGL vendor/renderer spoof) and claimed it covered *"the bottom ~85% of common fingerprint surface"*, verified only by source-pattern tests.
 
-### Tier 1+2 — what's covered (v0.3.5)
+Why it went: its patches **contradicted the real browser** — 3 fake plugins where the relay's Brave reports 7 (**measured**, Cloudflare relay recon research A §2) and a WebGL renderer spoofed as "Apple M1" on an "Apple M1 Max" machine (**code**); a spoof that disagrees with the real value is itself a tell. Its `webdriver` hide was a JS getter that needed its own `toString` disguise, while the measured cause of Cloudflare walls here is the launch itself (`navigator.webdriver === true` from Playwright's `--enable-automation` plus `--remote-debugging-port=0`) and CDP attachment — spec §1. The one recorded "pass" with it (a Shopify checkbox) is confounded: the same lane saw the relay pass Shopify's managed challenge with no stealth on the next GET. It also broke `matchMedia` in a test. The code stays in git history (`git show e41224c:src/own-tools/stealth-apply.js`).
 
-**Tier 1** (v0.3.4):
-
-| Patch | What it defeats |
-|---|---|
-| `navigator.webdriver = undefined` | Trivial `if (navigator.webdriver)` checks |
-| `navigator.plugins` faked | Bot detection that flags empty plugins arrays |
-| `navigator.languages` override | Mismatched-language flagging |
-| `navigator.permissions.query` notifications fix | The `Notification.permission === 'denied'` headless tell |
-| `navigator.userAgentData` synthesized from current UA | Sec-CH-UA-* JS-side fingerprinting; tracks `emulate_device`'s UA override |
-| `toString()` defense on patched getters | `Object.getOwnPropertyDescriptor(navigator, 'webdriver').get.toString()` returns native-looking output |
-| AudioContext `getChannelData` stabilization | Audio-fingerprint hash detection on PerimeterX et al.; per-session deterministic jitter (≤ 1e-7), not random per-call |
-
-**Tier 2** (v0.3.5 — added 2026-05-10):
-
-| Patch | What it defeats |
-|---|---|
-| **HTTP-side `Sec-CH-UA-*` headers via `userAgentMetadata`** | The Tier-1 JS-side `userAgentData` paired with HTTP-side `Sec-CH-UA-*` mismatch detection. `emulate_device` now passes a synthesized `userAgentMetadata` to CDP's `Network.setUserAgentOverride`. |
-| **`window.chrome` runtime expansion** | Probes for `chrome.loadTimes()` / `chrome.csi()` / `chrome.app` namespace. Real Chrome ships all three; Tier 1's bare `runtime: {}` was a tell. Now populates plausible-shape stubs. |
-| **Full permissions overrides** | Probes for `geolocation` / `clipboard-read` / `clipboard-write` / `camera` / `microphone` / `midi` / `push` / etc. Tier 1 only covered notifications; Tier 2 extends to the canonical 17 permission types with realistic states. |
-| **WebGL renderer + vendor override** | `getParameter(UNMASKED_VENDOR_WEBGL)` / `getParameter(UNMASKED_RENDERER_WEBGL)` returning Playwright signature strings. UA-aware GPU strings on both `WebGLRenderingContext` and `WebGL2RenderingContext`. |
-
-This covers trivial bot checks + the bottom ~85% of common fingerprint surface. **Verified by source-pattern tests** (`test/own-tools/stealth-apply.test.js` T1-A/B/C + T2-B/C/D, plus `test/own-tools/emulate-device.test.js` T2-A).
+What remains: `emulate_device` is unchanged — its HTTP-side `Sec-CH-UA-*` via a synthesized `userAgentMetadata` (BACKLOG T2-A) lives there. For a Cloudflare wall, see [Cloudflare walls](#cloudflare-walls); the separate plain-flags profile that clears `webdriver` at launch (no JS patch) is designed in spec §5.6 and is built only if its measurement passes (D22).
 
 ### What it does NOT cover
 
@@ -556,16 +597,16 @@ The relay is honest about these limits — pretending otherwise misleads callers
 | Limit | Why | Workaround |
 |---|---|---|
 | **TLS / HTTP/2 fingerprint (JA3 / JA4)** | Server-side detection runs before any JS executes. Playwright's chromium has a recognizable TLS handshake. | Route through a TLS-mimicking proxy (`BROWSER_RELAY_PROXY_URL` + a tool like `tlspoof` or a real-Brave-attach pattern). |
-| **`Function.prototype.toString` deep checks** | Sophisticated detectors examine the toString chain itself. Tier 1's getter-level toString defense doesn't reach this. | Tier 3 (deferred — see BACKLOG): rebrowser-patches at the chromium-binary level. |
+| **`Function.prototype.toString` deep checks** | Sophisticated detectors examine the toString chain itself. ~~Tier 1's getter-level toString defense doesn't reach this.~~ (Tier 1 was `stealth_apply`, deleted 2026-10-30 — the relay now patches no JS at all, so there is nothing for this check to find.) | Tier 3 (deferred — see BACKLOG): rebrowser-patches at the chromium-binary level. |
 | **`event.isTrusted` detection (press-and-hold, CAPTCHAs)** | ~~Synthetic events from CDP fundamentally have `isTrusted=false`. This is by browser design — there's no JS-level fix.~~ **Retracted 2026-10-30 — wrong for CDP input:** a CDP `Input.dispatchMouseEvent` click arrives with **`isTrusted=true`**, measured in plain Brave 156 and in the relay (Cloudflare relay recon, research A §2, "CDP click" column, 2026-10-29: move/press/release on a local probe page). Only events dispatched from page JS (`dispatchEvent`) are untrusted. `isTrusted` is not why challenges fail here — the relay's `navigator.webdriver === true` and CDP attachment are the measured tells (vault spec *Browser Work Behind Cloudflare — Spec v8* §1, §5.5). Whether a CDP click reaches the cross-origin Turnstile iframe as trusted is still unmeasured. | Don't try to auto-solve press-and-hold CAPTCHAs or click-loop a Cloudflare widget; for Cloudflare walls follow the `cf-challenge` skill (API first, then a one-click human step in the user's own browser). |
-| **Behavioral fingerprinting** (mouse paths, typing rhythm, dwell time) | Uniform Bezier-zero clicks + uniform 0ms typing are non-human. | Tier 2.5 (deferred — see BACKLOG): `humanlike_click` + `humanlike_type` tools. Has an explicit ship gate (capture the detection signal first; design the humanizer to match the target's tolerance window). |
+| **Behavioral fingerprinting** (mouse paths, typing rhythm, dwell time) | Uniform Bezier-zero clicks + uniform 0ms typing are non-human. | ~~Tier 2.5 (deferred — see BACKLOG): `humanlike_click` + `humanlike_type` tools.~~ **Not to be built** — spec v8 D26 recommends against (its ship gate is unmet, a plain-flags try clicks at most once, and CDP clicks are already `isTrusted=true`); open, see BACKLOG Tier 2.5. |
 
 ### Hard targets
 
-For sites with sophisticated detection (Akamai, DataDome, advanced PerimeterX deployments), `stealth_apply` is **insufficient** — it's a starting point, not a finish line. Real wins for hard targets are:
+For sites with sophisticated detection (Akamai, DataDome, advanced PerimeterX deployments), ~~`stealth_apply` is **insufficient** — it's a starting point, not a finish line.~~ (`stealth_apply` was deleted 2026-10-30 — see [Stealth model](#stealth-model); for Cloudflare walls, [Cloudflare walls](#cloudflare-walls).) What has been considered for hard targets:
 
 - **Real-Brave-attach** (Tier 3, deferred — see BACKLOG): connect to a Brave instance the user is already running interactively, never spawn one. Eliminates the entire "Playwright launched it" fingerprint surface. Already used in the maintainer's Walmart sidecar.
-- **Residential proxies** (Bright Data, IPRoyal): TLS handshake from a residential IP gets a much higher trust score than data-center IPs. Set `BROWSER_RELAY_PROXY_URL`.
+- ~~**Residential proxies** (Bright Data, IPRoyal): TLS handshake from a residential IP gets a much higher trust score than data-center IPs. Set `BROWSER_RELAY_PROXY_URL`.~~ **Not pursued for this agency** (2026-10-30, spec v8 D28 — recommended exclude, open; ask the user before any): no use case — the walls met here are browser- and rate-based, which an exit IP does not change — and the proxy setting turns off TLS validation (below).
   > ⚠️ **Read the proxy-whitelist security note above before doing this.** Setting that variable also turns OFF TLS cert validation, so a third-party proxy can transparently MITM every authenticated session the relay drives. These two recommendations sit ~60 lines apart and directly contradict each other: the note says never point it at a proxy you don't control, and this line recommends exactly that. Treat third-party proxying as an explicit decision, not a config tweak.
   > Also note (measured 2026-08-25): a Cloudflare challenge that renders *"Verification successful"* is **not** a TLS/JA3 rejection — JA3 is evaluated before any JS runs. Confirm the block is actually TLS-layer before reaching for a proxy at all.
 - **Warm session reuse** (`cookies_export` / `cookies_import` + the credential vault): a session with N days of authentic browsing history scores higher than a fresh login.
