@@ -26,6 +26,7 @@
 const { EventEmitter } = require("node:events");
 const metaGuard = require("./meta-guard.js");
 const sync = require("./own-tools/_upstream-sync.js");
+const requestBodyFilter = require("./request-body-filter.js");
 
 // Cap each emitted event's response body at this size (in JSON-stringified
 // chars). capture_xhr / lighthouse_audit can return MB-scale responses;
@@ -215,11 +216,18 @@ class RelayServer {
         const guarded = sync.isGuarded(name);
         if (this.ensureBrave) await this.ensureBrave();
         const upstream = await this.getUpstream();
-        if (guarded && sync.isDesynced() && !optIn) {
+        // A76: read the patch status only now — ensureBrave()/getUpstream()
+        // may just have (re)spawned upstream, which re-runs the patch.
+        const unpatched = requestBodyFilter.refuseUnpatched(name);
+        if (unpatched) {
+          response = unpatched;
+        } else if (guarded && sync.isDesynced() && !optIn) {
           response = sync.refusal(name);
         } else {
           const before = guarded ? await sync.readUpstreamUrl() : null;
           response = await upstream.request("tools/call", { name, arguments: fwdArgs });
+          // A76: request bodies (typed logins) never leave the relay.
+          response = requestBodyFilter.filterToolResult(name, response);
           if (guarded) await sync.afterGuardedCall({ before, name, optIn });
           // Rule A: every upstream result says so while upstream's tab is not
           // the selected one.

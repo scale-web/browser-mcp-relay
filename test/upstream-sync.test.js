@@ -6,6 +6,10 @@ const { RelayServer } = require("../src/relay-server.js");
 const sync = require("../src/own-tools/_upstream-sync.js");
 const { propagateActivePageToUpstream } = require("../src/own-tools/_propagate-active-page.js");
 const { fakeUpstream } = require("./fixtures/fake-upstream-page.js");
+// A76: in production src/index.js marks the request-body source patch as in
+// effect before upstream spawns; these tests drive RelayServer directly, so
+// they set it themselves (otherwise execute is refused, fail closed).
+require("../src/request-body-filter.js").setSourcePatchInEffect(true);
 
 function setup(url = "about:blank") {
   const up = fakeUpstream({ url });

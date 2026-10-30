@@ -126,9 +126,15 @@ function applyPatch(opts = {}) {
   if (!out) {
     return { patched: false, reason: "regex match failed (upstream bundler shape changed?)" };
   }
+  // Atomic (A76 re-review r2 #5): this file is also patched by
+  // scripts/patch-bdmcp-request-body.js; a plain truncate-and-write from one
+  // relay could undo another relay's A76 rename, or be imported half-written.
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.f120-${process.pid}.tmp`);
   try {
-    fs.writeFileSync(file, out, "utf8");
+    fs.writeFileSync(tmp, out, "utf8");
+    fs.renameSync(tmp, file);
   } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
     return { patched: false, reason: `write failed: ${e.message}` };
   }
   log(

@@ -250,15 +250,35 @@ async function main() {
     // those hooks are CJS-only. Patching the bundle on disk is reliable
     // across both module systems. Idempotent + safe — bails on bundler
     // shape changes rather than corrupting the file.
+    // Patch the bundle we actually spawn (an override path included, through
+    // any symlink — Node loads the real file), not whatever require.resolve
+    // finds (A76 re-reviews r1 #1, r2 #4).
+    const bdmcpDist = path.dirname(fs.realpathSync(path.resolve(bdmcpEntry)));
     try {
       const { applyPatch } = require("../scripts/patch-bdmcp-bundle.js");
-      const result = applyPatch();
+      const result = applyPatch({ distDir: bdmcpDist });
       if (!result.patched) {
         process.stderr.write(`[mcp-relay] F1-20 patch skipped: ${result.reason} (o11y_get-http-requests may reject ping/prefetch/etc resourceTypes)\n`);
       }
     } catch (e) {
       process.stderr.write(`[mcp-relay] F1-20 patch threw (continuing): ${e.message}\n`);
     }
+    // A76 (2026-10-30): stop upstream capturing request bodies (typed logins).
+    // Fail closed: while the patch is not in effect, the relay refuses
+    // execute / scenario-run (src/request-body-filter.js); the direct
+    // o11y_get-http-requests call stays covered by the result filter.
+    let a76Applied = false;
+    try {
+      const { applyPatch } = require("../scripts/patch-bdmcp-request-body.js");
+      const result = applyPatch({ distDir: bdmcpDist });
+      a76Applied = !!result.patched;
+      if (!result.patched) {
+        process.stderr.write(`[mcp-relay] WARNING A76 request-body patch NOT applied: ${result.reason} — execute and scenario-run are refused until it is\n`);
+      }
+    } catch (e) {
+      process.stderr.write(`[mcp-relay] WARNING A76 request-body patch threw: ${e.message} — execute and scenario-run are refused until it applies\n`);
+    }
+    require("./request-body-filter.js").setSourcePatchInEffect(a76Applied);
     process.stderr.write(`[mcp-relay] spawning upstream child (no Brave yet, entry=${bdmcpEntry})...\n`);
     // CDP env points at the exact ws endpoint of OUR Brave (pinned to its
     // uuid, so it can reach no other browser). Before any Brave exists it is
@@ -272,6 +292,9 @@ async function main() {
       upstreamEnv[k] = v;
     }
     delete upstreamEnv.BROWSER_PERSISTENT_USER_DATA_DIR;
+    // A76: upstream prefixes tool names with this; the relay's name-based
+    // guards (meta-guard, sync, the request-body filter) need them unprefixed.
+    delete upstreamEnv.TOOL_NAME_PREFIX;
     delete upstreamEnv.BROWSER_PERSISTENT_ENABLE;
     // BDMCP reads `BROWSER_CDP_ENDPOINT_URL` from process.env and assigns it
     // internally to its exported constant `BROWSER_CDP_CONNECT_URL`. The

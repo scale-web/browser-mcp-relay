@@ -42,8 +42,9 @@ async function waitFor(pred, ms = 3000, what = "condition") {
   throw new Error(`timed out waiting for ${what}`);
 }
 
-async function startRelay({ attachable, idleMinutes = "0", extraEnv = {}, clone = false } = {}) {
+async function startRelay({ attachable, idleMinutes = "0", extraEnv = {}, clone = false, a76Unpatched = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-upstream-restart-"));
+  if (a76Unpatched) fs.writeFileSync(path.join(dir, "a76-unpatched"), "1");
   if (attachable) fs.writeFileSync(path.join(dir, "attachable"), JSON.stringify(attachable));
   if (clone) fs.writeFileSync(path.join(dir, "clone-mode"), "1");
   const env = {};
@@ -158,6 +159,87 @@ test("Brave relaunched on the SAME port → upstream child replaced; next forwar
     assert.strictEqual(r.child.exitCode, null, "deliberate restart must not shut the relay down");
   } finally {
     await r.stop();
+  }
+});
+
+test("A76: the request-body patch runs before EVERY upstream spawn, restarts included", T, async () => {
+  const r = await startRelay();
+  try {
+    await r.request("tools/list", {});
+    await r.call();
+    await r.killBrave();
+    await r.call();
+    const spawns = (r.stderr().match(/spawning upstream child/g) || []).length;
+    const patches = (r.stderr().match(/HARNESS a76-patch/g) || []).length;
+    assert.ok(spawns >= 3, `precondition: placeholder + two Brave generations (${spawns} spawns)`);
+    assert.strictEqual(patches, spawns, `each spawn must run the A76 patch first:\n${r.stderr()}`);
+    const dirs = new Set((r.stderr().match(/HARNESS a76-patch \S+/g) || []).map((l) => l.split(" ")[2]));
+    assert.deepStrictEqual([...dirs], [path.dirname(MOCK_BDMCP)], "the patch must target the bundle actually spawned (the override path)");
+  } finally {
+    await r.stop();
+  }
+});
+
+test("A76: execute as the very FIRST call (no tools/list) runs the patch and is forwarded", T, async () => {
+  const r = await startRelay();
+  try {
+    const res = await r.request("tools/call", { name: "execute", arguments: { code: "return 1" } });
+    assert.ok(!res.isError, `first-call execute refused: ${JSON.stringify(res)}`);
+    assert.ok(/HARNESS a76-patch/.test(r.stderr()), "the spawn before the call must have run the patch");
+  } finally {
+    await r.stop();
+  }
+});
+
+test("A76: a respawn whose patch FAILS refuses the very call that triggered it (no stale 'patched' flag)", T, async () => {
+  const r = await startRelay();
+  try {
+    await r.request("tools/list", {});
+    const first = await r.request("tools/call", { name: "execute", arguments: { code: "return 1" } });
+    assert.ok(!first.isError, "precondition: patched upstream forwards execute");
+    fs.writeFileSync(path.join(r.dir, "a76-unpatched"), "1");
+    await r.killBrave();
+    const second = await r.request("tools/call", { name: "execute", arguments: { code: "return 1" } });
+    assert.strictEqual(second.isError, true, `the respawn-triggering call reached an unpatched upstream: ${JSON.stringify(second)}`);
+    assert.match(second.content.map((c) => c.text).join("\n"), /A76 request-body patch is not in effect/);
+  } finally {
+    await r.stop();
+  }
+});
+
+test("A76: a symlinked BROWSER_RELAY_UPSTREAM_PATH is patched at its real location", T, async () => {
+  const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), "a76-link-"));
+  const link = path.join(linkDir, "index.js");
+  fs.symlinkSync(MOCK_BDMCP, link);
+  const r = await startRelay({ extraEnv: { BROWSER_RELAY_UPSTREAM_PATH: link } });
+  try {
+    await r.request("tools/list", {});
+    const dirs = new Set((r.stderr().match(/HARNESS a76-patch \S+/g) || []).map((l) => l.split(" ")[2]));
+    assert.deepStrictEqual([...dirs], [path.dirname(fs.realpathSync(MOCK_BDMCP))]);
+  } finally {
+    await r.stop();
+    fs.rmSync(linkDir, { recursive: true, force: true });
+  }
+});
+
+test("A76: execute is forwarded when the patch applied, and refused (never forwarded) when it did not", T, async () => {
+  const ok = await startRelay();
+  try {
+    await ok.request("tools/list", {});
+    const r = await ok.request("tools/call", { name: "execute", arguments: { code: "return 1" } });
+    assert.ok(!r.isError, `execute refused although the patch applied: ${JSON.stringify(r)}`);
+  } finally {
+    await ok.stop();
+  }
+  const bad = await startRelay({ a76Unpatched: true });
+  try {
+    await bad.request("tools/list", {});
+    const r = await bad.request("tools/call", { name: "execute", arguments: { code: "return 1" } });
+    assert.strictEqual(r.isError, true);
+    assert.match(r.content.map((c) => c.text).join("\n"), /A76 request-body patch is not in effect/);
+    assert.match(bad.stderr(), /WARNING A76 request-body patch NOT applied/);
+  } finally {
+    await bad.stop();
   }
 });
 

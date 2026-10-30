@@ -141,6 +141,27 @@ test("F1-20: applyPatch on a fixture distDir applies + becomes idempotent", () =
   }
 });
 
+test("F1-20: applyPatch writes atomically — no temp file is left in dist/", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "f1-20-"));
+  try {
+    const distDir = path.join(tmp, "dist");
+    fs.mkdirSync(distDir);
+    fs.writeFileSync(path.join(distDir, "core-FAKEBUNDLE.js"),
+      `var HttpResourceType=(function(HttpResourceType2){HttpResourceType2.OTHER="other"})(HttpResourceType||{});`);
+    const renames = [];
+    const realRename = fs.renameSync;
+    fs.renameSync = (a, b) => { renames.push([path.basename(a), path.basename(b)]); return realRename(a, b); };
+    let r;
+    try { r = patcher.applyPatch({ distDir, log: () => {} }); } finally { fs.renameSync = realRename; }
+    assert.strictEqual(r.action, "applied");
+    assert.strictEqual(renames.length, 1, "the patched file must be renamed into place, not written in place");
+    assert.strictEqual(renames[0][1], "core-FAKEBUNDLE.js");
+    assert.deepStrictEqual(fs.readdirSync(distDir), ["core-FAKEBUNDLE.js"]);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("F1-20: applyPatch on missing distDir returns soft failure (no throw)", () => {
   const r = patcher.applyPatch({ distDir: "/__definitely__not__existing__/dist" });
   assert.strictEqual(r.patched, false);

@@ -661,6 +661,15 @@ npm install
 
 **Fixed in v0.3.6.** Upstream `browser-devtools-mcp`'s bundled `HttpResourceType` enum is missing `ping` / `prefetch` / `signedexchange` / `cspviolationreport` / `preflight` / `fedcm`. Playwright's `request.resourceType()` does return those (Amazon affiliate links fire `<a ping="...">` beacons → `resourceType="ping"` → upstream's zod schema rejects). The relay now patches the upstream bundle file at startup via `scripts/patch-bdmcp-bundle.js` (idempotent, on-disk, survives ESM/CJS module systems). Look for a stderr line `[mcp-relay] patched browser-devtools-mcp HttpResourceType enum...` on first relay startup after `npm install`. Filed as F1-20 — see `docs/BACKLOG.md` for the upstream-issue tracking.
 
+### `o11y_get-http-requests` items have no request `body`
+
+**By design (register A76, 2026-10-30).** Upstream returned every request's POST body with no flag, so a login typed in a relay tab (email and password in the form body) reached the transcript of the next session that read HTTP requests — directly, or through `execute` / `scenario-run`, whose `callTool(…, true)` returns the inner tool's raw output. Two layers:
+
+1. **At the source:** `scripts/patch-bdmcp-request-body.js` patches the upstream bundle the relay actually spawns (`BROWSER_RELAY_UPSTREAM_PATH` included) before every upstream spawn, so `_toHttpRequest` never captures `postData()`. It is idempotent, writes atomically, and is a no-op if upstream's bundle shape changes. **Fail closed:** if the patch is not in effect for the upstream child currently running, the relay logs `WARNING A76 request-body patch NOT applied` and refuses `execute` and `scenario-run` (a script could return captured bodies); the status is re-read on every call, after any upstream respawn, so it clears at the next spawn where the patch applies. `test/patch-bdmcp-request-body.test.js` fails against the live bundle if the pattern breaks or a new `postData*()` call appears — re-check after any upstream upgrade.
+2. **On the direct call:** `src/request-body-filter.js` strips `body` from each `o11y_get-http-requests` item, in both `structuredContent` and the JSON text block, before the result or the Inspector traffic feed sees it. A text block it cannot parse, or any non-text item, is replaced with a "withheld" notice.
+
+Not covered (accepted, Trevor 2026-10-30, ask as-ops/ask-7hghph): a script in `execute` / `scenario-run` gets Playwright's `page`, so it can still read request bodies through Playwright itself (`page.requests()` keeps the last 100, each with `postData()`; or its own `page.on('request')` listener) and can read form fields directly — arbitrary scripts cannot be fenced completely (`page.context().pages()` escapes any wrapper). Also not covered: request headers when you pass `includeRequestHeaders`, response bodies (`includeResponseBody`, `capture_xhr`), and query strings in URLs.
+
 ### Smoke test fails: "tool count too low"
 
 The relay started but returned fewer than 60 tools. Check the relay's stderr output for upstream-spawn errors, or the smoke script's stderr tail.
