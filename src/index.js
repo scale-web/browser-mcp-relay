@@ -54,6 +54,7 @@ const { createSigninPolicy, installSigninGuard, installSigninWatchdog } = requir
 const { createAskVerifier } = require("./plainflags-ask-verify.js");
 const { createPlainflagsPolicy } = require("./plainflags-policy.js");
 const { createLock } = require("./plainflags-lock.js");
+const { createDefaultLockPolicy } = require("./default-lock.js");
 const { createClickCounter } = require("./challenge-clicks.js");
 const { plainflagsTools } = require("./own-tools/index.js");
 const challengeDetect = require("./own-tools/challenge-detect.js");
@@ -1014,15 +1015,15 @@ async function main() {
     cloneBelongsTo: pool.cloneBelongsTo,
     metaGuard: bridge ? (bridge.metaGuard && bridge.metaGuard.alive() ? "active" : "down (re-armed on the next browser call)") : "not installed yet (no Brave)",
   })));
-  /** relay_status re-probes the lock when a Brave is up (it never launches one). */
+  /** relay_status re-probes the lock when a Brave is up (it never launches one; the probe is bounded — L4). */
   async function refreshLock() {
     // `policy` is declared below; relay_status only runs after it exists.
-    if (!plain || !bridge || !policy) return;
+    if (!bridge || !policy) return;
     try { await policy.lock.probe(); } catch { /* status shows the last state */ }
   }
-  /** Plain-flags fields on relay_status (the default relay's payload is unchanged). */
+  /** Plain-flags fields on relay_status; the default relay adds only its lock (A77). */
   function withPlainflagsStatus(st) {
-    if (!plain) return st;
+    if (!plain) return { ...st, lock: policy ? policy.lock.status() : null };
     const sl = signinPolicy.status();
     return {
       ...st,
@@ -1055,7 +1056,12 @@ async function main() {
         log: (m) => process.stderr.write(`[mcp-relay] ${m}\n`),
       }),
     })
-    : null;
+    // A77: the default relay's lock (a filled secret field; values this relay filled are excepted).
+    : createDefaultLockPolicy({
+      getContext: () => (bridge ? bridge.context : null),
+      notice: pushNotice,
+      log: (m) => process.stderr.write(`[mcp-relay] ${m}\n`),
+    });
   const relay = new RelayServer({ getUpstream, ensureBrave, takeNotices, policy });
   // Register Phase C own-tools. Each entry in ownTools is
   // { name, description, inputSchema, handler }. challenge_click and

@@ -63,7 +63,8 @@ function fakeBrowser() {
     return s;
   }
   const phantoms = []; // frames CDP describes that Playwright has not listed yet (an attach race)
-  const mainTree = () => ({ frame: { id: "MAIN", url: main.url() }, childFrames: [...frames.filter((f) => f !== main && !oopif.has(f)).map((f) => ({ frame: { id: f._id, url: f.url() } })), ...phantoms.map((p) => ({ frame: p }))] });
+  const undescribed = new Set(); // Playwright frames no CDP frame tree describes (1c L2)
+  const mainTree = () => ({ frame: { id: "MAIN", url: main.url() }, childFrames: [...frames.filter((f) => f !== main && !oopif.has(f) && !undescribed.has(f)).map((f) => ({ frame: { id: f._id, url: f.url() } })), ...phantoms.map((p) => ({ frame: p }))] });
   const ctx = {
     pages: () => [page],
     async newCDPSession(target) {
@@ -75,7 +76,7 @@ function fakeBrowser() {
     },
   };
   return {
-    ctx, main, frames, counts, contexts, log, oopif, phantoms, sessions,
+    ctx, page, main, frames, counts, contexts, log, oopif, phantoms, sessions, undescribed,
     onNextEvaluate(f) { beforeEvaluate = f; },
     addFrame(id, url, opts = {}) { const f = frame(id, url, main); frames.push(f); if (opts.oopif) oopif.set(f, opts); return f; },
     /** A cross-process navigation: contexts die, NUMERIC ids restart, the page's own new contexts take the low ids. */
@@ -228,4 +229,58 @@ test("round 7 rule 0 (fake CDP): every probe opens its own sessions and detaches
   assert.strictEqual(b.sessions.length, 4, "the second probe opened new ones");
   assert.ok(b.sessions.every((s) => s.detached));
   assert.strictEqual(b.log.filter((l) => l === "Page.createIsolatedWorld").length - worldsBefore, 2, "the world of each frame (MAIN, OOP) is resolved again");
+});
+
+// ── 1c final review L2 / L4 ─────────────────────────────────────────────────
+
+test("1c L2 (fake CDP): a frame Playwright lists that NO CDP session describes is unreadable — beside a seen secret field, its tab fails closed", async () => {
+  const b = fakeBrowser();
+  const ghost = b.addFrame("GHOST", "https://b.example/ghost");
+  b.undescribed.add(ghost);
+  b.counts.set("MAIN", { seen: 1, filled: 0 });
+  const st = await createLock({ getContext: () => b.ctx, accounts: [], readTabs: createCdpReader({ frameTimeoutMs: 300 }) }).probe();
+  assert.strictEqual(st.unreadable, 1, JSON.stringify(st));
+  assert.strictEqual(st.locked, true);
+  b.undescribed.delete(ghost);
+  const ok = await createLock({ getContext: () => b.ctx, accounts: [], readTabs: createCdpReader({ frameTimeoutMs: 300 }) }).probe();
+  assert.deepStrictEqual([ok.unreadable, ok.locked], [0, false], "described again: readable, nothing filled");
+});
+
+test("1c L4 (fake CDP): a newCDPSession that HANGS is bounded by the frame timeout (not the tab's) — that frame is unreadable, the tab fails closed, and a session that arrives late is detached", async () => {
+  const b = fakeBrowser();
+  const slow = b.addFrame("SLOW", "https://pay.example/frame", { oopif: true });
+  b.counts.set("MAIN", { seen: 1, filled: 0 });
+  const orig = b.ctx.newCDPSession;
+  let late = null;
+  b.ctx.newCDPSession = async (t) => {
+    if (t !== slow) return orig(t);
+    await new Promise((r) => setTimeout(r, 1500));
+    late = await orig(t);
+    return late;
+  };
+  const lock = createLock({ getContext: () => b.ctx, accounts: [], readTabs: createCdpReader({ frameTimeoutMs: 200, tabTimeoutMs: 20000 }) });
+  const t0 = Date.now();
+  const st = await lock.probe();
+  const ms = Date.now() - t0;
+  assert.ok(ms < 1000, `bounded by the 200 ms frame timeout, took ${ms} ms`);
+  assert.deepStrictEqual([st.unreadable, st.locked], [1, true], JSON.stringify(st));
+  await new Promise((r) => setTimeout(r, 1700));
+  assert.ok(late && late.detached, "the late session was detached, never used");
+});
+
+test("1c L4 (fake CDP): each TAB is bounded and tabs are read in parallel — three tabs whose frames each time out end together at the tab timeout; a filled password on a fourth tab still locks", async () => {
+  const bs = [fakeBrowser(), fakeBrowser(), fakeBrowser(), fakeBrowser()];
+  for (const b of bs.slice(0, 3)) for (let i = 0; i < 6; i++) b.addFrame(`H${i}`, `https://ads${i}.example/`, { oopif: true, hangTree: true });
+  bs[3].counts.set("MAIN", { seen: 1, filled: 1 });
+  const owner = (t) => bs.find((b) => b.page === t || b.frames.includes(t));
+  const ctx = { pages: () => bs.map((b) => b.page), newCDPSession: (t) => owner(t).ctx.newCDPSession(t) };
+  const lock = createLock({ getContext: () => ctx, accounts: [], readTabs: createCdpReader({ frameTimeoutMs: 300, tabTimeoutMs: 500 }) });
+  const t0 = Date.now();
+  const st = await lock.probe();
+  const ms = Date.now() - t0;
+  // unbounded and sequential: 3 tabs × 6 frames × 300 ms ≈ 5.4 s
+  assert.ok(ms < 1200, `took ${ms} ms`);
+  assert.strictEqual(st.locked, true, JSON.stringify(st));
+  assert.strictEqual(st.reason, "a password / one-time-code field on a tab holds a value");
+  assert.ok(st.unreadable >= 3, JSON.stringify(st));
 });

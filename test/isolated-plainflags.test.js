@@ -126,6 +126,10 @@ async function startServer() {
       case "/chl-busy-page": return send(200, pageHtml(`<input type="password" id="pw"><iframe src="https://challenges.cloudflare.com:${TLS_PORT}/busy-frame" width="300" height="65"></iframe>`));
       case "/login-form": return send(200, pageHtml(`<form method="post" action="/session"><input name="email" id="email" autocomplete="username"><input type="password" name="pw" id="lpw"><button id="go">go</button></form>`));
       case "/session": return send(200, pageHtml("SESSION-OK"));
+      // A77 (the default relay's lock)
+      case "/a77-nolock": return send(200, pageHtml(`<h1>A77-NOLOCK</h1><input type="password" id="pw"><input type="checkbox" name="password" id="cb" checked><input type="text" name="first" value="Zed">`));
+      case "/a77-shadow": return send(200, pageHtml(`<div id="h"></div><script>const r=document.getElementById("h").attachShadow({mode:"open"});r.innerHTML='<div id="h2"></div>';r.getElementById("h2").attachShadow({mode:"open"}).innerHTML='<input type="password" id="spw">';</script>`));
+      case "/a77-xo5": return send(200, pageHtml(`<input type="password" id="pw">${Array.from({ length: 5 }, (_, i) => `<iframe src="http://www.fixturexo${i}.test:${P}/xs-frame"></iframe>`).join("")}`));
       case "/api/modal-login": return send(200, "{}", { "content-type": "application/json", "set-cookie": "FDSESS=abc123; Path=/; HttpOnly" });
       case "/sw.js": return send(200, SW_JS, { "content-type": "text/javascript", "service-worker-allowed": "/" });
       case "/sw-setup": return send(200, pageHtml(`<script>navigator.serviceWorker.register("/sw.js", { scope: "/" }).then(() => navigator.serviceWorker.ready).then(() => { document.title = "SW-READY"; });</script>`));
@@ -1115,4 +1119,190 @@ test("round 7 item 1d / item 4 (HIGH): an iframe moves out of process, is probed
     await fr.fill("#pw", "");
     return (first.locked && !cleared.locked && second.locked) || JSON.stringify({ first, cleared, second });
   });
+});
+
+// ── A77: the DEFAULT relay's lock (ruling as-ops/ask-a2ggu5 rev 2, "Lock, except session-filled values") ──
+
+const SESSION_PW = "Session-Fixture-Pw-41";
+const DEFAULT_RELAY_ENV = () => ({
+  BROWSER_RELAY_TEST_LAUNCH: "1",
+  BROWSER_HEADLESS_ENABLE: "true",
+  BROWSER_RELAY_BRAVE_PATH: BRAVE,
+  TELEMETRY_ENABLE: "false",
+  BROWSER_RELAY_PROFILE_MODE: "default",
+});
+
+test("A77 e2e DEFAULT relay: Trevor's typed password (over CDP) refuses the aria snapshot, navigation, get-as-html and the screenshot; tabs_list + relay_status work; clearing unlocks; a session form_fill of a password then interaction_click submit works; no lock on an empty password field or a checkbox named password", ISO, async () => {
+  await startServer();
+  const home = homeTmp("home-a77-");
+  const proj = path.join(home, "proj-a77");
+  const r = await startRelay({ env: { HOME: home, CLAUDE_PROJECT_DIR: proj, ...DEFAULT_RELAY_ENV() }, realUpstream: true });
+  const { chromium } = require("playwright-core");
+  let peek = null;
+  const seen = [];
+  const call = async (n, a = {}, t = 60000) => { const x = await r.call(n, a, t); seen.push(JSON.stringify(x)); return x; };
+  try {
+    assert.ok(!(await call("tabs_list", {}, 90000)).isError);
+    const side = JSON.parse(fs.readFileSync(path.join(cacheOf(home), "profiles", slugOf(proj), ".mcp-relay-status.json"), "utf8"));
+    peek = await chromium.connectOverCDP(`http://127.0.0.1:${side.cdpPort}`);
+    const pageAt = async (part) => waitFor(async () => peek.contexts()[0].pages().find((x) => x.url().includes(part)) || null, 10000);
+    const LOCKED_RE = /^\[mcp-relay\] Locked: a password or one-time code typed on this page \(Trevor may be signing in\)\. Tools resume when the field is empty, or holds only a value this session filled\./;
+
+    // the default tool list is untouched (a11y_* and execute are still offered)
+    const names = (await r.request("tools/list", {})).tools.map((t) => t.name);
+    for (const n of ["a11y_take-aria-snapshot", "execute", "cookies_export", "navigation_reload"]) assert.ok(names.includes(n), n);
+
+    // no lock: an EMPTY password field and a checked checkbox named password
+    const nl = await call("navigation_go-to", { url: U("www.fixturepublic.test", "/a77-nolock") });
+    assert.ok(!nl.isError, nl.text.slice(0, 300));
+    assert.ok(!(await call("a11y_take-aria-snapshot")).isError);
+    assert.ok(!(await call("content_get-as-html")).isError);
+
+    // (1) Trevor types a password → every tool but relay_status / tabs_list is refused
+    assert.ok(!(await call("navigation_go-to", { url: U("www.fixturepublic.test", "/signin-fixture"), includeSnapshot: false })).isError);
+    const sp = await pageAt("/signin-fixture");
+    await sp.fill("#pw", PASSWORD);
+    for (const [n, a] of [
+      ["a11y_take-aria-snapshot", {}], ["navigation_go-to", { url: U("www.fixturepublic.test", "/") }], ["navigation_go-back-or-forward", { direction: "back" }],
+      ["content_get-as-html", {}], ["content_take-screenshot", {}], ["content_get-as-text", {}], ["execute", { script: "return 1" }], ["interaction_click", { selector: "#go" }],
+    ]) {
+      const x = await call(n, a);
+      assert.strictEqual(x.isError, true, `${n}: ${x.text.slice(0, 200)}`);
+      assert.match(x.text, LOCKED_RE, n);
+    }
+    assert.strictEqual(sp.url().includes("/signin-fixture"), true, "the refused navigation did not run");
+    const tl = await call("tabs_list");
+    assert.ok(!tl.isError, "tabs_list is exempt");
+    const st = JSON.parse((await call("relay_status")).text);
+    assert.strictEqual(st.lock.locked, true);
+    assert.ok(seen.some((t) => /\[browser-mcp-relay\] LOCKED — /.test(t)), "the lock is announced");
+
+    // clearing it unlocks
+    await sp.fill("#pw", "");
+    const t1 = await call("a11y_take-aria-snapshot");
+    assert.ok(!t1.isError, t1.text.slice(0, 200));
+    assert.ok(t1.notices.some((n) => /UNLOCKED/.test(n)), t1.notices.join(" | "));
+
+    // (2) the SESSION fills a fixture password (form_fill) and submits (interaction_click): never locked
+    assert.ok(!(await call("navigation_go-to", { url: U("www.fixturepublic.test", "/login-form"), includeSnapshot: false })).isError);
+    const lf = await pageAt("/login-form");
+    const ff = await call("form_fill", { fields: [{ selector: "#email", value: "zz@example.invalid" }, { selector: "#lpw", value: SESSION_PW }] });
+    assert.ok(!ff.isError, ff.text.slice(0, 300));
+    assert.strictEqual(await lf.inputValue("#lpw"), SESSION_PW);
+    const snap = await call("a11y_take-aria-snapshot");
+    assert.ok(!snap.isError, `the session's own value does not lock: ${snap.text.slice(0, 200)}`);
+    const click = await call("interaction_click", { selector: "#go" });
+    assert.ok(!click.isError, click.text.slice(0, 300));
+    await waitFor(async () => (await lf.textContent("body").catch(() => "")).includes("SESSION-OK"), 10000);
+    assert.match(await lf.textContent("body"), /SESSION-OK/, "submitted");
+
+    // (3) interaction_fill too; then Trevor types a DIFFERENT value over it → locked
+    assert.ok(!(await call("navigation_go-to", { url: U("www.fixturepublic.test", "/signin-fixture"), includeSnapshot: false })).isError);
+    const sp2 = await pageAt("/signin-fixture");
+    const fi = await call("interaction_fill", { selector: "#pw", value: SESSION_PW });
+    assert.ok(!fi.isError, fi.text.slice(0, 300));
+    assert.ok(!(await call("content_get-as-text")).isError);
+    await sp2.fill("#pw", PASSWORD);
+    assert.match((await call("content_get-as-text")).text, LOCKED_RE);
+    await sp2.fill("#pw", "");
+    assert.ok(!(await call("content_get-as-text")).isError);
+
+    assert.ok(seen.every((t) => !t.includes(PASSWORD)), "Trevor's password never appears in any tool result");
+    assert.ok(!r.stderr().includes(PASSWORD) && !r.stderr().includes(SESSION_PW), "nor in the relay's log");
+  } finally {
+    if (peek) await peek.close().catch(() => {});
+    await r.stop();
+  }
+});
+
+test("A77 default-mode lock on a real Brave: the in-page hash matches a session value in the main frame, a cross-origin iframe and two open shadow roots deep (1c L1); a different value locks", ISO, async () => {
+  await startServer();
+  const { createLock, createSessionFills } = require("../src/plainflags-lock.js");
+  const { h } = await launchPf("pf-a77h-", "default");
+  try {
+    const page = h.context.pages()[0] || (await h.context.newPage());
+    const fills = createSessionFills();
+    const lock = createLock({ getContext: () => h.context, mode: "default", sessionFills: fills });
+    fills.record(SESSION_PW);
+    await page.goto(U("www.fixturepublic.test", "/signin-fixture"));
+    await page.fill("#pw", SESSION_PW);
+    const own = await lock.probe();
+    assert.deepStrictEqual([own.locked, own.sessionFilled, own.unreadable], [false, 1, 0], JSON.stringify(own));
+    await page.fill("#pw", PASSWORD);
+    assert.strictEqual((await lock.probe()).locked, true);
+    await page.goto(U("www.fixturepublic.test", "/xo-parent"));
+    const child = await waitFor(async () => page.frames().find((f) => f.url().includes("/xo-child")) || null, 10000);
+    await child.fill("#xpw", SESSION_PW);
+    assert.strictEqual((await lock.probe()).locked, false, "a session value in a cross-origin frame");
+    await child.fill("#xpw", PASSWORD);
+    assert.strictEqual((await lock.probe()).locked, true);
+    await page.goto(U("www.fixturepublic.test", "/a77-shadow"));
+    assert.strictEqual((await lock.probe()).locked, false, "empty");
+    await page.fill("#spw", PASSWORD); // Playwright pierces open shadow roots
+    const sh = await lock.probe();
+    assert.deepStrictEqual([sh.locked, sh.seen], [true, 1], JSON.stringify(sh));
+  } finally { await closeBrave(h); }
+});
+
+test("A77 default-mode lock: the round-5 cross-site navigation (12×) and the round-7 process swaps (about:blank → cross-site; second swap) still lock a typed password", ISO, async () => {
+  await startServer();
+  const { createLock, createSessionFills } = require("../src/plainflags-lock.js");
+  const { h } = await launchPf("pf-a77x-", "default");
+  try {
+    const page = h.context.pages()[0] || (await h.context.newPage());
+    const fills = createSessionFills();
+    fills.record(SESSION_PW); // an unrelated session value: the allow path runs on every probe
+    const lock = createLock({ getContext: () => h.context, mode: "default", sessionFills: fills });
+    const outcomes = [];
+    for (let i = 0; i < 12; i++) {
+      await page.goto(U(`www.a77sitea${i}.test`, "/xs-a"));
+      assert.strictEqual((await lock.probe()).locked, false);
+      await page.goto(U(`www.a77siteb${i}.test`, `/xs-b?n=${1 + (i % 3)}`));
+      await page.waitForLoadState("load");
+      await page.fill("#pw", PASSWORD);
+      outcomes.push((await lock.probe()).locked);
+      await page.fill("#pw", "");
+    }
+    assert.deepStrictEqual(outcomes, Array(12).fill(true), outcomes.join(","));
+    const swaps = [];
+    for (let i = 0; i < 5; i++) {
+      await page.goto(U(`www.a77swaptop${i}.test`, "/swap-top"));
+      assert.strictEqual((await lock.probe()).locked, false);
+      let fr = await swapFrame(page, U(`www.a77swapx${i}.test`, "/swap-pw"));
+      assert.strictEqual(await oopif(h, fr), true);
+      await fr.fill("#pw", PASSWORD);
+      const first = await lock.probe();
+      await fr.fill("#pw", "");
+      fr = await swapFrame(page, U(`www.a77swapy${i}.test`, "/swap-pw"));
+      await fr.fill("#pw", PASSWORD);
+      const second = await lock.probe();
+      await fr.fill("#pw", "");
+      swaps.push(first.locked && second.locked);
+    }
+    assert.deepStrictEqual(swaps, Array(5).fill(true), swaps.join(","));
+  } finally { await closeBrave(h); }
+});
+
+test("A77 latency: the probe's cost per tool call in the default relay (2 probes per call) — a page with 0 iframes, 5 same-site and 5 cross-site iframes", ISO, async (t) => {
+  await startServer();
+  const { createLock, createSessionFills } = require("../src/plainflags-lock.js");
+  const { h } = await launchPf("pf-a77l-", "default");
+  try {
+    const page = h.context.pages()[0] || (await h.context.newPage());
+    const fills = createSessionFills();
+    fills.record(SESSION_PW);
+    const lock = createLock({ getContext: () => h.context, mode: "default", sessionFills: fills });
+    const out = {};
+    for (const [label, url] of [["0 iframes", U("www.a77lat.test", "/signin-fixture")], ["5 same-site iframes", U("www.a77lat.test", "/xs-b?n=5")], ["5 cross-site iframes", U("www.a77lat.test", "/a77-xo5")]]) {
+      await page.goto(url);
+      await page.waitForLoadState("load");
+      await lock.probe(); // warm
+      const ms = [];
+      for (let i = 0; i < 15; i++) { const t0 = process.hrtime.bigint(); const st = await lock.probe(); ms.push(Number(process.hrtime.bigint() - t0) / 1e6); assert.strictEqual(st.unreadable, 0, label); }
+      ms.sort((a, b) => a - b);
+      out[label] = { medianMs: +ms[7].toFixed(1), p90Ms: +ms[13].toFixed(1), maxMs: +ms[14].toFixed(1), frames: page.frames().length };
+    }
+    t.diagnostic(`A77 probe latency (one probe; a tool call runs two): ${JSON.stringify(out)}`);
+    process.stderr.write(`A77-LATENCY ${JSON.stringify(out)}\n`);
+  } finally { await closeBrave(h); }
 });

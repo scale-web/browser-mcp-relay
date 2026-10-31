@@ -87,9 +87,10 @@ class RelayServer {
     // consumed when a result is actually returned, so a thrown call never
     // swallows one.
     this.takeNotices = typeof takeNotices === "function" ? takeNotices : () => [];
-    // Plain-flags mode only (src/plainflags-policy.js, spec v8 §5.6): the tool
+    // Plain-flags mode (src/plainflags-policy.js, spec v8 §5.6): the tool
     // allowlist, the sign-in guard's layer 1 and the typed-secret / body limits.
-    // The default relay passes none, and every path below is then unchanged.
+    // The default relay (A77) passes src/default-lock.js: the secret-on-page
+    // lock only — tool list and args unchanged. No policy = every path below unchanged.
     this.policy = policy || null;
     this.ownTools = new Map(); // name → { name, description, inputSchema, handler, needsBrave }
     // Traffic emitter is always present so call sites don't need null-guards.
