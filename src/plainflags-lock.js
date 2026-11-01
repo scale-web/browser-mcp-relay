@@ -159,14 +159,19 @@ const secretProbe = (allow) => {
   // with "passeng" or "passport" (at the start, after a separator or at a
   // camelCase boundary) and any "bypass" / "compass" are cut out first, and
   // whatever is left is tested as above ("passengerPassword" still locks).
-  // Fix round 3: each exception matches only as ONE word — all lower case,
-  // ALL CAPS or Capitalised — never across a camelCase boundary, so
-  // "loginByPassword", "comPassword" and "passPortal" keep their "Pass".
+  // The passeng / passport cut is case-AWARE (it needs camelCase token starts —
+  // fix round 3: "passPortal" keeps its "pass", "userPassport" is cut). The
+  // bypass / compass cut matches only the word's three natural casings —
+  // all lower case, ALL CAPS, Capitalised — never across a camelCase boundary
+  // (round 3: "loginByPass", "comPassword" keep their "Pass"), and never when
+  // the "pass" runs on into a "w" in EITHER case (round 4: "bypassword";
+  // round 5, Trevor's ruling as-ops/ask-am5h7p rev 2: "bypassWord",
+  // "BYPASSwd" — so "bypassWarning" also locks, fail closed, as in base).
+  // Any other casing ("bYpAsS") is never cut, so it locks, as in base.
   const notPassword = (str) => String(str || "")
     .replace(/(^|[^A-Za-z0-9])(passeng|passport|PASSENG|PASSPORT|Passeng|Passport)/g, "$1")
     .replace(/([a-z0-9])(?:Passeng|Passport|PASSENG|PASSPORT)/g, "$1")
-    // fix round 4: never when "pass" runs on into "w" ("bypassword", "COMPASSWORD", "authbypasswd" keep it)
-    .replace(/(?:by|com)pass(?!w)|(?:BY|COM)PASS(?!W)|(?:By|Com)pass(?!w)/g, "");
+    .replace(/(?:by|com)pass(?![wW])|(?:BY|COM)PASS(?![wW])|(?:By|Com)pass(?![wW])/g, "");
   const nameSecret = (nm, id) => {
     const a = dflt ? notPassword(nm) : nm;
     const b = dflt ? notPassword(id) : id;

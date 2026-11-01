@@ -385,11 +385,13 @@ test("A77 round 2 (F1) + round 3: default mode uses plain-flags' SUBSTRING name 
   const reviewer = ["password1", "Password1", "pass1", "pwd1", "passwd2", "passcode1", "passphrase1", "passwordconfirm", "passwordfield", "passwordinput",
     "userpass", "newpass", "pwdhash", "passw", "passwort", "mot_de_passe", "motdepasse", "PASSWORD_1"];
   // round 3: an exception never matches across a camelCase boundary
-  const round3 = ["loginByPassword", "signInByPassword", "byPassword", "loginByPass", "comPassword", "passPortal", "x_passPort", "BYPassword"];
+  const round3 = ["loginByPassword", "signInByPassword", "byPassword", "loginByPass", "comPassword", "passPortal", "x_passPort", "BYPassword", "byPass", "ComPass", "comPass"];
+  // round 5 (Trevor's ruling as-ops/ask-am5h7p rev 2): a w OR W after bypass / compass keeps the "pass"; an odd casing is never cut
+  const round5 = ["loginbypassWord", "bypassWord", "BypassWord", "BYPASSword", "BYPASSwd", "bypassWD", "compassWord", "CompassWD", "bypassWarning", "compassWidget", "bypasswarning", "bYpAsS", "cOmPaSs_cache"];
   // round 4: an exception never eats the "pass" of a run-together "password" / "passwd"; the passeng / passport cut never reaches a following "pass"
   const round4 = ["loginbypassword", "signinbypassword", "bypassword", "Bypassword", "BYPASSWORD", "LOGINBYPASSWORD", "compassword", "Compassword", "COMPASSWORD", "authbypasswd",
     "passportpassword", "PASSPORTPASSWORD", "passengerpassword", "passportpwd", "Passport_password"];
-  for (const name of [...reviewer, ...round3, ...round4, "user_pass", "newPassword", "pwd", "otp_code", "passengerPassword", "passport_pwd", "bypassPassword", "mypassport"]) {
+  for (const name of [...reviewer, ...round3, ...round4, ...round5, "user_pass", "newPassword", "pwd", "otp_code", "passengerPassword", "passport_pwd", "bypassPassword", "mypassport"]) {
     for (const key of ["name", "id"]) {
       assert.strictEqual(filled({ type: "text", [key]: name }, D), 1, `default ${key}=${name}`);
       assert.strictEqual(filled({ type: "text", [key]: name }, null), 1, `plain-flags ${key}=${name}`);
@@ -568,4 +570,28 @@ test("A77 round 3: a lock probe that THROWS fails closed — before the call (re
     assert.match(e.message, /the lock probe failed — fail closed\) — this call's error was withheld/);
     return true;
   });
+});
+
+test("A77 round 5 (generated): every casing of bypass (2^6) and compass (2^7) × 10 suffixes × 4 prefixes — default mode locks iff the suffix starts with w / W, OR the casing is not one of the three natural forms (lower, UPPER, Capitalised), OR the rest of the name would lock in base; plain-flags equals base on every one", () => {
+  const casings = (w) => Array.from({ length: 2 ** w.length }, (_, m) => [...w].map((c, i) => ((m >> i) & 1 ? c.toUpperCase() : c)).join(""));
+  const SUFFIXES = ["", "word", "Word", "WORD", "wd", "WD", "_cache", "Cache", "1", "_x"];
+  const PREFIXES = ["", "login", "LOGIN", "cache_"];
+  const baseRule = (n) => /pass|pwd/i.test(n); // base 7491e5b's name rule for these names (no "otp" word in any of them)
+  const filled = (name, mode) => runProbe(docOf([input({ type: "text", name }, "Zed-value-1")]), mode).filled;
+  let n = 0;
+  const bad = [];
+  for (const word of ["bypass", "compass"]) {
+    for (const w of casings(word)) for (const suf of SUFFIXES) for (const pre of PREFIXES) {
+      const name = pre + w + suf;
+      const natural = w === word || w === word.toUpperCase() || w === word[0].toUpperCase() + word.slice(1);
+      const want = /^w/i.test(suf) || !natural || baseRule(pre + suf) ? 1 : 0;
+      const d = filled(name, { dflt: true });
+      const p = filled(name, null);
+      if (d !== want) bad.push(`default ${name}: ${d} (want ${want})`);
+      if (p !== (baseRule(name) ? 1 : 0)) bad.push(`plain ${name}: ${p}`);
+      n++;
+    }
+  }
+  assert.strictEqual(n, (64 + 128) * 10 * 4);
+  assert.deepStrictEqual(bad.slice(0, 20), [], `${bad.length} mismatches`);
 });
