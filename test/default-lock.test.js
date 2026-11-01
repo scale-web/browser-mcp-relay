@@ -379,42 +379,111 @@ test("A77 fix 2: the session filled single digits 1..6 into split code boxes —
   assert.strictEqual((await d2.lock.probe()).locked, false);
 });
 
-test("A77 fix 3b: the name / id rule matches password words WHOLE in default mode — passenger_name, passport, bypass, compass do not lock there (they still do in plain-flags); user_pass, newPassword, pwd, otp_code, userpassword lock in both; type=password and the autocomplete values lock regardless of name", () => {
+test("A77 round 2 (F1): default mode uses plain-flags' SUBSTRING name / id rule minus only the ruled false positives — the reviewer's 18 names lock, passenger_name / passport / bypass / compass do not (they still do in plain-flags)", () => {
   const D = { dflt: true };
   const filled = (attrs, mode) => runProbe(docOf([input(attrs, "Zed-value-1")]), mode).filled;
-  for (const name of ["passenger_name", "passport", "bypass", "compass", "passengers", "PassengerCount"]) {
-    assert.strictEqual(filled({ type: "text", name }, D), 0, `default: ${name}`);
-    assert.strictEqual(filled({ type: "text", id: name }, D), 0, `default id: ${name}`);
-    assert.strictEqual(filled({ type: "text", name }, null), 1, `plain-flags unchanged (substring): ${name}`);
+  const reviewer = ["password1", "Password1", "pass1", "pwd1", "passwd2", "passcode1", "passphrase1", "passwordconfirm", "passwordfield", "passwordinput",
+    "userpass", "newpass", "pwdhash", "passw", "passwort", "mot_de_passe", "motdepasse", "PASSWORD_1"];
+  for (const name of [...reviewer, "user_pass", "newPassword", "pwd", "otp_code", "passengerPassword", "passport_pwd", "bypassPassword", "mypassport"]) {
+    for (const key of ["name", "id"]) {
+      assert.strictEqual(filled({ type: "text", [key]: name }, D), 1, `default ${key}=${name}`);
+      assert.strictEqual(filled({ type: "text", [key]: name }, null), 1, `plain-flags ${key}=${name}`);
+    }
   }
-  for (const name of ["user_pass", "newPassword", "pwd", "otp_code", "userpassword", "login.passwd", "pass[1]", "accessPasscode", "my-passphrase", "OTPInput"]) {
-    assert.strictEqual(filled({ type: "text", name, maxlength: "6" }, D), 1, `default: ${name}`);
-    assert.strictEqual(filled({ type: "text", name, maxlength: "6" }, null), 1, `plain-flags: ${name}`);
+  for (const name of ["passenger_name", "passengerName", "PassengerCount", "passengers", "passport", "passport_no", "userPassport", "bypass", "bypass_cache", "compass", "compass_heading"]) {
+    for (const key of ["name", "id"]) {
+      assert.strictEqual(filled({ type: "text", [key]: name }, D), 0, `default ${key}=${name}: a ruled exception`);
+      assert.strictEqual(filled({ type: "text", [key]: name }, null), 1, `plain-flags unchanged (substring): ${key}=${name}`);
+    }
   }
   for (const attrs of [{ type: "password", name: "passenger_name" }, { type: "text", name: "bypass", autocomplete: "current-password" }, { type: "text", name: "x", autocomplete: "one-time-code" }]) {
     assert.strictEqual(filled(attrs, D), 1, JSON.stringify(attrs));
   }
 });
 
-test("A77 fix 3a: a field still holding the PAGE's value (not dirty) does not count in default mode — and does in plain-flags; a value that differs from the page's, or a dirty one equal to it, counts", () => {
-  // a fake control with the HTML dirty-value flag: its value follows defaultValue only while not dirty
-  const control = (def, { typed = null, dirty = false } = {}) => {
-    const el = input({ type: "password" });
-    let d = def; let v = typed === null ? def : typed; let isDirty = dirty || typed !== null;
-    Object.defineProperty(el, "defaultValue", { get: () => d, set: (x) => { d = x; if (!isDirty) v = x; } });
-    Object.defineProperty(el, "value", { get: () => v, set: (x) => { v = x; isDirty = true; } });
-    el.cloneNode = () => control(d, isDirty ? { typed: v, dirty: true } : {});
-    return el;
-  };
-  const D = { dflt: true };
-  const count = (el, mode) => runProbe(docOf([el]), mode);
-  assert.deepStrictEqual(count(control("Saved-Pw-Server-1"), D), { seen: 1, filled: 0, own: 0 }, "the page's own value");
-  assert.deepStrictEqual(count(control("Saved-Pw-Server-1"), null), { seen: 1, filled: 1 }, "plain-flags: exactly as before");
-  assert.strictEqual(count(control("Saved-Pw-Server-1", { typed: TYPED }), D).filled, 1, "typed over the page's value");
-  assert.strictEqual(count(control("Saved-Pw-Server-1", { typed: "Saved-Pw-Server-1" }), D).filled, 1, "re-typed (dirty) equal to it: still counts");
-  assert.strictEqual(count(control("", { typed: TYPED }), D).filled, 1, "no page value: unchanged");
-  // a control the clone check cannot run on (no cloneNode) fails closed
-  const bare = input({ type: "password" }, "Saved-Pw-Server-1");
-  bare.defaultValue = "Saved-Pw-Server-1";
-  assert.strictEqual(count(bare, D).filled, 1);
+test("A77 round 2 (F2): the page-sent exception is gone — a field holding the page's own value (its value attribute) counts as filled in default mode, exactly as in plain-flags", () => {
+  const el = input({ type: "password", value: "Saved-Pw-Server-1" }, "Saved-Pw-Server-1");
+  el.defaultValue = "Saved-Pw-Server-1";
+  el.cloneNode = () => { throw new Error("the probe must not clone page nodes"); };
+  assert.deepStrictEqual(runProbe(docOf([el]), { dflt: true }), { seen: 1, filled: 1, own: 0, kinds: ["type=password"] });
+  assert.deepStrictEqual(runProbe(docOf([el]), null), { seen: 1, filled: 1 });
+});
+
+test("A77 round 2 (F2): kinds — the rule tags of the FILLED fields only (never a value, a name or an id), and none in plain-flags", () => {
+  const els = [input({ type: "password", id: "secret-id-xyz" }, "v1-value"), input({ type: "text", name: "user_pwd_xyz" }, "v2-value"), input({ type: "text", autocomplete: "one-time-code" }, ""), input({ type: "text", name: "code", inputmode: "numeric", maxlength: "6" }, "123456")];
+  const r = runProbe(docOf(els), { dflt: true });
+  assert.deepStrictEqual(r, { seen: 4, filled: 3, own: 0, kinds: ["name-rule", "otp", "type=password"] });
+  assert.ok(!/xyz|value|123456/.test(JSON.stringify(r)));
+  assert.ok(!("kinds" in runProbe(docOf(els), null)));
+});
+
+// ── round 2: the lock-episode log (F2) and dialog_handle (F3) ──────────────
+
+const { ReapLog } = require("../src/reap-hold.js");
+
+test("A77 round 2 (F2): one episode line per lock and per unlock — exactly {event, reason, kinds, tabs, host} (+ durationMs on unlock); the host only; written 0600 through the relay's rotating log; no typed value, name, id, path or query in the file", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-a77-episodes-"));
+  const file = path.join(dir, "default-lock-episodes.log");
+  const elog = new ReapLog({ file, slug: "proj-x" });
+  const calls = [];
+  const b = fakeBrowser();
+  const [pw] = b.add("A", "https://bank.example/secret-path/login?code=QUERY-MARK-9#frag", [input({ type: "password", id: "pw-id-mark", name: "pw-name-mark" })]);
+  b.add("B", "https://other.example/", [input({ type: "text" })]);
+  const lock = createLock({ getContext: () => ({}), mode: "default", sessionFills: createSessionFills(), readTabs: b.readTabs, episode: ({ event, ...f }) => { calls.push({ event, ...f }); elog.write(event, f); } });
+  await lock.probe();
+  pw.value = TYPED;
+  await lock.probe();
+  await lock.probe(); // still locked: no new line
+  await new Promise((r) => setTimeout(r, 15));
+  pw.value = "";
+  await lock.probe();
+  assert.strictEqual(calls.length, 2, JSON.stringify(calls));
+  assert.deepStrictEqual(Object.keys(calls[0]).sort(), ["event", "host", "kinds", "reason", "tabs"]);
+  assert.deepStrictEqual(Object.keys(calls[1]).sort(), ["durationMs", "event", "host", "kinds", "reason", "tabs"]);
+  assert.deepStrictEqual({ ...calls[0] }, { event: "lock", reason: "filled", kinds: ["type=password"], tabs: 1, host: "bank.example" });
+  assert.strictEqual(calls[1].event, "unlock");
+  assert.ok(calls[1].durationMs >= 10, JSON.stringify(calls[1]));
+  const text = fs.readFileSync(file, "utf8");
+  const lines = text.trim().split("\n").map((l) => JSON.parse(l));
+  assert.strictEqual(lines.length, 2);
+  assert.deepStrictEqual(Object.keys(lines[0]).sort(), ["event", "host", "kinds", "pid", "reason", "slug", "tabs", "ts"]);
+  assert.deepStrictEqual(Object.keys(lines[1]).sort(), ["durationMs", "event", "host", "kinds", "pid", "reason", "slug", "tabs", "ts"]);
+  assert.strictEqual((fs.statSync(file).mode & 0o777).toString(8), "600");
+  for (const mark of [TYPED, "pw-id-mark", "pw-name-mark", "secret-path", "QUERY-MARK-9", "frag"]) assert.ok(!text.includes(mark), `${mark} in ${text}`);
+});
+
+test("A77 round 2 (F2): an unreadable-frame lock logs reason \"unreadable\" with no kinds; plain-flags never logs an episode", async () => {
+  let tabs = [{ key: "A", url: "https://a.example/f", frames: [{ url: "https://a.example/f", result: { seen: 1, filled: 0, own: 0, kinds: [] } }] }];
+  const calls = [];
+  const lock = createLock({ getContext: () => ({}), accounts: [], mode: "default", readTabs: async () => ({ tabs }), episode: (e) => calls.push(e) });
+  await lock.probe();
+  tabs = [{ key: "A", url: "https://a.example/f", frames: [{ url: "https://a.example/f", result: { seen: 0, filled: 0, own: 0, kinds: [] } }, { url: "https://pay.example/x", result: null }] }];
+  assert.strictEqual((await lock.probe()).locked, true);
+  assert.deepStrictEqual(calls, [{ event: "lock", reason: "unreadable", kinds: [], tabs: 1, host: "a.example" }]);
+  const plainCalls = [];
+  const plain = createLock({ getContext: () => ({}), accounts: [], readTabs: async () => ({ tabs: [{ key: "P", url: "https://p.example/", frames: [{ url: "https://p.example/", result: { seen: 1, filled: 1 } }] }] }), episode: (e) => plainCalls.push(e) });
+  assert.strictEqual((await plain.probe()).locked, true);
+  assert.deepStrictEqual(plainCalls, []);
+});
+
+test("A77 round 2 (F3): while locked, dialog_handle is NOT refused before the call (its handler runs) — every other tool still is; its result is still probed after and withheld if the lock holds", async () => {
+  const { relay, pw } = makeRelay();
+  const handled = [];
+  let clears = false;
+  relay.registerOwnTool({ name: "dialog_handle", description: "", inputSchema: { type: "object" }, handler: async (a) => { handled.push(a); if (clears) pw.value = ""; return { content: [{ type: "text", text: "{\"handled\":\"accept\"}" }] }; } });
+  pw.value = TYPED; // locked
+  const other = await relay.handleToolsCall({ name: "a11y_take-aria-snapshot", arguments: {} });
+  assert.strictEqual(other.isError, true);
+  assert.match(other.content.map((c) => c.text).join(" "), /Locked: a password or one-time code typed/);
+  clears = true; // handling the dialog clears what held the lock
+  const ok = await relay.handleToolsCall({ name: "dialog_handle", arguments: { action: "accept" } });
+  assert.deepStrictEqual(handled, [{ action: "accept" }], "the handler ran while locked");
+  assert.ok(!ok.isError, JSON.stringify(ok));
+  assert.match(ok.content.map((c) => c.text).join(" "), /handled/);
+  clears = false;
+  pw.value = TYPED;
+  const held = await relay.handleToolsCall({ name: "dialog_handle", arguments: {} });
+  assert.strictEqual(handled.length, 2, "ran again");
+  assert.strictEqual(held.isError, true, "the lock still holds after it: its result is withheld");
+  assert.match(held.content.map((c) => c.text).join(" "), /withheld: the lock came on while it ran/);
 });

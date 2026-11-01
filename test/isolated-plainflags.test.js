@@ -129,7 +129,10 @@ async function startServer() {
       // A77 (the default relay's lock)
       case "/a77-nolock": return send(200, pageHtml(`<h1>A77-NOLOCK</h1><input type="password" id="pw"><input type="checkbox" name="password" id="cb" checked><input type="text" name="first" value="Zed">`));
       case "/a77-shadow": return send(200, pageHtml(`<div id="h"></div><script>const r=document.getElementById("h").attachShadow({mode:"open"});r.innerHTML='<div id="h2"></div>';r.getElementById("h2").attachShadow({mode:"open"}).innerHTML='<input type="password" id="spw">';</script>`));
-      // fix round 1: page-sent values (a settings page's saved password; a pre-filled passenger name), a React-style attribute mirror, a script-set value
+      // fix rounds 1–2: a settings page's saved password + a pre-filled passenger name, a React-style attribute mirror, a script-set value,
+      // the reviewer's show-password names (round 2 F1), a dialog beside an empty password field (round 2 F3)
+      case "/a77-names": return send(200, pageHtml(`<input type="text" name="password1" id="n1"><input type="text" id="passwordconfirm"><input type="text" name="passenger_name" id="n3">`));
+      case "/a77-dialog": return send(200, pageHtml(`<input type="password" id="pw"><button id="two" onclick="setTimeout(()=>{alert('A77-ONE');alert('A77-TWO');},0)">two</button>`));
       case "/a77-settings": return send(200, pageHtml(`<h1>A77-SETTINGS</h1><input type="password" name="current" id="cur" value="Saved-Pw-Server-1"><input type="text" name="passenger_name" id="pn" value="Zed Fixture">`));
       case "/a77-mirror": return send(200, pageHtml(`<input type="password" id="mpw"><script>const m=document.getElementById("mpw");m.addEventListener("input",()=>m.setAttribute("value",m.value));</script>`));
       case "/a77-scriptset": return send(200, pageHtml(`<input type="password" id="spw2"><script>document.getElementById("spw2").value="Script-Set-Pw-9";</script>`));
@@ -1214,6 +1217,19 @@ test("A77 e2e DEFAULT relay: Trevor's typed password (over CDP) refuses the aria
 
     assert.ok(seen.every((t) => !t.includes(PASSWORD)), "Trevor's password never appears in any tool result");
     assert.ok(!r.stderr().includes(PASSWORD) && !r.stderr().includes(SESSION_PW), "nor in the relay's log");
+    // round 2 (F2): the lock-episode log — one line per lock / unlock, 0600, no value, no path
+    const epFile = path.join(cacheOf(home), "default-lock-episodes.log");
+    const ep = fs.readFileSync(epFile, "utf8");
+    const eps = ep.trim().split("\n").map((l) => JSON.parse(l));
+    assert.ok(eps.length >= 4 && eps[0].event === "lock" && eps[1].event === "unlock", ep);
+    for (const e of eps) {
+      assert.deepStrictEqual(Object.keys(e).filter((k) => !["ts", "slug", "pid", "event", "reason", "kinds", "tabs", "host", "durationMs"].includes(k)), [], ep);
+      assert.strictEqual(e.host, "www.fixturepublic.test");
+    }
+    assert.ok(eps[0].kinds.includes("type=password"), JSON.stringify(eps[0]));
+    for (const e of eps) for (const k of e.kinds) assert.ok(["remembered", "type=password", "autocomplete", "name-rule", "text-security", "otp"].includes(k), k);
+    assert.strictEqual((fs.statSync(epFile).mode & 0o777).toString(8), "600");
+    for (const mark of [PASSWORD, SESSION_PW, "signin-fixture", "#pw"]) assert.ok(!ep.includes(mark), `${mark} in the episode log`);
   } finally {
     if (peek) await peek.close().catch(() => {});
     await r.stop();
@@ -1339,30 +1355,77 @@ test("A77 fix 1 (HIGH): a password typed in the main frame beside 3 and 4 BUSY c
   } finally { await closeBrave(h); }
 });
 
-test("A77 fix 3 on a real Brave: a settings page's saved password and a pre-filled passenger_name (page-sent values) do NOT lock in default mode and DO lock in plain-flags; typing over the saved password, a React-style attribute mirror and a script-set value all lock in default mode", ISO, async () => {
+test("A77 round 2 on a real Brave: a settings page's saved password LOCKS in default mode (the page-sent exception is gone — F2) and a pre-filled passenger_name does not (a ruled name exception); plain-flags locks both, exactly as before; the reviewer's show-password names (name=password1, id=passwordconfirm, type=text) lock (F1); typing, a React-style attribute mirror and a script-set value lock", ISO, async () => {
   await startServer();
   const { createLock, createSessionFills } = require("../src/plainflags-lock.js");
-  const { h } = await launchPf("pf-a77f3-", "default");
+  const { h } = await launchPf("pf-a77r2-", "default");
   try {
     const page = h.context.pages()[0] || (await h.context.newPage());
     const dflt = createLock({ getContext: () => h.context, accounts: accountsFixture(), mode: "default", sessionFills: createSessionFills() });
     const plain = createLock({ getContext: () => h.context, accounts: accountsFixture() });
     await page.goto(U("www.a77settings.test", "/a77-settings"));
     const d = await dflt.probe();
-    assert.deepStrictEqual([d.locked, d.filled, d.seen], [false, 0, 1], `default: page-sent values: ${JSON.stringify(d)}`);
+    assert.deepStrictEqual([d.locked, d.filled, d.seen], [true, 1, 1], `default: the saved password locks; passenger_name is not secret: ${JSON.stringify(d)}`);
     const p = await plain.probe();
-    assert.deepStrictEqual([p.locked, p.filled, p.seen], [true, 2, 2], `plain-flags exactly as before (passenger_name is a substring match there): ${JSON.stringify(p)}`);
-    await page.fill("#cur", PASSWORD); // Trevor types over the saved one
-    assert.strictEqual((await dflt.probe()).locked, true, "a typed value on a field with a server default");
-    await page.fill("#cur", "Saved-Pw-Server-1"); // even re-typing the saved value is typing (dirty)
-    assert.strictEqual((await dflt.probe()).locked, true, "re-typed: dirty");
+    assert.deepStrictEqual([p.locked, p.filled, p.seen], [true, 2, 2], `plain-flags exactly as before: ${JSON.stringify(p)}`);
+    // default-mode probes FIRST on this document: the probe's "seen" memory lives in its isolated world, which both locks share
+    // (only one mode ever drives a real Brave), so a plain-flags probe would mark passenger_name as remembered-secret
+    await page.goto(U("www.a77settings.test", "/a77-names"));
+    assert.strictEqual((await dflt.probe()).locked, false, "empty");
+    await page.fill("#n3", "Zed Fixture");
+    assert.strictEqual((await dflt.probe()).locked, false, "a filled passenger_name is not a secret in default mode");
+    for (const target of ["#n1", "#passwordconfirm"]) {
+      await page.fill(target, PASSWORD);
+      const st = await dflt.probe();
+      assert.deepStrictEqual([st.locked, st.filled], [true, 1], `${target} (type=text) locks: ${JSON.stringify(st)}`);
+      await page.fill(target, "");
+      assert.strictEqual((await dflt.probe()).locked, false, `${target} cleared`);
+    }
+    assert.strictEqual((await plain.probe()).locked, true, "plain-flags: the filled passenger_name still locks");
     await page.goto(U("www.a77settings.test", "/a77-mirror"));
     await page.fill("#mpw", PASSWORD);
     assert.strictEqual(await page.getAttribute("#mpw", "value"), PASSWORD, "the page mirrored the typed value into its value attribute");
-    assert.strictEqual((await dflt.probe()).locked, true, "a mirrored (React-style) typed value still locks");
+    assert.strictEqual((await dflt.probe()).locked, true, "a mirrored (React-style) typed value locks");
     await page.goto(U("www.a77settings.test", "/a77-scriptset"));
     assert.strictEqual((await dflt.probe()).locked, true, "a value set by script after load locks");
   } finally { await closeBrave(h); }
+});
+
+test("A77 round 2 (F3) on a real Brave: a JavaScript dialog open on a tab with an (empty) password field fails that tab closed — another tool is refused, but dialog_handle runs, handles the NEXT dialog and its result is returned once nothing holds the lock", ISO, async () => {
+  await startServer();
+  const { createLock, createSessionFills } = require("../src/plainflags-lock.js");
+  const { createDefaultLockPolicy } = require("../src/default-lock.js");
+  const { RelayServer } = require("../src/relay-server.js");
+  const dialogHandle = require("../src/own-tools/dialog-handle.js");
+  const { h } = await launchPf("pf-a77dlg-", "default");
+  try {
+    const page = h.context.pages()[0] || (await h.context.newPage());
+    await page.goto(U("www.a77dialog.test", "/a77-dialog"));
+    globalThis.__relayBridge = { context: h.context };
+    setActivePage(page);
+    const lock = createLock({ getContext: () => h.context, mode: "default", sessionFills: createSessionFills(), frameTimeoutMs: 800 });
+    const relay = new RelayServer({ getUpstream: async () => ({ request: async () => ({ tools: [] }) }), ensureBrave: async () => {}, policy: createDefaultLockPolicy({ lock }) });
+    relay.registerOwnTool(dialogHandle);
+    relay.registerOwnTool({ name: "content_get-as-text", description: "", inputSchema: { type: "object" }, handler: async () => ({ content: [{ type: "text", text: "TEXT" }] }) });
+    assert.ok(!(await relay.handleToolsCall({ name: "content_get-as-text", arguments: {} })).isError, "an empty password field: no lock");
+    // hold the FIRST dialog open (a handler that does not answer it), let later ones go to dialog_handle
+    let held = null;
+    page.on("dialog", (dg) => { if (!held) held = dg; });
+    await page.evaluate(() => document.getElementById("two").click());
+    await waitFor(async () => held, 5000);
+    assert.ok(held && held.message() === "A77-ONE");
+    const refused = await relay.handleToolsCall({ name: "content_get-as-text", arguments: {} });
+    assert.strictEqual(refused.isError, true, "while the dialog is open the tab fails closed");
+    assert.match(refused.content[0].text, /Locked: a password or one-time code typed/);
+    // dialog_handle is not refused: it waits for the next dialog; dismissing the held one lets the page open it
+    const pending = relay.handleToolsCall({ name: "dialog_handle", arguments: { action: "accept", timeoutMs: 10000 } });
+    await new Promise((r) => setTimeout(r, 300));
+    await held.dismiss();
+    const handled = await pending;
+    assert.ok(!handled.isError, JSON.stringify(handled));
+    assert.match(handled.content.map((c) => c.text).join(" "), /"handled": "accept"[\s\S]*A77-TWO/);
+    assert.ok(!(await relay.handleToolsCall({ name: "content_get-as-text", arguments: {} })).isError, "no dialog left: unlocked");
+  } finally { globalThis.__relayBridge = null; clearActivePage(); await closeBrave(h); }
 });
 
 test("A77 fix 2 e2e DEFAULT relay: the session fills single digits into six split-code boxes (which locks it — digits are never excepted), then Trevor types his code over them → LOCKED (aria snapshot refused, relay_status locked); his digits never reach a result", ISO, async () => {

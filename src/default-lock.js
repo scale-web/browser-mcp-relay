@@ -8,9 +8,13 @@
 // lock).
 //
 // RelayServer runs it as the default relay's `policy`: the tool list and every
-// argument pass unchanged; before every call but relay_status / tabs_list the
-// lock is probed (locked → refused), and again after it (locked → the result,
-// or a thrown error, is withheld and a screenshot file it names is deleted).
+// argument pass unchanged; before every call but relay_status / tabs_list (and
+// dialog_handle — fix round 2: a JavaScript dialog on a tab where a secret
+// field was seen fails that tab closed, and the session must still be able to
+// handle it) the lock is probed (locked → refused), and again after every call
+// but relay_status / tabs_list (locked → the result, or a thrown error, is
+// withheld and a screenshot file it names is deleted). Each lock and unlock is
+// logged as one line (`episode`; rule tags, counts and a host only).
 // Everything else in the default relay is untouched (tool list, launch flags,
 // A76 body stripping, the Meta guard, the vault). An ACCIDENT GUARD, not a
 // boundary: `execute`, `cookies_export` and any local CDP client still read
@@ -22,6 +26,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { createLock, createSessionFills, EXEMPT } = require("./plainflags-lock.js");
 
+// Run without the BEFORE-call probe (its result is still probed and withheld): dialog_handle (fix round 2).
+const NO_PRE_PROBE = new Set(["dialog_handle"]);
 // Upstream tools that write a screenshot file and name it in their result.
 const SHOT_TOOLS = new Set(["content_take-screenshot", "navigation_go-to", "navigation_go-back-or-forward", "navigation_reload"]);
 const SHOT_KEYS = new Set(["filePath", "screenshotFilePath"]);
@@ -59,10 +65,11 @@ function deleteScreenshots(name, response) {
  * @param {(m: string) => void} [o.log]
  * @param {object} [o.lock]  test seam (default: createLock in default mode)
  * @param {object} [o.sessionFills]  test seam (default: createSessionFills())
+ * @param {(e: object) => void} [o.episode]  one call per lock / unlock (the lock-episode log)
  */
-function createDefaultLockPolicy({ getContext, notice = () => {}, log = () => {}, lock = null, sessionFills = null, frameTimeoutMs } = {}) {
+function createDefaultLockPolicy({ getContext, notice = () => {}, log = () => {}, lock = null, sessionFills = null, frameTimeoutMs, episode = null } = {}) {
   const fills = sessionFills || createSessionFills();
-  const theLock = lock || createLock({ getContext, notice, log, mode: "default", sessionFills: fills, ...(frameTimeoutMs ? { frameTimeoutMs } : {}) });
+  const theLock = lock || createLock({ getContext, notice, log, mode: "default", sessionFills: fills, episode, ...(frameTimeoutMs ? { frameTimeoutMs } : {}) });
   const text = theLock.LOCK_TEXT;
   const locked = (reason, tail = "") => ({ isError: true, content: [{ type: "text", text: `[mcp-relay] ${text} (${reason})${tail}` }] });
   const probeOrFail = async () => { try { return await theLock.probe(); } catch { return { locked: true, reason: "the lock probe failed — fail closed" }; } };
@@ -72,7 +79,7 @@ function createDefaultLockPolicy({ getContext, notice = () => {}, log = () => {}
     filterToolsList: (tools) => tools,
 
     async beforeCall(name, args) {
-      if (EXEMPT.includes(name)) return { args };
+      if (EXEMPT.includes(name) || NO_PRE_PROBE.has(name)) return { args };
       let st;
       try { st = await theLock.probe(); } catch (e) { return { refusal: locked(`the lock probe failed: ${e.message} — fail closed`) }; }
       if (st.locked) return { refusal: locked(st.reason) };
@@ -102,4 +109,4 @@ function createDefaultLockPolicy({ getContext, notice = () => {}, log = () => {}
   };
 }
 
-module.exports = { createDefaultLockPolicy, screenshotFiles, SHOT_TOOLS };
+module.exports = { createDefaultLockPolicy, screenshotFiles, SHOT_TOOLS, NO_PRE_PROBE };

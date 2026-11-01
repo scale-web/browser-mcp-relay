@@ -50,9 +50,10 @@
 // sign-in-frame clause are URL rules and are off), plus one exception — a
 // filled secret field whose value EXACTLY equals a value (≥ 6 characters —
 // fix round 1) this relay process passed into a page with interaction_fill /
-// form_fill does not lock — and two refinements of rule 1 (ruling
-// as-ops/ask-75txd2): a field still holding the value the page sent (not
-// dirty) does not count, and the name / id rule matches password words whole.
+// form_fill does not lock — and one refinement of rule 1 (rulings
+// as-ops/ask-75txd2, as-ops/ask-gnpqzm): the name / id substring rule skips
+// only the ruled false positives (passeng… / passport… tokens, bypass,
+// compass). Each lock / unlock is reported to `episode` (rule tags, counts, a host).
 // The relay keeps only salted SHA-256 digests of those values (createSessionFills:
 // the last 50, each forgotten after 30 min; never logged, never in
 // relay_status, never on disk); the probe gets the digests and the salt, hashes
@@ -94,9 +95,10 @@ const WORLD_NAME = "__browser_mcp_relay_lock__";
  * `allow` (default relay only; null in plain-flags): { dflt: true, salt?, digests? }.
  *   - a filled secret field whose SHA-256(salt + value) is one of `digests` is
  *     counted in `own`, not `filled` (the session-filled exception);
- *   - `dflt` (ruling as-ops/ask-75txd2, "Skip page-sent values + whole-word
- *     match"): a field still holding the value the PAGE sent is not filled,
- *     and the name / id rule matches password words whole.
+ *   - `dflt`: the name / id rule is plain-flags' substring rule minus the
+ *     ruled false positives (as-ops/ask-75txd2; round 2), and the result
+ *     carries `kinds` — which rules made the FILLED fields secret (tags only,
+ *     for the lock-episode log; never a value, a name or an id).
  */
 const secretProbe = (allow) => {
   "use strict";
@@ -131,24 +133,6 @@ const secretProbe = (allow) => {
   };
   const ownSet = allow && typeof allow.salt === "string" && Array.isArray(allow.digests) && allow.digests.length > 0 ? new Set(allow.digests) : null;
   const dflt = !!(allow && allow.dflt);
-  /**
-   * Default relay: the field still holds the value the page sent — its
-   * dirty-value flag is unset (nothing typed, autofilled or set through
-   * `.value` since). The flag is read on a DETACHED clone (cloning copies the
-   * value and the flag; the page cannot observe a detached node): the clone's
-   * value follows a changed default only while it is not dirty. A page that
-   * mirrors typed text into the `value` attribute (React) stays dirty, so it
-   * still locks. Any doubt → false (locks).
-   */
-  const sentByPage = (el) => {
-    try {
-      const d = String(el.defaultValue || "");
-      if (d === "" || String(el.value) !== d) return false;
-      const c = el.cloneNode(false);
-      c.defaultValue = d + "0";
-      return String(c.value) === d + "0";
-    } catch { return false; }
-  };
   // Round 5 item 2: an element once seen as secret stays secret for the life
   // of this world (= this document) — a show-password toggle turns
   // type=password into type=text with nothing else to recognise it by.
@@ -163,15 +147,20 @@ const secretProbe = (allow) => {
   };
   const AC = ["current-password", "new-password", "one-time-code"];
   const TEXT_TYPES = ["", "text", "password", "email", "tel", "number", "search", "url"];
-  const PASS_RE = /pass|pwd/i; // plain-flags: "password", "passcode", "passwd", "pwd" (substring, fail closed)
-  // Default relay: whole words ("pass", "pwd", "otp") or a word ENDING in a long form
-  // ("userpassword", "loginpasswd") — "passenger_name", "passport", "bypass", "compass" do not match.
-  const NAME_WORDS = ["pass", "pwd", "otp"];
-  const NAME_ENDINGS = ["password", "passwd", "passcode", "passphrase", "pwd"];
+  const PASS_RE = /pass|pwd/i; // "password", "passcode", "passwd", "pwd", "passwort", "mot_de_passe" (substring, fail closed)
+  // Default relay (Trevor's ruling as-ops/ask-75txd2; fix round 2): the SAME
+  // substring rule, minus only the ruled false positives — a token STARTING
+  // with "passeng" or "passport" (at the start, after a separator or at a
+  // camelCase boundary) and any "bypass" / "compass" are cut out first, and
+  // whatever is left is tested as above ("passengerPassword" still locks).
+  const notPassword = (str) => String(str || "")
+    .replace(/(^|[^a-z0-9])(passeng|passport)/gi, "$1")
+    .replace(/([a-z0-9])(?:Passeng|Passport|PASSENG|PASSPORT)/g, "$1")
+    .replace(/bypass|compass/gi, "");
   const nameSecret = (nm, id) => {
-    const ws = [...words(nm), ...words(id)];
-    if (!dflt) return PASS_RE.test(nm) || PASS_RE.test(id) || ws.includes("otp");
-    return ws.some((w) => NAME_WORDS.includes(w) || NAME_ENDINGS.some((e) => w.endsWith(e)));
+    const a = dflt ? notPassword(nm) : nm;
+    const b = dflt ? notPassword(id) : id;
+    return PASS_RE.test(a) || PASS_RE.test(b) || [...words(nm), ...words(id)].includes("otp");
   };
   const STRONG = (w) => w === "mfa" || w === "2fa" || w === "totp" || w === "otp" || w === "passcode" || w.startsWith("verif");
   const CODE_WORD = (w) => w === "code" || /^(sms|auth|login|access|security|email|onetime|confirm|confirmation|signin)code$/.test(w);
@@ -215,6 +204,8 @@ const secretProbe = (allow) => {
     return im === "numeric" || im === "decimal" || /\d|0-9/.test(pat) || t === "number" || t === "tel";
   };
   const groups = new Map();
+  const why = new Map(); // element → Set of rule tags
+  const tag = (el, ...t) => { if (!why.has(el)) why.set(el, new Set()); for (const x of t) why.get(el).add(x); };
   for (const el of inputs) {
     const type = String(el.getAttribute("type") || "").toLowerCase();
     const prop = String(el.type || "").toLowerCase();
@@ -228,12 +219,17 @@ const secretProbe = (allow) => {
     const id = String(el.getAttribute("id") || "");
     const im = String(el.getAttribute("inputmode") || "").toLowerCase();
     const ml = Number(el.maxLength);
-    if (mem.has(el) || type === "password" || prop === "password" || AC.some((t) => ac.includes(t)) ||
-      nameSecret(nm, id) || (ts !== "" && ts !== "none") || codeField(el, nm, id, im, ml)) {
-      secret.add(el);
-    }
+    // which rules make it secret — tags for the default relay's episode log (the decision is unchanged: any tag = secret)
+    const tags = [];
+    if (mem.has(el)) tags.push("remembered");
+    if (type === "password" || prop === "password") tags.push("type=password");
+    if (AC.some((t) => ac.includes(t))) tags.push("autocomplete");
+    if (nameSecret(nm, id)) tags.push("name-rule");
+    if (ts !== "" && ts !== "none") tags.push("text-security");
+    if (codeField(el, nm, id, im, ml)) tags.push("otp");
+    if (tags.length > 0) { secret.add(el); tag(el, ...tags); }
     if (ac.includes("one-time-code")) {
-      for (const sib of [el.previousElementSibling, el.nextElementSibling]) if (sib && inputs.includes(sib)) secret.add(sib);
+      for (const sib of [el.previousElementSibling, el.nextElementSibling]) if (sib && inputs.includes(sib)) { secret.add(sib); tag(sib, "otp"); }
     }
     if (isOtpBox(el)) {
       for (const c of [el.parentElement, el.parentElement && el.parentElement.parentElement]) {
@@ -243,18 +239,19 @@ const secretProbe = (allow) => {
       }
     }
   }
-  for (const members of groups.values()) if (members.length >= 4) for (const m of members) secret.add(m);
+  for (const members of groups.values()) if (members.length >= 4) for (const m of members) { secret.add(m); tag(m, "otp"); }
   for (const el of secret) mem.add(el);
   let filled = 0;
   let own = 0;
+  const kinds = new Set();
   for (const el of secret) {
     const v = String(el.value || "");
     if (v.length === 0) continue;
-    if (dflt && sentByPage(el)) continue; // the page's own value (a settings page's saved password)
     if (ownSet && ownSet.has(sha256hex(allow.salt + v))) own++; // exactly a value this session filled
-    else filled++;
+    else { filled++; for (const k of why.get(el) || []) kinds.add(k); }
   }
-  return ownSet || dflt ? { seen: secret.size, filled, own } : { seen: secret.size, filled };
+  if (dflt) return { seen: secret.size, filled, own, kinds: [...kinds].sort() };
+  return ownSet ? { seen: secret.size, filled, own } : { seen: secret.size, filled };
 };
 
 /**
@@ -524,15 +521,18 @@ function pageKey(u) {
  * @param {(ctx, {allow}) => Promise<{tabs}>} [o.readTabs]  test seam (default: the CDP isolated-world reader)
  * @param {"plainflags"|"default"} [o.mode]  "default" (A77): no URL rules, the session-filled exception, its own text
  * @param {ReturnType<typeof createSessionFills>} [o.sessionFills]  default mode: the values this relay filled
+ * @param {(e: {event, reason, kinds, tabs, host, durationMs?}) => void} [o.episode]  default mode: one call per
+ *   lock and per unlock (fix round 2, ruling as-ops/ask-gnpqzm) — rule tags, counts and a host only
  */
 function createLock({ getContext, accounts = KNOWN_ACCOUNTS, notice = () => {}, frameTimeoutMs = FRAME_TIMEOUT_MS, log = () => {}, readTabs = null,
-  mode = "plainflags", sessionFills = null, tabTimeoutMs = 3 * frameTimeoutMs, probeTimeoutMs = tabTimeoutMs + 1000 } = {}) {
+  mode = "plainflags", sessionFills = null, tabTimeoutMs = 3 * frameTimeoutMs, probeTimeoutMs = tabTimeoutMs + 1000, episode = null } = {}) {
   const dflt = mode === "default";
   const urlRules = !dflt; // 1c rule 2 and rule 3's sign-in-frame clause: plain-flags only
   const lockText = dflt ? DEFAULT_LOCK_TEXT : LOCK_TEXT;
   const reader = readTabs || createCdpReader({ frameTimeoutMs, tabTimeoutMs });
   let state = { locked: false, reason: null, since: null, checkedAt: null, filled: 0, seen: 0, unreadable: 0, ...(dflt ? { sessionFilled: 0 } : {}) };
   const tabMemory = new Map(); // tab key → { url: pageKey, seen }
+  let current = null; // default mode: the open lock episode { reason, kinds, tabs, host, at }
 
   async function probe() {
     let ctx = null;
@@ -540,7 +540,7 @@ function createLock({ getContext, accounts = KNOWN_ACCOUNTS, notice = () => {}, 
     let tabs = [];
     let readFailed = false;
     if (ctx) {
-      // Default mode: the probe's own rules (page-sent values, whole-word names) and the session's digests.
+      // Default mode: the probe's own name rule and the session's digests.
       const allow = dflt ? { dflt: true, ...((sessionFills && sessionFills.allow()) || {}) } : null;
       // L4: the whole probe is bounded too (a backstop — the reader bounds each tab itself).
       try { ({ tabs } = await withTimeout(Promise.resolve().then(() => reader(ctx, { allow })), probeTimeoutMs, "lock probe")); } catch { readFailed = true; }
@@ -551,25 +551,33 @@ function createLock({ getContext, accounts = KNOWN_ACCOUNTS, notice = () => {}, 
     let unreadableAll = 0;
     let reason = null;
     const present = new Set();
+    const filledTabs = []; // hosts of the tabs holding a filled secret (episode log)
+    const closedTabs = []; // hosts of the tabs that failed closed (episode log)
+    const kinds = new Set();
     for (const t of tabs) {
       present.add(t.key);
       let seen = 0;
       let unreadable = 0;
       let signInFrame = null;
       let stale = 0;
+      let filledHere = 0;
       for (const f of t.frames) {
         if (f.stale) stale++;
         if (urlRules && f !== t.frames[0] && matchSignInPage(f.url, accounts)) signInFrame = hostOf(f.url);
         if (!f.result || typeof f.result !== "object") { unreadable++; continue; }
         seen += Math.max(0, Math.floor(Number(f.result.seen) || 0));
-        filled += Math.max(0, Math.floor(Number(f.result.filled) || 0));
+        filledHere += Math.max(0, Math.floor(Number(f.result.filled) || 0));
         own += Math.max(0, Math.floor(Number(f.result.own) || 0));
+        if (Array.isArray(f.result.kinds)) for (const k of f.result.kinds) if (typeof k === "string") kinds.add(k);
       }
+      filled += filledHere;
+      if (filledHere > 0) filledTabs.push(hostOf(t.url));
       const mem = tabMemory.get(t.key);
       const samePage = mem && mem.url === pageKey(t.url);
       const seenHere = seen > 0 || (samePage && mem.seen);
       if (!reason && urlRules && matchSignInPage(t.url, accounts)) reason = `a tab is on a known account's sign-in page (${hostOf(t.url)})`;
       // Round 5 item 1: a frame whose probe world could not be verified locks its tab outright.
+      if (stale > 0 || (unreadable > 0 && (seenHere || signInFrame))) closedTabs.push(hostOf(t.url));
       if (!reason && stale > 0) reason = `${stale} frame(s) of a tab could not be read in a verified isolated world — fail closed`;
       if (!reason && unreadable > 0 && (seenHere || signInFrame)) {
         reason = `${unreadable} frame(s) of a tab could not be read while ${signInFrame ? `a sign-in frame (${signInFrame}) is open there` : "a password field was seen there"} — fail closed`;
@@ -591,6 +599,20 @@ function createLock({ getContext, accounts = KNOWN_ACCOUNTS, notice = () => {}, 
         ? `[browser-mcp-relay] ${tag}LOCKED — ${reason}. Every tool but relay_status and tabs_list is refused until it clears.`
         : `[browser-mcp-relay] ${tag}UNLOCKED — no ${dflt ? "typed " : ""}password or one-time code on any tab any more; tools resume.`);
       log(`${dflt ? "lock" : "plain-flags lock"}: ${locked ? `LOCKED (${reason})` : "unlocked"}`);
+      // Default mode: one log line per lock and per unlock — rule tags, counts, a host; never a value, a name, an id, a path or a query.
+      if (dflt && episode) {
+        try {
+          if (locked) {
+            const byFill = filled > 0;
+            const hosts = byFill ? filledTabs : closedTabs;
+            current = { reason: byFill ? "filled" : "unreadable", kinds: byFill ? [...kinds].sort() : [], tabs: hosts.length, host: hosts[0] || null, at: Date.now() };
+            episode({ event: "lock", reason: current.reason, kinds: current.kinds, tabs: current.tabs, host: current.host });
+          } else if (current) {
+            episode({ event: "unlock", reason: current.reason, kinds: current.kinds, tabs: current.tabs, host: current.host, durationMs: Date.now() - current.at });
+            current = null;
+          }
+        } catch { /* log-only: never affects the lock */ }
+      }
     }
     state = { locked, reason, since: locked ? (state.locked ? state.since : now) : null, checkedAt: now, filled, seen: seenAll, unreadable: unreadableAll, ...(dflt ? { sessionFilled: own } : {}) };
     return state;

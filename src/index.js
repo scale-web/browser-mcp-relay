@@ -1061,6 +1061,11 @@ async function main() {
       getContext: () => (bridge ? bridge.context : null),
       notice: pushNotice,
       log: (m) => process.stderr.write(`[mcp-relay] ${m}\n`),
+      // Fix round 2 (ruling as-ops/ask-gnpqzm): one line per lock / unlock (0600, rotated past ~1 MB).
+      episode: (() => {
+        const episodeLog = new ReapLog({ file: path.join(cacheRoot, "default-lock-episodes.log"), slug: project });
+        return ({ event, ...fields }) => episodeLog.write(event, fields);
+      })(),
     });
   const relay = new RelayServer({ getUpstream, ensureBrave, takeNotices, policy });
   // Register Phase C own-tools. Each entry in ownTools is
