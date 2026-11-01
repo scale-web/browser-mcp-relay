@@ -320,21 +320,47 @@ test("A77 fix 1 (fake CDP): the main frame's secret field is EMPTY but SEEN and 
   assert.strictEqual(st2.locked, false, JSON.stringify(st2));
 });
 
-test("A77 round 3 (fake CDP): every setup step of the main frame (new session, Runtime.enable, frame tree) and its read answer just UNDER the frame timeout — the default tab budget still reaches the read: LOCKED (at 3 × the frame timeout it was not)", async () => {
-  const T = 300;
+/** A fake browser whose main frame answers every step (new session, Runtime.enable, frame tree, the read) after `stepMs`. */
+function slowMainBrowser(stepMs) {
   const slow = (ms) => new Promise((r) => setTimeout(r, ms));
-  for (const mode of ["plainflags", "default"]) {
-    const b = fakeBrowser();
-    b.counts.set("MAIN", { seen: 1, filled: 1 });
-    const orig = b.ctx.newCDPSession;
-    b.ctx.newCDPSession = async (t) => {
-      await slow(T - 40);
-      const s = await orig(t);
-      const send = s.send;
-      s.send = async (m, p) => { if (m === "Runtime.enable" || m === "Page.getFrameTree" || m === "Runtime.evaluate") await slow(T - 40); return send(m, p); };
-      return s;
-    };
+  const b = fakeBrowser();
+  b.counts.set("MAIN", { seen: 1, filled: 1 });
+  const orig = b.ctx.newCDPSession;
+  b.ctx.newCDPSession = async (t) => {
+    await slow(stepMs);
+    const s = await orig(t);
+    const send = s.send;
+    s.send = async (m, p) => { if (m === "Runtime.enable" || m === "Page.getFrameTree" || m === "Runtime.evaluate") await slow(stepMs); return send(m, p); };
+    return s;
+  };
+  return b;
+}
+
+test("A77 rounds 3–4 (fake CDP): the main frame answers each setup step (new session, Runtime.enable, frame tree) and its read at T − 20 ms, T = 1 s — about 3.9 s, which only a tab budget of 4 frame timeouts (+ margin) covers: LOCKED, both modes (3 T and 3 T + 0.5 s do not)", async () => {
+  const T = 1000;
+  await Promise.all(["plainflags", "default"].map(async (mode) => {
+    const b = slowMainBrowser(T - 20);
     const st = await createLock({ getContext: () => b.ctx, accounts: [], mode, readTabs: createCdpReader({ frameTimeoutMs: T }) }).probe();
     assert.deepStrictEqual([st.locked, st.filled], [true, 1], `${mode}: ${JSON.stringify(st)}`);
-  }
+  }));
+});
+
+test("A77 round 4 (fake CDP): with the DEFAULT whole-probe backstop (createLock's own reader, no override), every main-frame step at T − 10 ms still locks — the backstop sits above the tab budget", async () => {
+  const T = 1000;
+  await Promise.all(["plainflags", "default"].map(async (mode) => {
+    const b = slowMainBrowser(T - 10);
+    const st = await createLock({ getContext: () => b.ctx, accounts: [], mode, frameTimeoutMs: T }).probe();
+    assert.deepStrictEqual([st.locked, st.filled], [true, 1], `${mode}: ${JSON.stringify(st)}`);
+  }));
+});
+
+test("A77 round 4 (fake CDP): a tab that runs OVER its budget (main frame read at once, 7 in-process children whose read hangs) keeps the main frame's filled password under the DEFAULT backstop — the backstop must fire after the tab budget, not with it", async () => {
+  await Promise.all(["plainflags", "default"].map(async (mode) => {
+    const b = fakeBrowser();
+    for (let i = 0; i < 7; i++) { b.addFrame(`H${i}`, `https://hang${i}.example/`); b.hangEval.add(`H${i}`); }
+    b.counts.set("MAIN", { seen: 1, filled: 1 });
+    // T = 300 ms: tab budget 1.7 s < 7 × 300 ms of hung reads
+    const st = await createLock({ getContext: () => b.ctx, accounts: [], mode, frameTimeoutMs: 300 }).probe();
+    assert.deepStrictEqual([st.locked, st.filled], [true, 1], `${mode}: ${JSON.stringify(st)}`);
+  }));
 });

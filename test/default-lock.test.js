@@ -386,14 +386,17 @@ test("A77 round 2 (F1) + round 3: default mode uses plain-flags' SUBSTRING name 
     "userpass", "newpass", "pwdhash", "passw", "passwort", "mot_de_passe", "motdepasse", "PASSWORD_1"];
   // round 3: an exception never matches across a camelCase boundary
   const round3 = ["loginByPassword", "signInByPassword", "byPassword", "loginByPass", "comPassword", "passPortal", "x_passPort", "BYPassword"];
-  for (const name of [...reviewer, ...round3, "user_pass", "newPassword", "pwd", "otp_code", "passengerPassword", "passport_pwd", "bypassPassword", "mypassport"]) {
+  // round 4: an exception never eats the "pass" of a run-together "password" / "passwd"; the passeng / passport cut never reaches a following "pass"
+  const round4 = ["loginbypassword", "signinbypassword", "bypassword", "Bypassword", "BYPASSWORD", "LOGINBYPASSWORD", "compassword", "Compassword", "COMPASSWORD", "authbypasswd",
+    "passportpassword", "PASSPORTPASSWORD", "passengerpassword", "passportpwd", "Passport_password"];
+  for (const name of [...reviewer, ...round3, ...round4, "user_pass", "newPassword", "pwd", "otp_code", "passengerPassword", "passport_pwd", "bypassPassword", "mypassport"]) {
     for (const key of ["name", "id"]) {
       assert.strictEqual(filled({ type: "text", [key]: name }, D), 1, `default ${key}=${name}`);
       assert.strictEqual(filled({ type: "text", [key]: name }, null), 1, `plain-flags ${key}=${name}`);
     }
   }
   for (const name of ["passenger_name", "passengerName", "PassengerCount", "passengers", "PASSENGER_NAME", "passport", "Passport", "passport_no", "userPassport", "PASSPORT",
-    "bypass", "Bypass", "BYPASS", "bypass_cache", "cacheBypass", "compass", "Compass", "COMPASS", "compass_heading", "compassion"]) {
+    "bypass", "Bypass", "BYPASS", "bypass_cache", "cacheBypass", "compass", "Compass", "COMPASS", "compass_heading", "compassion", "Passport_No"]) {
     for (const key of ["name", "id"]) {
       assert.strictEqual(filled({ type: "text", [key]: name }, D), 0, `default ${key}=${name}: a ruled exception`);
       assert.strictEqual(filled({ type: "text", [key]: name }, null), 1, `plain-flags unchanged (substring): ${key}=${name}`);

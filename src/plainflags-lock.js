@@ -165,7 +165,8 @@ const secretProbe = (allow) => {
   const notPassword = (str) => String(str || "")
     .replace(/(^|[^A-Za-z0-9])(passeng|passport|PASSENG|PASSPORT|Passeng|Passport)/g, "$1")
     .replace(/([a-z0-9])(?:Passeng|Passport|PASSENG|PASSPORT)/g, "$1")
-    .replace(/(?:by|com)pass|(?:BY|COM)PASS|(?:By|Com)pass/g, "");
+    // fix round 4: never when "pass" runs on into "w" ("bypassword", "COMPASSWORD", "authbypasswd" keep it)
+    .replace(/(?:by|com)pass(?!w)|(?:BY|COM)PASS(?!W)|(?:By|Com)pass(?!w)/g, "");
   const nameSecret = (nm, id) => {
     const a = dflt ? notPassword(nm) : nm;
     const b = dflt ? notPassword(id) : id;
