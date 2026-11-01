@@ -319,3 +319,22 @@ test("A77 fix 1 (fake CDP): the main frame's secret field is EMPTY but SEEN and 
   const st2 = await createLock({ getContext: () => b.ctx, accounts: [], readTabs: createCdpReader({ frameTimeoutMs: 300, tabTimeoutMs: 500 }) }).probe();
   assert.strictEqual(st2.locked, false, JSON.stringify(st2));
 });
+
+test("A77 round 3 (fake CDP): every setup step of the main frame (new session, Runtime.enable, frame tree) and its read answer just UNDER the frame timeout — the default tab budget still reaches the read: LOCKED (at 3 × the frame timeout it was not)", async () => {
+  const T = 300;
+  const slow = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (const mode of ["plainflags", "default"]) {
+    const b = fakeBrowser();
+    b.counts.set("MAIN", { seen: 1, filled: 1 });
+    const orig = b.ctx.newCDPSession;
+    b.ctx.newCDPSession = async (t) => {
+      await slow(T - 40);
+      const s = await orig(t);
+      const send = s.send;
+      s.send = async (m, p) => { if (m === "Runtime.enable" || m === "Page.getFrameTree" || m === "Runtime.evaluate") await slow(T - 40); return send(m, p); };
+      return s;
+    };
+    const st = await createLock({ getContext: () => b.ctx, accounts: [], mode, readTabs: createCdpReader({ frameTimeoutMs: T }) }).probe();
+    assert.deepStrictEqual([st.locked, st.filled], [true, 1], `${mode}: ${JSON.stringify(st)}`);
+  }
+});

@@ -87,6 +87,12 @@ const FRAME_TIMEOUT_MS = 2500;
 const SESSION_FILLS_MAX = 50;
 const SESSION_FILLS_TTL_MS = 30 * 60 * 1000;
 const SESSION_FILLS_MIN = 6; // characters (A77 fix 2)
+// Fix round 3: a tab's budget covers its worst case — its frame targets' setup
+// in parallel (session, Runtime, frame tree: 3 frame timeouts) and THEN the
+// main frame's read (a 4th) — plus a margin. At exactly 3 frame timeouts a
+// frame answering each setup step just under its timeout left the main frame
+// unread (review of 6b61c6d, fake CDP).
+const tabBudget = (frameTimeoutMs) => 4 * frameTimeoutMs + 500;
 const CHALLENGE_HOST = "challenges.cloudflare.com";
 const WORLD_NAME = "__browser_mcp_relay_lock__";
 
@@ -153,10 +159,13 @@ const secretProbe = (allow) => {
   // with "passeng" or "passport" (at the start, after a separator or at a
   // camelCase boundary) and any "bypass" / "compass" are cut out first, and
   // whatever is left is tested as above ("passengerPassword" still locks).
+  // Fix round 3: each exception matches only as ONE word — all lower case,
+  // ALL CAPS or Capitalised — never across a camelCase boundary, so
+  // "loginByPassword", "comPassword" and "passPortal" keep their "Pass".
   const notPassword = (str) => String(str || "")
-    .replace(/(^|[^a-z0-9])(passeng|passport)/gi, "$1")
+    .replace(/(^|[^A-Za-z0-9])(passeng|passport|PASSENG|PASSPORT|Passeng|Passport)/g, "$1")
     .replace(/([a-z0-9])(?:Passeng|Passport|PASSENG|PASSPORT)/g, "$1")
-    .replace(/bypass|compass/gi, "");
+    .replace(/(?:by|com)pass|(?:BY|COM)PASS|(?:By|Com)pass/g, "");
   const nameSecret = (nm, id) => {
     const a = dflt ? notPassword(nm) : nm;
     const b = dflt ? notPassword(id) : id;
@@ -322,7 +331,7 @@ class StaleWorldError extends Error {}
  * a second failure fails closed on the tab. No stamp, no numeric fallback.
  * Every evaluated function runs in strict mode.
  */
-function createCdpReader({ frameTimeoutMs = FRAME_TIMEOUT_MS, tabTimeoutMs = 3 * frameTimeoutMs } = {}) {
+function createCdpReader({ frameTimeoutMs = FRAME_TIMEOUT_MS, tabTimeoutMs = tabBudget(frameTimeoutMs) } = {}) {
   const expressionFor = (allow) => `(() => { "use strict"; return (${secretProbe.toString()})(${JSON.stringify(allow || null)}); })()`;
   const IN_PROCESS = /does not have a separate CDP session/i;
 
@@ -522,10 +531,11 @@ function pageKey(u) {
  * @param {"plainflags"|"default"} [o.mode]  "default" (A77): no URL rules, the session-filled exception, its own text
  * @param {ReturnType<typeof createSessionFills>} [o.sessionFills]  default mode: the values this relay filled
  * @param {(e: {event, reason, kinds, tabs, host, durationMs?}) => void} [o.episode]  default mode: one call per
- *   lock and per unlock (fix round 2, ruling as-ops/ask-gnpqzm) — rule tags, counts and a host only
+ *   lock and per unlock (fix round 2, ruling as-ops/ask-gnpqzm) — rule tags, counts and a host only — and one
+ *   per probe slower than `slowProbeMs` (fix round 3: {event: "slow-probe", ms, tabs, frames, unreadable})
  */
 function createLock({ getContext, accounts = KNOWN_ACCOUNTS, notice = () => {}, frameTimeoutMs = FRAME_TIMEOUT_MS, log = () => {}, readTabs = null,
-  mode = "plainflags", sessionFills = null, tabTimeoutMs = 3 * frameTimeoutMs, probeTimeoutMs = tabTimeoutMs + 1000, episode = null } = {}) {
+  mode = "plainflags", sessionFills = null, tabTimeoutMs = tabBudget(frameTimeoutMs), probeTimeoutMs = tabTimeoutMs + 1000, episode = null, slowProbeMs = 1000 } = {}) {
   const dflt = mode === "default";
   const urlRules = !dflt; // 1c rule 2 and rule 3's sign-in-frame clause: plain-flags only
   const lockText = dflt ? DEFAULT_LOCK_TEXT : LOCK_TEXT;
@@ -535,6 +545,7 @@ function createLock({ getContext, accounts = KNOWN_ACCOUNTS, notice = () => {}, 
   let current = null; // default mode: the open lock episode { reason, kinds, tabs, host, at }
 
   async function probe() {
+    const started = Date.now();
     let ctx = null;
     try { ctx = getContext(); } catch { /* none */ }
     let tabs = [];
@@ -615,6 +626,11 @@ function createLock({ getContext, accounts = KNOWN_ACCOUNTS, notice = () => {}, 
       }
     }
     state = { locked, reason, since: locked ? (state.locked ? state.since : now) : null, checkedAt: now, filled, seen: seenAll, unreadable: unreadableAll, ...(dflt ? { sessionFilled: own } : {}) };
+    // Fix round 3 (log-only): a probe over slowProbeMs → one line of COUNTS (never a value, a name, a URL, a host or a path).
+    const ms = Date.now() - started;
+    if (dflt && episode && ms > slowProbeMs) {
+      try { episode({ event: "slow-probe", ms, tabs: tabs.length, frames: tabs.reduce((n, t) => n + (Array.isArray(t.frames) ? t.frames.length : 0), 0), unreadable: unreadableAll }); } catch { /* log-only */ }
+    }
     return state;
   }
 

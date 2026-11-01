@@ -131,7 +131,7 @@ async function startServer() {
       case "/a77-shadow": return send(200, pageHtml(`<div id="h"></div><script>const r=document.getElementById("h").attachShadow({mode:"open"});r.innerHTML='<div id="h2"></div>';r.getElementById("h2").attachShadow({mode:"open"}).innerHTML='<input type="password" id="spw">';</script>`));
       // fix rounds 1–2: a settings page's saved password + a pre-filled passenger name, a React-style attribute mirror, a script-set value,
       // the reviewer's show-password names (round 2 F1), a dialog beside an empty password field (round 2 F3)
-      case "/a77-names": return send(200, pageHtml(`<input type="text" name="password1" id="n1"><input type="text" id="passwordconfirm"><input type="text" name="passenger_name" id="n3">`));
+      case "/a77-names": return send(200, pageHtml(`<input type="text" name="password1" id="n1"><input type="text" id="passwordconfirm"><input type="text" name="passenger_name" id="n3"><input type="text" name="loginByPassword" id="n4"><input type="text" id="comPassword">`));
       case "/a77-dialog": return send(200, pageHtml(`<input type="password" id="pw"><button id="two" onclick="setTimeout(()=>{alert('A77-ONE');alert('A77-TWO');},0)">two</button>`));
       case "/a77-settings": return send(200, pageHtml(`<h1>A77-SETTINGS</h1><input type="password" name="current" id="cur" value="Saved-Pw-Server-1"><input type="text" name="passenger_name" id="pn" value="Zed Fixture">`));
       case "/a77-mirror": return send(200, pageHtml(`<input type="password" id="mpw"><script>const m=document.getElementById("mpw");m.addEventListener("input",()=>m.setAttribute("value",m.value));</script>`));
@@ -1374,7 +1374,7 @@ test("A77 round 2 on a real Brave: a settings page's saved password LOCKS in def
     assert.strictEqual((await dflt.probe()).locked, false, "empty");
     await page.fill("#n3", "Zed Fixture");
     assert.strictEqual((await dflt.probe()).locked, false, "a filled passenger_name is not a secret in default mode");
-    for (const target of ["#n1", "#passwordconfirm"]) {
+    for (const target of ["#n1", "#passwordconfirm", "#n4", "#comPassword"]) { // round 3: ByPass… / comPass… keep their "Pass"
       await page.fill(target, PASSWORD);
       const st = await dflt.probe();
       assert.deepStrictEqual([st.locked, st.filled], [true, 1], `${target} (type=text) locks: ${JSON.stringify(st)}`);

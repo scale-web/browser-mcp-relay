@@ -379,18 +379,21 @@ test("A77 fix 2: the session filled single digits 1..6 into split code boxes —
   assert.strictEqual((await d2.lock.probe()).locked, false);
 });
 
-test("A77 round 2 (F1): default mode uses plain-flags' SUBSTRING name / id rule minus only the ruled false positives — the reviewer's 18 names lock, passenger_name / passport / bypass / compass do not (they still do in plain-flags)", () => {
+test("A77 round 2 (F1) + round 3: default mode uses plain-flags' SUBSTRING name / id rule minus only the ruled false positives — the reviewer's 18 names and the ByPass… / comPass… / passPort… names lock, passenger_name / passport / bypass / compass do not (they still do in plain-flags)", () => {
   const D = { dflt: true };
   const filled = (attrs, mode) => runProbe(docOf([input(attrs, "Zed-value-1")]), mode).filled;
   const reviewer = ["password1", "Password1", "pass1", "pwd1", "passwd2", "passcode1", "passphrase1", "passwordconfirm", "passwordfield", "passwordinput",
     "userpass", "newpass", "pwdhash", "passw", "passwort", "mot_de_passe", "motdepasse", "PASSWORD_1"];
-  for (const name of [...reviewer, "user_pass", "newPassword", "pwd", "otp_code", "passengerPassword", "passport_pwd", "bypassPassword", "mypassport"]) {
+  // round 3: an exception never matches across a camelCase boundary
+  const round3 = ["loginByPassword", "signInByPassword", "byPassword", "loginByPass", "comPassword", "passPortal", "x_passPort", "BYPassword"];
+  for (const name of [...reviewer, ...round3, "user_pass", "newPassword", "pwd", "otp_code", "passengerPassword", "passport_pwd", "bypassPassword", "mypassport"]) {
     for (const key of ["name", "id"]) {
       assert.strictEqual(filled({ type: "text", [key]: name }, D), 1, `default ${key}=${name}`);
       assert.strictEqual(filled({ type: "text", [key]: name }, null), 1, `plain-flags ${key}=${name}`);
     }
   }
-  for (const name of ["passenger_name", "passengerName", "PassengerCount", "passengers", "passport", "passport_no", "userPassport", "bypass", "bypass_cache", "compass", "compass_heading"]) {
+  for (const name of ["passenger_name", "passengerName", "PassengerCount", "passengers", "PASSENGER_NAME", "passport", "Passport", "passport_no", "userPassport", "PASSPORT",
+    "bypass", "Bypass", "BYPASS", "bypass_cache", "cacheBypass", "compass", "Compass", "COMPASS", "compass_heading", "compassion"]) {
     for (const key of ["name", "id"]) {
       assert.strictEqual(filled({ type: "text", [key]: name }, D), 0, `default ${key}=${name}: a ruled exception`);
       assert.strictEqual(filled({ type: "text", [key]: name }, null), 1, `plain-flags unchanged (substring): ${key}=${name}`);
@@ -486,4 +489,80 @@ test("A77 round 2 (F3): while locked, dialog_handle is NOT refused before the ca
   assert.strictEqual(handled.length, 2, "ran again");
   assert.strictEqual(held.isError, true, "the lock still holds after it: its result is withheld");
   assert.match(held.content.map((c) => c.text).join(" "), /withheld: the lock came on while it ran/);
+});
+
+// ── round 3: the slow-probe line, and the three fail-closed / log-only catches ──
+
+test("A77 round 3: a probe over 1000 ms appends ONE slow-probe line of counts {event, ms, tabs, frames, unreadable} (+ ts, slug, pid) — no value, name, URL, host or path; nothing else is written; a fast probe writes nothing; plain-flags never", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-a77-slow-"));
+  const file = path.join(dir, "default-lock-episodes.log");
+  const elog = new ReapLog({ file, slug: "proj-x" });
+  let delay = 1100;
+  const tabs = [
+    { key: "A", url: "https://slow-host-mark.example/secret-path?q=QUERY-MARK", frames: [{ url: "https://slow-host-mark.example/secret-path", result: { seen: 1, filled: 0, own: 0, kinds: [] } }, { url: "https://ads-mark.example/f", result: { seen: 0, filled: 0, own: 0, kinds: [] } }] },
+    { key: "B", url: "https://b.example/", frames: [{ url: "https://b.example/", result: null }] },
+  ];
+  const readTabs = async () => { await new Promise((r) => setTimeout(r, delay)); return { tabs }; };
+  const lock = createLock({ getContext: () => ({}), accounts: [], mode: "default", readTabs, episode: ({ event, ...f }) => elog.write(event, f) });
+  assert.strictEqual((await lock.probe()).locked, false);
+  delay = 0;
+  await lock.probe(); // fast: nothing
+  const lines = fs.readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.strictEqual(lines.length, 1, JSON.stringify(lines));
+  assert.deepStrictEqual(Object.keys(lines[0]).sort(), ["event", "frames", "ms", "pid", "slug", "tabs", "ts", "unreadable"]);
+  assert.deepStrictEqual([lines[0].event, lines[0].tabs, lines[0].frames, lines[0].unreadable], ["slow-probe", 2, 3, 1]);
+  assert.ok(lines[0].ms >= 1000 && lines[0].ms < 5000, String(lines[0].ms));
+  const text = fs.readFileSync(file, "utf8");
+  for (const mark of ["slow-host-mark", "ads-mark", "b.example", "secret-path", "QUERY-MARK", "https"]) assert.ok(!text.includes(mark), `${mark} in ${text}`);
+  const plainCalls = [];
+  const plain = createLock({ getContext: () => ({}), accounts: [], readTabs: async () => { await new Promise((r) => setTimeout(r, 1100)); return { tabs: [] }; }, episode: (e) => plainCalls.push(e) });
+  await plain.probe();
+  assert.deepStrictEqual(plainCalls, []);
+});
+
+test("A77 round 3: an episode writer that THROWS never affects the lock — the probe still locks, announces and returns its state (log-only)", async () => {
+  const b = fakeBrowser();
+  b.add("A", "https://bank.example/login", [input({ type: "password" }, TYPED)]);
+  const notices = [];
+  const lock = createLock({ getContext: () => ({}), mode: "default", readTabs: b.readTabs, notice: (n) => notices.push(n), episode: () => { throw new Error("disk full"); } });
+  const st = await lock.probe();
+  assert.strictEqual(st.locked, true);
+  assert.ok(notices.some((n) => /LOCKED/.test(n)));
+  b.tabs.get("A").els[0].value = "";
+  assert.strictEqual((await lock.probe()).locked, false, "and the unlock too");
+  // the slow-probe line too (every probe counts as slow here)
+  const slow = createLock({ getContext: () => ({}), mode: "default", readTabs: b.readTabs, slowProbeMs: -1, episode: () => { throw new Error("disk full"); } });
+  assert.strictEqual((await slow.probe()).locked, false);
+  b.tabs.get("A").els[0].value = TYPED;
+  assert.strictEqual((await slow.probe()).locked, true);
+});
+
+test("A77 round 3: a lock probe that THROWS fails closed — before the call (refused, nothing runs), after it (the result is withheld) and for a thrown error (withheld)", async () => {
+  let throwOn = new Set();
+  let n = 0;
+  const lock = { LOCK_TEXT: DEFAULT_LOCK_TEXT, status: () => ({}), probe: async () => { n++; if (throwOn.has(n)) throw new Error("cdp gone"); return { locked: false }; } };
+  const ran = [];
+  let upstreamThrows = false;
+  const upstream = { request: async (m, p) => { if (m === "tools/list") return { tools: [] }; ran.push(p.name); if (upstreamThrows) throw new Error(`upstream: <input value="${TYPED}">`); return { content: [{ type: "text", text: `RESULT ${TYPED}` }] }; } };
+  const relay = new RelayServer({ getUpstream: async () => upstream, ensureBrave: async () => {}, policy: createDefaultLockPolicy({ lock }) });
+  // before the call
+  n = 0; throwOn = new Set([1]);
+  const pre = await relay.handleToolsCall({ name: "a11y_take-aria-snapshot", arguments: {} });
+  assert.strictEqual(pre.isError, true);
+  assert.match(pre.content[0].text, /the lock probe failed: cdp gone — fail closed/);
+  assert.deepStrictEqual(ran, [], "nothing ran");
+  // after the call
+  n = 0; throwOn = new Set([2]);
+  const post = await relay.handleToolsCall({ name: "a11y_take-aria-snapshot", arguments: {} });
+  assert.deepStrictEqual(ran, ["a11y_take-aria-snapshot"]);
+  assert.strictEqual(post.isError, true);
+  assert.ok(!JSON.stringify(post).includes(TYPED), JSON.stringify(post));
+  assert.match(post.content[0].text, /the lock probe failed — fail closed\) — the result of this call was withheld/);
+  // a thrown error
+  n = 0; throwOn = new Set([2]); upstreamThrows = true;
+  await assert.rejects(relay.handleToolsCall({ name: "interaction_click", arguments: { selector: "#x" } }), (e) => {
+    assert.ok(!e.message.includes(TYPED), e.message);
+    assert.match(e.message, /the lock probe failed — fail closed\) — this call's error was withheld/);
+    return true;
+  });
 });
