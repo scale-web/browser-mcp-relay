@@ -48,9 +48,12 @@
 // "Lock, except session-filled values") runs this same lock with
 // `mode: "default"` (src/default-lock.js): rule 1 only (rule 2 and rule 3's
 // sign-in-frame clause are URL rules and are off), plus one exception — a
-// filled secret field whose value EXACTLY equals a value this relay process
-// passed into a page with interaction_fill / form_fill does not lock. The
-// relay keeps only salted SHA-256 digests of those values (createSessionFills:
+// filled secret field whose value EXACTLY equals a value (≥ 6 characters —
+// fix round 1) this relay process passed into a page with interaction_fill /
+// form_fill does not lock — and two refinements of rule 1 (ruling
+// as-ops/ask-75txd2): a field still holding the value the page sent (not
+// dirty) does not count, and the name / id rule matches password words whole.
+// The relay keeps only salted SHA-256 digests of those values (createSessionFills:
 // the last 50, each forgotten after 30 min; never logged, never in
 // relay_status, never on disk); the probe gets the digests and the salt, hashes
 // each filled secret field in its isolated world and COUNTS the matches — a
@@ -58,7 +61,8 @@
 //
 // Timeouts (review 1c L4, both modes): every newCDPSession, every CDP call,
 // each tab (tabs are read in parallel) and the whole probe are bounded; a
-// timeout = unreadable, which fails closed only per rule 3. The per-tab
+// timeout = unreadable, which fails closed only per rule 3; a tab that times
+// out keeps the frames already read (fix round 1). The per-tab
 // memory is keyed on origin + path (L5), so a ?step= / #hash change keeps it.
 //
 // Residuals (REFERENCE "The plain-flags relay"): a secret field in a CLOSED
@@ -81,13 +85,18 @@ const DEFAULT_LOCK_TEXT =
 const FRAME_TIMEOUT_MS = 2500;
 const SESSION_FILLS_MAX = 50;
 const SESSION_FILLS_TTL_MS = 30 * 60 * 1000;
+const SESSION_FILLS_MIN = 6; // characters (A77 fix 2)
 const CHALLENGE_HOST = "challenges.cloudflare.com";
 const WORLD_NAME = "__browser_mcp_relay_lock__";
 
 /**
  * Runs in each frame's ISOLATED world. COUNTS only — a value never leaves the page.
- * `allow` (default relay only): { salt, digests } — a filled secret field whose
- * SHA-256(salt + value) is one of `digests` is counted in `own`, not `filled`.
+ * `allow` (default relay only; null in plain-flags): { dflt: true, salt?, digests? }.
+ *   - a filled secret field whose SHA-256(salt + value) is one of `digests` is
+ *     counted in `own`, not `filled` (the session-filled exception);
+ *   - `dflt` (ruling as-ops/ask-75txd2, "Skip page-sent values + whole-word
+ *     match"): a field still holding the value the PAGE sent is not filled,
+ *     and the name / id rule matches password words whole.
  */
 const secretProbe = (allow) => {
   "use strict";
@@ -121,6 +130,25 @@ const secretProbe = (allow) => {
     return H.map((v) => (v >>> 0).toString(16).padStart(8, "0")).join("");
   };
   const ownSet = allow && typeof allow.salt === "string" && Array.isArray(allow.digests) && allow.digests.length > 0 ? new Set(allow.digests) : null;
+  const dflt = !!(allow && allow.dflt);
+  /**
+   * Default relay: the field still holds the value the page sent — its
+   * dirty-value flag is unset (nothing typed, autofilled or set through
+   * `.value` since). The flag is read on a DETACHED clone (cloning copies the
+   * value and the flag; the page cannot observe a detached node): the clone's
+   * value follows a changed default only while it is not dirty. A page that
+   * mirrors typed text into the `value` attribute (React) stays dirty, so it
+   * still locks. Any doubt → false (locks).
+   */
+  const sentByPage = (el) => {
+    try {
+      const d = String(el.defaultValue || "");
+      if (d === "" || String(el.value) !== d) return false;
+      const c = el.cloneNode(false);
+      c.defaultValue = d + "0";
+      return String(c.value) === d + "0";
+    } catch { return false; }
+  };
   // Round 5 item 2: an element once seen as secret stays secret for the life
   // of this world (= this document) — a show-password toggle turns
   // type=password into type=text with nothing else to recognise it by.
@@ -135,7 +163,16 @@ const secretProbe = (allow) => {
   };
   const AC = ["current-password", "new-password", "one-time-code"];
   const TEXT_TYPES = ["", "text", "password", "email", "tel", "number", "search", "url"];
-  const PASS_RE = /pass|pwd/i; // "password", "passcode", "passwd", "pwd" (substring, fail closed)
+  const PASS_RE = /pass|pwd/i; // plain-flags: "password", "passcode", "passwd", "pwd" (substring, fail closed)
+  // Default relay: whole words ("pass", "pwd", "otp") or a word ENDING in a long form
+  // ("userpassword", "loginpasswd") — "passenger_name", "passport", "bypass", "compass" do not match.
+  const NAME_WORDS = ["pass", "pwd", "otp"];
+  const NAME_ENDINGS = ["password", "passwd", "passcode", "passphrase", "pwd"];
+  const nameSecret = (nm, id) => {
+    const ws = [...words(nm), ...words(id)];
+    if (!dflt) return PASS_RE.test(nm) || PASS_RE.test(id) || ws.includes("otp");
+    return ws.some((w) => NAME_WORDS.includes(w) || NAME_ENDINGS.some((e) => w.endsWith(e)));
+  };
   const STRONG = (w) => w === "mfa" || w === "2fa" || w === "totp" || w === "otp" || w === "passcode" || w.startsWith("verif");
   const CODE_WORD = (w) => w === "code" || /^(sms|auth|login|access|security|email|onetime|confirm|confirmation|signin)code$/.test(w);
   const BOOST = ["sms", "auth", "2step", "twostep", "factor", "login", "signin", "security", "onetime"];
@@ -192,7 +229,7 @@ const secretProbe = (allow) => {
     const im = String(el.getAttribute("inputmode") || "").toLowerCase();
     const ml = Number(el.maxLength);
     if (mem.has(el) || type === "password" || prop === "password" || AC.some((t) => ac.includes(t)) ||
-      PASS_RE.test(nm) || PASS_RE.test(id) || [...words(nm), ...words(id)].includes("otp") || (ts !== "" && ts !== "none") || codeField(el, nm, id, im, ml)) {
+      nameSecret(nm, id) || (ts !== "" && ts !== "none") || codeField(el, nm, id, im, ml)) {
       secret.add(el);
     }
     if (ac.includes("one-time-code")) {
@@ -213,10 +250,11 @@ const secretProbe = (allow) => {
   for (const el of secret) {
     const v = String(el.value || "");
     if (v.length === 0) continue;
+    if (dflt && sentByPage(el)) continue; // the page's own value (a settings page's saved password)
     if (ownSet && ownSet.has(sha256hex(allow.salt + v))) own++; // exactly a value this session filled
     else filled++;
   }
-  return ownSet ? { seen: secret.size, filled, own } : { seen: secret.size, filled };
+  return ownSet || dflt ? { seen: secret.size, filled, own } : { seen: secret.size, filled };
 };
 
 /**
@@ -225,6 +263,9 @@ const secretProbe = (allow) => {
  * forgotten `ttlMs` after it was (last) filled. In memory only.
  */
 function createSessionFills({ max = SESSION_FILLS_MAX, ttlMs = SESSION_FILLS_TTL_MS, now = () => Date.now() } = {}) {
+  // A77 fix 2: a value shorter than SESSION_FILLS_MIN characters is not
+  // recorded — single digits filled into split one-time-code boxes would
+  // otherwise except Trevor's own code typed into the same boxes.
   const salt = crypto.randomBytes(16).toString("hex");
   const at = new Map(); // digest → time last filled (Map order = oldest first)
   const digest = (v) => crypto.createHash("sha256").update(salt + v, "utf8").digest("hex");
@@ -235,7 +276,7 @@ function createSessionFills({ max = SESSION_FILLS_MAX, ttlMs = SESSION_FILLS_TTL
   };
   return {
     record(value) {
-      if (typeof value !== "string" || value === "") return;
+      if (typeof value !== "string" || [...value].length < SESSION_FILLS_MIN) return;
       const d = digest(value);
       at.delete(d);
       at.set(d, now());
@@ -376,37 +417,43 @@ function createCdpReader({ frameTimeoutMs = FRAME_TIMEOUT_MS, tabTimeoutMs = 3 *
     return false;
   }
 
-  async function readTab(ctx, page, expression) {
+  /** `frames` (A77 fix 1): every frame's outcome is pushed as soon as it is known, so a tab timeout keeps what was read. */
+  async function readTab(ctx, page, expression, frames) {
     const opened = []; // every session this probe opened — all detached at the end
-    try { return await readTabWith(ctx, page, opened, expression); }
+    try { return await readTabWith(ctx, page, opened, expression, frames); }
     finally { await Promise.allSettled(opened.map((s) => withTimeout(Promise.resolve().then(() => s.detach()), 1000, "detach"))); }
   }
 
-  async function readTabWith(ctx, page, opened, expression) {
+  async function readTabWith(ctx, page, opened, expression, frames) {
     const children = page.frames().filter((f) => f !== page.mainFrame());
     const skipped = children.filter(underChallenge);
     const targets = [page, ...children.filter((f) => !skipped.includes(f))];
     const byFrame = new Map(); // CDP frameId → { url, sessions: [{ session, live }] }
     const failedTargets = new Set(); // Playwright frames whose own session or tree could not be had
     const ownSession = new Set(); // Playwright frames with a session of their own (out-of-process)
-    for (const t of targets) {
+    // A77 fix 1: every target's session, Runtime and frame tree are had IN
+    // PARALLEL (each step bounded), so N hung out-of-process frames cost one
+    // frame timeout, not N — the main frame is then read first. The results
+    // are applied in target order (main first), exactly as before.
+    const setups = await Promise.all(targets.map(async (t) => {
       const r = await sessionFor(ctx, t, opened);
-      if (r.inProcess) continue;
-      if (r.failed) { failedTargets.add(t === page ? page.mainFrame() : t); continue; }
-      const s = r.session;
-      if (t !== page) ownSession.add(t);
-      let tree;
-      let live;
+      if (r.inProcess || r.failed) return { t, ...r };
       try {
-        live = await withTimeout(runtimeFor(s), frameTimeoutMs, "runtime");
-        ({ frameTree: tree } = await withTimeout(s.send("Page.getFrameTree"), frameTimeoutMs, "frame tree"));
-      } catch { failedTargets.add(t === page ? page.mainFrame() : t); continue; }
-      for (const f of flatten(tree)) {
+        const live = await withTimeout(runtimeFor(r.session), frameTimeoutMs, "runtime");
+        const { frameTree: tree } = await withTimeout(r.session.send("Page.getFrameTree"), frameTimeoutMs, "frame tree");
+        return { t, session: r.session, live, tree };
+      } catch { return { t, session: r.session, failed: true }; }
+    }));
+    for (const x of setups) {
+      if (x.inProcess) continue;
+      if (x.session && x.t !== page) ownSession.add(x.t);
+      if (x.failed) { failedTargets.add(x.t === page ? page.mainFrame() : x.t); continue; }
+      for (const f of flatten(x.tree)) {
         if (!byFrame.has(f.id)) byFrame.set(f.id, { url: f.url, sessions: [] });
-        byFrame.get(f.id).sessions.push({ session: s, live });
+        byFrame.get(f.id).sessions.push({ session: x.session, live: x.live });
       }
     }
-    const frames = skipped.map((f) => ({ url: f.url(), result: { seen: 0, filled: 0 }, skipped: true }));
+    for (const f of skipped) frames.push({ url: f.url(), result: { seen: 0, filled: 0 }, skipped: true });
     for (const [id, f] of byFrame) {
       if (hostOf(f.url) === CHALLENGE_HOST) { frames.push({ url: f.url, result: { seen: 0, filled: 0 }, skipped: true }); continue; }
       let result = null;
@@ -452,8 +499,12 @@ function createCdpReader({ frameTimeoutMs = FRAME_TIMEOUT_MS, tabTimeoutMs = 3 *
     const tabs = await Promise.all(pages.map(async (page) => {
       let url = "";
       try { url = page.url(); } catch { /* unknown */ }
+      const read = []; // filled in as each frame is read (A77 fix 1)
       let frames;
-      try { frames = await withTimeout(readTab(ctx, page, expression), tabTimeoutMs, "tab probe"); } catch { frames = [{ url, result: null }]; }
+      // A tab that times out (or fails) keeps every frame already read — a
+      // filled secret there still locks, a seen one fails the rest closed —
+      // plus one unreadable entry for what was not read.
+      try { frames = await withTimeout(readTab(ctx, page, expression, read), tabTimeoutMs, "tab probe"); } catch { frames = [...read, { url, result: null }]; }
       return { key: page, url, frames };
     }));
     return { tabs };
@@ -489,7 +540,8 @@ function createLock({ getContext, accounts = KNOWN_ACCOUNTS, notice = () => {}, 
     let tabs = [];
     let readFailed = false;
     if (ctx) {
-      const allow = dflt && sessionFills ? sessionFills.allow() : null;
+      // Default mode: the probe's own rules (page-sent values, whole-word names) and the session's digests.
+      const allow = dflt ? { dflt: true, ...((sessionFills && sessionFills.allow()) || {}) } : null;
       // L4: the whole probe is bounded too (a backstop — the reader bounds each tab itself).
       try { ({ tabs } = await withTimeout(Promise.resolve().then(() => reader(ctx, { allow })), probeTimeoutMs, "lock probe")); } catch { readFailed = true; }
     }
@@ -549,5 +601,5 @@ function createLock({ getContext, accounts = KNOWN_ACCOUNTS, notice = () => {}, 
 
 module.exports = {
   createLock, createCdpReader, createSessionFills, secretProbe, EXEMPT, LOCK_TEXT, DEFAULT_LOCK_TEXT, CHALLENGE_HOST, StaleWorldError,
-  SESSION_FILLS_MAX, SESSION_FILLS_TTL_MS,
+  SESSION_FILLS_MAX, SESSION_FILLS_TTL_MS, SESSION_FILLS_MIN,
 };

@@ -129,6 +129,11 @@ async function startServer() {
       // A77 (the default relay's lock)
       case "/a77-nolock": return send(200, pageHtml(`<h1>A77-NOLOCK</h1><input type="password" id="pw"><input type="checkbox" name="password" id="cb" checked><input type="text" name="first" value="Zed">`));
       case "/a77-shadow": return send(200, pageHtml(`<div id="h"></div><script>const r=document.getElementById("h").attachShadow({mode:"open"});r.innerHTML='<div id="h2"></div>';r.getElementById("h2").attachShadow({mode:"open"}).innerHTML='<input type="password" id="spw">';</script>`));
+      // fix round 1: page-sent values (a settings page's saved password; a pre-filled passenger name), a React-style attribute mirror, a script-set value
+      case "/a77-settings": return send(200, pageHtml(`<h1>A77-SETTINGS</h1><input type="password" name="current" id="cur" value="Saved-Pw-Server-1"><input type="text" name="passenger_name" id="pn" value="Zed Fixture">`));
+      case "/a77-mirror": return send(200, pageHtml(`<input type="password" id="mpw"><script>const m=document.getElementById("mpw");m.addEventListener("input",()=>m.setAttribute("value",m.value));</script>`));
+      case "/a77-scriptset": return send(200, pageHtml(`<input type="password" id="spw2"><script>document.getElementById("spw2").value="Script-Set-Pw-9";</script>`));
+      case "/a77-busy": return send(200, pageHtml(`<input type="password" id="pw">${Array.from({ length: Number(url.searchParams.get("n")) || 3 }, (_, i) => `<iframe src="http://www.fixturebusy${i}.test:${P}/busy-frame"></iframe>`).join("")}`));
       case "/a77-xo5": return send(200, pageHtml(`<input type="password" id="pw">${Array.from({ length: 5 }, (_, i) => `<iframe src="http://www.fixturexo${i}.test:${P}/xs-frame"></iframe>`).join("")}`));
       case "/api/modal-login": return send(200, "{}", { "content-type": "application/json", "set-cookie": "FDSESS=abc123; Path=/; HttpOnly" });
       case "/sw.js": return send(200, SW_JS, { "content-type": "text/javascript", "service-worker-allowed": "/" });
@@ -1305,4 +1310,89 @@ test("A77 latency: the probe's cost per tool call in the default relay (2 probes
     t.diagnostic(`A77 probe latency (one probe; a tool call runs two): ${JSON.stringify(out)}`);
     process.stderr.write(`A77-LATENCY ${JSON.stringify(out)}\n`);
   } finally { await closeBrave(h); }
+});
+
+test("A77 fix 1 (HIGH): a password typed in the main frame beside 3 and 4 BUSY cross-site iframes still LOCKS, in both modes — the frames already read survive a tab timeout; the probe stays bounded", ISO, async (t) => {
+  await startServer();
+  const { createLock, createSessionFills } = require("../src/plainflags-lock.js");
+  const { h } = await launchPf("pf-a77busy-", "default");
+  try {
+    const page = h.context.pages()[0] || (await h.context.newPage());
+    const out = [];
+    for (const n of [3, 4]) {
+      await page.goto(U("www.a77busytop.test", `/a77-busy?n=${n}`), { waitUntil: "domcontentloaded" });
+      await page.fill("#pw", PASSWORD);
+      await page.waitForTimeout(700); // every child renderer is now stuck in its loop
+      for (const mode of ["plainflags", "default"]) {
+        const lock = createLock({ getContext: () => h.context, accounts: accountsFixture(), mode, sessionFills: createSessionFills() });
+        const t0 = Date.now();
+        const st = await lock.probe();
+        const ms = Date.now() - t0;
+        out.push({ n, mode, ms, locked: st.locked, filled: st.filled, unreadable: st.unreadable });
+        assert.strictEqual(st.locked, true, `${n} busy frames, ${mode}: ${JSON.stringify(st)}`);
+        assert.ok(st.filled >= 1, `the main frame's read counted: ${JSON.stringify(st)}`);
+        assert.ok(ms < 9000, `bounded: ${ms} ms`);
+      }
+    }
+    t.diagnostic(`A77 busy-frame probes: ${JSON.stringify(out)}`);
+    process.stderr.write(`A77-BUSY ${JSON.stringify(out)}\n`);
+  } finally { await closeBrave(h); }
+});
+
+test("A77 fix 3 on a real Brave: a settings page's saved password and a pre-filled passenger_name (page-sent values) do NOT lock in default mode and DO lock in plain-flags; typing over the saved password, a React-style attribute mirror and a script-set value all lock in default mode", ISO, async () => {
+  await startServer();
+  const { createLock, createSessionFills } = require("../src/plainflags-lock.js");
+  const { h } = await launchPf("pf-a77f3-", "default");
+  try {
+    const page = h.context.pages()[0] || (await h.context.newPage());
+    const dflt = createLock({ getContext: () => h.context, accounts: accountsFixture(), mode: "default", sessionFills: createSessionFills() });
+    const plain = createLock({ getContext: () => h.context, accounts: accountsFixture() });
+    await page.goto(U("www.a77settings.test", "/a77-settings"));
+    const d = await dflt.probe();
+    assert.deepStrictEqual([d.locked, d.filled, d.seen], [false, 0, 1], `default: page-sent values: ${JSON.stringify(d)}`);
+    const p = await plain.probe();
+    assert.deepStrictEqual([p.locked, p.filled, p.seen], [true, 2, 2], `plain-flags exactly as before (passenger_name is a substring match there): ${JSON.stringify(p)}`);
+    await page.fill("#cur", PASSWORD); // Trevor types over the saved one
+    assert.strictEqual((await dflt.probe()).locked, true, "a typed value on a field with a server default");
+    await page.fill("#cur", "Saved-Pw-Server-1"); // even re-typing the saved value is typing (dirty)
+    assert.strictEqual((await dflt.probe()).locked, true, "re-typed: dirty");
+    await page.goto(U("www.a77settings.test", "/a77-mirror"));
+    await page.fill("#mpw", PASSWORD);
+    assert.strictEqual(await page.getAttribute("#mpw", "value"), PASSWORD, "the page mirrored the typed value into its value attribute");
+    assert.strictEqual((await dflt.probe()).locked, true, "a mirrored (React-style) typed value still locks");
+    await page.goto(U("www.a77settings.test", "/a77-scriptset"));
+    assert.strictEqual((await dflt.probe()).locked, true, "a value set by script after load locks");
+  } finally { await closeBrave(h); }
+});
+
+test("A77 fix 2 e2e DEFAULT relay: the session fills single digits into six split-code boxes (which locks it — digits are never excepted), then Trevor types his code over them → LOCKED (aria snapshot refused, relay_status locked); his digits never reach a result", ISO, async () => {
+  await startServer();
+  const home = homeTmp("home-a77f2-");
+  const proj = path.join(home, "proj-a77f2");
+  const r = await startRelay({ env: { HOME: home, CLAUDE_PROJECT_DIR: proj, ...DEFAULT_RELAY_ENV() }, realUpstream: true });
+  const { chromium } = require("playwright-core");
+  let peek = null;
+  const seen = [];
+  const call = async (n, a = {}, t = 60000) => { const x = await r.call(n, a, t); seen.push(JSON.stringify(x)); return x; };
+  try {
+    assert.ok(!(await call("tabs_list", {}, 90000)).isError);
+    const side = JSON.parse(fs.readFileSync(path.join(cacheOf(home), "profiles", slugOf(proj), ".mcp-relay-status.json"), "utf8"));
+    peek = await chromium.connectOverCDP(`http://127.0.0.1:${side.cdpPort}`);
+    assert.ok(!(await call("navigation_go-to", { url: U("www.a77otp.test", "/l6-otp"), includeSnapshot: false })).isError);
+    const ff = await call("form_fill", { fields: Array.from({ length: 6 }, (_, i) => ({ selector: `#d${i}`, value: String(i + 1) })) });
+    // single digits are not recorded (< 6 characters), so the session's own per-box fill locks itself — documented
+    assert.strictEqual(ff.isError, true, ff.text.slice(0, 300));
+    assert.match(ff.text, /the result of this call was withheld: the lock came on while it ran/);
+    const pg = await waitFor(async () => peek.contexts()[0].pages().find((x) => x.url().includes("/l6-otp")) || null, 10000);
+    const code = "531642";
+    for (let i = 0; i < 6; i++) await pg.fill(`#d${i}`, code[i]);
+    const snap = await call("a11y_take-aria-snapshot");
+    assert.strictEqual(snap.isError, true, snap.text.slice(0, 300));
+    assert.match(snap.text, /Locked: a password or one-time code typed on this page/);
+    assert.strictEqual(JSON.parse((await call("relay_status")).text).lock.locked, true);
+    assert.ok(seen.every((t) => !t.includes("textbox")), "no snapshot (and so none of his digits) left the relay");
+  } finally {
+    if (peek) await peek.close().catch(() => {});
+    await r.stop();
+  }
 });

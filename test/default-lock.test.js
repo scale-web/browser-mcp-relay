@@ -3,8 +3,8 @@
 // module in mode "default" and src/default-lock.js through a real
 // RelayServer, against a fake page model whose reader runs the REAL in-page
 // probe (secretProbe) on a minimal fake DOM — so the exception is exercised
-// from the tool's args to the probe's hash check. The real-Brave version:
-// test/isolated-default-lock.test.js.
+// from the tool's args to the probe's hash check. The real-Brave tests are
+// the "A77" ones in test/isolated-plainflags.test.js.
 
 const test = require("node:test");
 const assert = require("node:assert");
@@ -77,28 +77,32 @@ test("A77 exception: a secret field holding EXACTLY a session-filled value is no
   assert.deepStrictEqual(runProbe(docOf([input({ type: "password" }, PASSWORD)]), null), { seen: 1, filled: 1 }, "no allow (plain-flags): counted as before");
 });
 
-test("A77 session fills: the last 50 only, each forgotten 30 min after it was filled; a re-fill refreshes it; empty values are not recorded", () => {
+test("A77 session fills: the last 50 only, each forgotten 30 min after it was filled; a re-fill refreshes it; empty and short (< 6 characters) values are not recorded", () => {
   let t = 0;
   const fills = createSessionFills({ now: () => t });
   assert.strictEqual(fills.allow(), null);
   fills.record("");
   fills.record(undefined);
+  fills.record("12345"); // fix 2: 5 characters
+  fills.record("🔑🔑🔑🔑🔑"); // 5 characters (10 UTF-16 units)
   assert.strictEqual(fills.size(), 0);
-  fills.record("first");
-  for (let i = 0; i < 49; i++) fills.record(`v${i}`);
+  fills.record("first-value");
+  for (let i = 0; i < 49; i++) fills.record(`value-${i}`);
   assert.strictEqual(fills.size(), 50);
   const has = (v) => { const a = fills.allow(); return !!a && a.digests.includes(crypto.createHash("sha256").update(a.salt + v, "utf8").digest("hex")); };
-  assert.ok(has("first"));
-  fills.record("v50"); // the 51st
-  assert.ok(!has("first"), "past 50, the oldest is forgotten");
-  assert.ok(has("v0") && has("v50"));
+  assert.ok(has("first-value"));
+  fills.record("value-50"); // the 51st
+  assert.ok(!has("first-value"), "past 50, the oldest is forgotten");
+  assert.ok(has("value-0") && has("value-50"));
   t = 29 * 60 * 1000;
-  fills.record("v0"); // refreshed
+  fills.record("value-0"); // refreshed
   t = 30 * 60 * 1000;
-  assert.ok(!has("v1"), "30 min after it was filled: forgotten");
-  assert.ok(has("v0"), "re-filled at 29 min: still remembered");
+  assert.ok(!has("value-1"), "30 min after it was filled: forgotten");
+  assert.ok(has("value-0"), "re-filled at 29 min: still remembered");
   t = 59 * 60 * 1000 + 1;
   assert.strictEqual(fills.allow(), null, "all forgotten");
+  fills.record("123456");
+  assert.ok(has("123456"), "6 characters: recorded");
 });
 
 // ── the lock in default mode ────────────────────────────────────────────────
@@ -352,4 +356,65 @@ test("1c L4: a reader that never answers cannot hang the probe (or relay_status)
     assert.notStrictEqual(st2, "HUNG");
     assert.strictEqual(st2.locked, false, `${mode}: nothing seen → not locked`);
   }
+});
+
+// ── fix round 1 ─────────────────────────────────────────────────────────────
+
+test("A77 fix 2: the session filled single digits 1..6 into split code boxes — Trevor's code typed into the same six boxes LOCKS; a ≥ 6-character session fill is still excepted", async () => {
+  const b = fakeBrowser();
+  const otp = { id: "otp" };
+  const boxes = b.add("A", "https://bank.example/2fa", Array.from({ length: 6 }, () => ({ ...input({ type: "text", maxlength: "1", inputmode: "numeric" }), parentElement: otp })));
+  for (let i = 0; i < 6; i++) { boxes[i].previousElementSibling = boxes[i - 1] || null; boxes[i].nextElementSibling = boxes[i + 1] || null; }
+  const { lock, fills } = defaultLock(b);
+  for (let i = 1; i <= 6; i++) fills.record(String(i)); // the session's per-box fills
+  "531642".split("").forEach((d, i) => { boxes[i].value = d; }); // Trevor types his code
+  const st = await lock.probe();
+  assert.deepStrictEqual([st.locked, st.filled, st.sessionFilled], [true, 6, 0], JSON.stringify(st));
+  // a long session value in one field is still the session's own
+  const b2 = fakeBrowser();
+  const [pw] = b2.add("A", "https://bank.example/login", [input({ type: "password" })]);
+  const d2 = defaultLock(b2);
+  d2.fills.record("123456");
+  pw.value = "123456";
+  assert.strictEqual((await d2.lock.probe()).locked, false);
+});
+
+test("A77 fix 3b: the name / id rule matches password words WHOLE in default mode — passenger_name, passport, bypass, compass do not lock there (they still do in plain-flags); user_pass, newPassword, pwd, otp_code, userpassword lock in both; type=password and the autocomplete values lock regardless of name", () => {
+  const D = { dflt: true };
+  const filled = (attrs, mode) => runProbe(docOf([input(attrs, "Zed-value-1")]), mode).filled;
+  for (const name of ["passenger_name", "passport", "bypass", "compass", "passengers", "PassengerCount"]) {
+    assert.strictEqual(filled({ type: "text", name }, D), 0, `default: ${name}`);
+    assert.strictEqual(filled({ type: "text", id: name }, D), 0, `default id: ${name}`);
+    assert.strictEqual(filled({ type: "text", name }, null), 1, `plain-flags unchanged (substring): ${name}`);
+  }
+  for (const name of ["user_pass", "newPassword", "pwd", "otp_code", "userpassword", "login.passwd", "pass[1]", "accessPasscode", "my-passphrase", "OTPInput"]) {
+    assert.strictEqual(filled({ type: "text", name, maxlength: "6" }, D), 1, `default: ${name}`);
+    assert.strictEqual(filled({ type: "text", name, maxlength: "6" }, null), 1, `plain-flags: ${name}`);
+  }
+  for (const attrs of [{ type: "password", name: "passenger_name" }, { type: "text", name: "bypass", autocomplete: "current-password" }, { type: "text", name: "x", autocomplete: "one-time-code" }]) {
+    assert.strictEqual(filled(attrs, D), 1, JSON.stringify(attrs));
+  }
+});
+
+test("A77 fix 3a: a field still holding the PAGE's value (not dirty) does not count in default mode — and does in plain-flags; a value that differs from the page's, or a dirty one equal to it, counts", () => {
+  // a fake control with the HTML dirty-value flag: its value follows defaultValue only while not dirty
+  const control = (def, { typed = null, dirty = false } = {}) => {
+    const el = input({ type: "password" });
+    let d = def; let v = typed === null ? def : typed; let isDirty = dirty || typed !== null;
+    Object.defineProperty(el, "defaultValue", { get: () => d, set: (x) => { d = x; if (!isDirty) v = x; } });
+    Object.defineProperty(el, "value", { get: () => v, set: (x) => { v = x; isDirty = true; } });
+    el.cloneNode = () => control(d, isDirty ? { typed: v, dirty: true } : {});
+    return el;
+  };
+  const D = { dflt: true };
+  const count = (el, mode) => runProbe(docOf([el]), mode);
+  assert.deepStrictEqual(count(control("Saved-Pw-Server-1"), D), { seen: 1, filled: 0, own: 0 }, "the page's own value");
+  assert.deepStrictEqual(count(control("Saved-Pw-Server-1"), null), { seen: 1, filled: 1 }, "plain-flags: exactly as before");
+  assert.strictEqual(count(control("Saved-Pw-Server-1", { typed: TYPED }), D).filled, 1, "typed over the page's value");
+  assert.strictEqual(count(control("Saved-Pw-Server-1", { typed: "Saved-Pw-Server-1" }), D).filled, 1, "re-typed (dirty) equal to it: still counts");
+  assert.strictEqual(count(control("", { typed: TYPED }), D).filled, 1, "no page value: unchanged");
+  // a control the clone check cannot run on (no cloneNode) fails closed
+  const bare = input({ type: "password" }, "Saved-Pw-Server-1");
+  bare.defaultValue = "Saved-Pw-Server-1";
+  assert.strictEqual(count(bare, D).filled, 1);
 });

@@ -37,6 +37,7 @@ function fakeBrowser() {
     return c;
   }
   const announce = (s, c) => deliver(s, "Runtime.executionContextCreated", { context: { id: c.id, name: c.name, uniqueId: c.uniqueId, auxData: { frameId: c.frameId, type: c.world } } });
+  const hangEval = new Set(); // frame ids whose evaluate never answers (A77 fix 1)
   let beforeEvaluate = null; // test hook: runs just before a Runtime.evaluate is executed
   function session(owner, getTree) {
     const s = new EventEmitter();
@@ -55,6 +56,7 @@ function fakeBrowser() {
         if (params.uniqueContextId !== undefined) c = byUnique.get(params.uniqueContextId);
         else c = contexts.get(params.contextId);
         if (!c || c.dead) throw new Error("Cannot find context with specified id");
+        if (hangEval.has(c.frameId)) return new Promise(() => {}); // a busy renderer never answers
         return { result: { type: "object", value: counts.get(c.frameId) || { seen: 0, filled: 0 } } };
       }
       throw new Error(`unexpected ${method}`);
@@ -76,7 +78,7 @@ function fakeBrowser() {
     },
   };
   return {
-    ctx, page, main, frames, counts, contexts, log, oopif, phantoms, sessions, undescribed,
+    ctx, page, main, frames, counts, contexts, log, oopif, phantoms, sessions, undescribed, hangEval,
     onNextEvaluate(f) { beforeEvaluate = f; },
     addFrame(id, url, opts = {}) { const f = frame(id, url, main); frames.push(f); if (opts.oopif) oopif.set(f, opts); return f; },
     /** A cross-process navigation: contexts die, NUMERIC ids restart, the page's own new contexts take the low ids. */
@@ -283,4 +285,37 @@ test("1c L4 (fake CDP): each TAB is bounded and tabs are read in parallel — th
   assert.strictEqual(st.locked, true, JSON.stringify(st));
   assert.strictEqual(st.reason, "a password / one-time-code field on a tab holds a value");
   assert.ok(st.unreadable >= 3, JSON.stringify(st));
+});
+
+test("A77 fix 1 (fake CDP): the main frame holds a typed password and 3 child frames hang — in-process (their evaluate never answers) or out-of-process (their tree never answers) — the tab times out but keeps the main frame's read: LOCKED, in both modes, within the tab timeout", async () => {
+  for (const kind of ["in-process", "out-of-process"]) {
+    for (const mode of ["plainflags", "default"]) {
+      const b = fakeBrowser();
+      for (let i = 0; i < 3; i++) {
+        b.addFrame(`B${i}`, `https://busy${i}.example/`, kind === "out-of-process" ? { oopif: true, hangTree: true } : {});
+        if (kind === "in-process") b.hangEval.add(`B${i}`);
+      }
+      b.counts.set("MAIN", { seen: 1, filled: 1 });
+      // tab timeout 500 ms < 3 × 300 ms: frames read one after another would not all fit
+      const lock = createLock({ getContext: () => b.ctx, accounts: [], mode, readTabs: createCdpReader({ frameTimeoutMs: 300, tabTimeoutMs: 500 }) });
+      const t0 = Date.now();
+      const st = await lock.probe();
+      const ms = Date.now() - t0;
+      assert.strictEqual(st.locked, true, `${kind} ${mode}: ${JSON.stringify(st)}`);
+      assert.strictEqual(st.filled, 1, `${kind} ${mode}: the main frame's read was kept`);
+      assert.ok(st.unreadable >= 1, `${kind} ${mode}: ${JSON.stringify(st)}`);
+      assert.ok(ms < 1500, `${kind} ${mode}: bounded, ${ms} ms`);
+    }
+  }
+});
+
+test("A77 fix 1 (fake CDP): the main frame's secret field is EMPTY but SEEN and the tab times out on hung children — the rest fails closed (locked); with no secret anywhere it does not", async () => {
+  const b = fakeBrowser();
+  for (let i = 0; i < 3; i++) { b.addFrame(`B${i}`, `https://busy${i}.example/`); b.hangEval.add(`B${i}`); }
+  b.counts.set("MAIN", { seen: 1, filled: 0 });
+  const st = await createLock({ getContext: () => b.ctx, accounts: [], readTabs: createCdpReader({ frameTimeoutMs: 300, tabTimeoutMs: 500 }) }).probe();
+  assert.strictEqual(st.locked, true, JSON.stringify(st));
+  b.counts.set("MAIN", { seen: 0, filled: 0 });
+  const st2 = await createLock({ getContext: () => b.ctx, accounts: [], readTabs: createCdpReader({ frameTimeoutMs: 300, tabTimeoutMs: 500 }) }).probe();
+  assert.strictEqual(st2.locked, false, JSON.stringify(st2));
 });
