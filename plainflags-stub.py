@@ -5,16 +5,20 @@ Claude Code runs this in place of the plain-flags relay (docs/REFERENCE.md,
 "The lazy stub"). Until a tool is called it answers the MCP handshake itself —
 initialize, notifications/initialized, ping and tools/list — from
 plainflags-tools.json, which scripts/gen-plainflags-tools.js writes from the
-real relay and test/plainflags-stub-drift.test.js keeps equal to it. The first
-other request starts the real relay (launch-project-isolated.js beside this
+real relay and test/plainflags-stub-drift.test.js keeps equal to it. Methods the
+relay does not implement (Claude Code's opening `server/discover`, resources/*,
+prompts/*, …) get the relay's own recorded "Method not found" from the same file,
+and nothing starts the relay before the client's initialize. The first other
+request after it starts the real relay (launch-project-isolated.js beside this
 file, BROWSER_RELAY_PROFILE_MODE=plainflags forced), replays the client's
 initialize to it, and from then on every line is passed through unchanged, both
 ways. Only the stub's own two requests (the replayed initialize, a tools/list
 check) carry the stub's own ids, and their answers never reach the client.
 
 stderr: method names, ids, sizes and the relay's lifecycle only — never a
-message body (tool arguments can hold typed text). The relay's own stderr is
-passed through.
+message body (tool arguments can hold typed text). The relay writes to the
+stub's stderr itself (inherited, not piped: a pipe to a SIGKILLed stub left the
+relay and its Brave running).
 
 Python 3.9 stdlib only (/usr/bin/python3 on macOS).
 """
@@ -30,8 +34,9 @@ LAUNCHER = os.path.join(HERE, "launch-project-isolated.js")
 TOOLS_FILE = os.path.join(HERE, "plainflags-tools.json")
 TMPDIR_TOKEN = "${os.tmpdir()}"
 
-# Tests only, and only for a script under the system temp dir (else refused):
-# a fake relay to start instead, and "init,restart,grace" seconds.
+# Tests only: a fake relay to start instead, and "init,restart,grace" seconds.
+# Honoured only for a file under the temp dir the env names (TMPDIR), else the
+# stub refuses to run — a guard against a leftover setting, not a boundary.
 TEST_CHILD_ENV = "PLAINFLAGS_STUB_TEST_CHILD"
 TEST_TIMINGS_ENV = "PLAINFLAGS_STUB_TEST_TIMINGS"
 
@@ -91,11 +96,14 @@ def load_tools_file():
         protocol, server, tools = s["protocol"], s["initialize"], s["toolsList"]
         if not (isinstance(protocol["supported"], list) and protocol["latest"] and isinstance(tools["tools"], list)):
             raise ValueError("shape")
+        # Only "Method not found" replies are served: stateless, the relay's answer whatever its state.
+        not_found = {m: r["error"] for m, r in s["otherMethods"].items()
+                     if isinstance(r, dict) and isinstance(r.get("error"), dict) and r["error"].get("code") == -32601}
     except (OSError, ValueError, KeyError, TypeError) as e:
         log("%s is unreadable (%s) — cannot answer the handshake; regenerate it (scripts/gen-plainflags-tools.js)"
             % (TOOLS_FILE, type(e).__name__))
         sys.exit(2)
-    return protocol, server, untokenize(tools, node_tmpdir())
+    return protocol, server, untokenize(tools, node_tmpdir()), not_found
 
 
 def test_overrides():
@@ -106,7 +114,7 @@ def test_overrides():
     import tempfile
     real = os.path.realpath(script)
     if not real.startswith(os.path.realpath(tempfile.gettempdir()) + os.sep) or not os.path.isfile(real):
-        log("%s is set but is not a file under the system temp dir — refusing to run" % TEST_CHILD_ENV)
+        log("%s is set but is not a file under the temp dir — refusing to run" % TEST_CHILD_ENV)
         sys.exit(2)
     timings = (INIT_TIMEOUT_S, RESTART_EVERY_S, EXIT_GRACE_S)
     if os.environ.get(TEST_TIMINGS_ENV):
@@ -116,7 +124,7 @@ def test_overrides():
 
 class Stub:
     def __init__(self):
-        self.protocol, self.server, self.tools = load_tools_file()
+        self.protocol, self.server, self.tools, self.not_found = load_tools_file()
         self.script, (self.init_timeout, self.restart_every, self.exit_grace) = test_overrides()
         self.client_init = None  # params of the client's initialize, replayed to the relay
         self.proc = None
@@ -170,6 +178,9 @@ class Stub:
         if method in ("initialize", "notifications/initialized") or (
                 method in ("ping", "tools/list") and self.state != "ready"):
             return self.answer(msg, method) if is_request else None
+        if is_request and method in self.not_found and self.state != "ready":
+            log("%s id=%s answered by the stub (the relay's Method not found)" % (method, show_id(msg["id"])))
+            return self.to_client_msg({"jsonrpc": "2.0", "id": msg["id"], "error": self.not_found[method]})
         if self.state == "ready":
             return self.forward(line, msg)
         if self.state == "starting":
@@ -178,6 +189,12 @@ class Stub:
         if not is_request:
             log("dropped %s (%d bytes): no relay running" % (method or "a non-request line", len(line)))
             return None
+        if self.client_init is None:
+            # Never start the relay on a made-up initialize: before the client's own, refuse.
+            log("%s id=%s before initialize — refused, the relay is not started" % (method, show_id(msg["id"])))
+            return self.to_client_msg({"jsonrpc": "2.0", "id": msg["id"], "error": {
+                "code": -32600, "message": "[plainflags-stub] %s before initialize: the plain-flags relay starts only "
+                                           "after the client's initialize" % method}})
         if self.state == "failed" and time.monotonic() - self.last_start < self.restart_every:
             left = self.restart_every - (time.monotonic() - self.last_start)
             return self.reply_error(msg["id"], "%s; it is started again at most once per %d s — retry in %d s."
@@ -219,7 +236,7 @@ class Stub:
         env = dict(os.environ, BROWSER_RELAY_PROFILE_MODE="plainflags")
         try:
             self.proc = subprocess.Popen(
-                ["node", self.script], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                ["node", self.script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,  # stderr: the stub's own
                 env=env, bufsize=0, start_new_session=True)  # own process group: killed as one
         except OSError as e:
             self.proc = None
@@ -227,10 +244,7 @@ class Stub:
         self.state = "starting"
         self.deadline = time.monotonic() + self.init_timeout
         log("relay pid=%d starting" % self.proc.pid)
-        params = self.client_init if self.client_init is not None else {
-            "protocolVersion": self.protocol["latest"], "capabilities": {},
-            "clientInfo": {"name": "plainflags-stub", "version": "0"}}
-        self.to_child_msg({"jsonrpc": "2.0", "id": INIT_ID, "method": "initialize", "params": params})
+        self.to_child_msg({"jsonrpc": "2.0", "id": INIT_ID, "method": "initialize", "params": self.client_init})
         return None
 
     def from_child(self, line):
@@ -279,15 +293,10 @@ class Stub:
         except OSError:
             pass
         code = p.wait()
-        for f in (p.stderr, p.stdout, p.stdin):
+        for f in (p.stdout, p.stdin):
             try:
-                if f is p.stderr:
-                    os.set_blocking(f.fileno(), False)
-                    rest = f.read()
-                    if rest:
-                        self.write(2, rest)
                 f.close()
-            except (OSError, ValueError):
+            except OSError:
                 pass
         self.bufs.clear()
         self.proc, self.deadline = None, None
@@ -368,7 +377,7 @@ class Stub:
             if self.stdin_open and not self.stopping:
                 fds.append(0)
             if self.proc is not None:
-                fds += [f.fileno() for f in (self.proc.stdout, self.proc.stderr) if not f.closed]
+                fds.append(self.proc.stdout.fileno())
             timeout = None if self.deadline is None else max(0.0, self.deadline - time.monotonic())
             readable = select.select(fds, [], [], timeout)[0]
             relay = self.proc
@@ -388,11 +397,6 @@ class Stub:
                         self.begin_stop("stdin closed")
                     for line in self.lines(0, data):
                         self.from_client(line)
-                elif fd == self.proc.stderr.fileno():
-                    if data:
-                        self.write(2, data)
-                    else:
-                        self.proc.stderr.close()
                 elif not data:  # the relay's stdout: EOF = it exited
                     self.end_relay()
                 else:

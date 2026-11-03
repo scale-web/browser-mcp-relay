@@ -152,6 +152,44 @@ test("handshake: initialize / initialized / tools/list / ping answered by the st
   } finally { await s.stop(); }
 });
 
+test("Claude Code 2.1.296's opening (server/discover before initialize, then initialize / initialized / tools/list, resources/list, prompts/list) starts no relay; the first tools/call replays the client's exact initialize", OPTS, async () => {
+  const s = startStub();
+  try {
+    const disc = await s.request("server/discover", {}, "server-discover-probe-1");
+    assert.deepStrictEqual(disc.error, FILE.otherMethods["server/discover"].error, "the relay's own reply, from the file");
+    assert.deepStrictEqual(disc.error, { code: -32601, message: "Method not found" });
+    await s.handshake();
+    assert.strictEqual((await s.request("tools/list", {})).result.tools.length, FILE.toolsList.tools.length);
+    for (const m of ["resources/list", "resources/templates/list", "prompts/list"]) {
+      assert.deepStrictEqual((await s.request(m, {})).error, FILE.otherMethods[m].error, m);
+    }
+    await sleep(500);
+    assert.deepStrictEqual(s.pids(), [], "no relay was started");
+    assert.deepStrictEqual(childrenOf(s.child.pid), [], "the stub has no child process");
+    const r = await s.call("echo", { n: 1 }, 40);
+    assert.deepStrictEqual(text(r), { id: 40, args: { n: 1 } });
+    const got = s.received();
+    assert.strictEqual(got[0].method, "initialize");
+    assert.deepStrictEqual(got[0].params, CLIENT_INIT, "the client's own initialize, not a made-up one");
+    assert.ok(!got.some((m) => m.method === "server/discover" || m.method === "resources/list"), "the probes never reached the relay");
+    assert.strictEqual(s.pids().length, 1);
+  } finally { await s.stop(); }
+});
+
+test("a request before initialize is refused and starts no relay; after initialize the relay gets the client's initialize", OPTS, async () => {
+  const s = startStub();
+  try {
+    const early = await s.call("echo", {}, 41);
+    assert.strictEqual(early.error.code, -32600);
+    assert.match(early.error.message, /before initialize/);
+    await sleep(300);
+    assert.deepStrictEqual(s.pids(), [], "no relay before the client's initialize");
+    await s.handshake();
+    assert.deepStrictEqual(text(await s.call("echo", {}, 42)), { id: 42, args: {} });
+    assert.deepStrictEqual(s.received()[0].params, CLIENT_INIT);
+  } finally { await s.stop(); }
+});
+
 test("tools/list: the tmpdir token becomes the session's os.tmpdir() (trailing slash dropped, as Node does)", OPTS, async () => {
   const tmp = fs.realpathSync(os.tmpdir());
   const s = startStub({ env: { TMPDIR: tmp + "/" } });
@@ -192,6 +230,11 @@ test("first tools/call starts the relay: exact initialize replayed under the stu
     await s.request("tools/list", {}, 31);
     assert.deepStrictEqual(s.received().slice(-2).map((m) => [m.method, m.id]), [["ping", 30], ["tools/list", 31]]);
     await sleep(200);
+    // exactly once: one answer per request id, one relay notification per echo call (5: ids 10–12, 20, 21)
+    const answers = s.messages.filter((m) => m.id !== undefined).map((m) => m.id);
+    assert.deepStrictEqual(answers.slice().sort((a, b) => a - b), [1, 10, 11, 12, 20, 21, 30, 31], "every request answered exactly once");
+    assert.strictEqual(s.messages.filter((m) => m.method === "notifications/message").length, 5, "each relay notification delivered once");
+    assert.strictEqual(s.received().filter((m) => m.method === "tools/call").length, 5, "each call reached the relay once");
     assert.ok(s.messages.every((m) => typeof m.id !== "string"), "no answer to the stub's own requests reached the client");
     assert.ok(!s.messages.some((m) => m.method === "notifications/tools/list_changed"), "no drift → no list_changed");
     assert.strictEqual(s.pids().length, 1, "one relay");
@@ -206,7 +249,10 @@ test("relay → client notifications and the relay's stderr are passed through",
     await s.waitFor((m) => m.method === "notifications/message" && m.params.data === "fake-note");
     await s.call("listchanged");
     await s.waitFor((m) => m.method === "notifications/tools/list_changed");
-    assert.match(s.stderr(), /fake-relay: started pid=\d+/);
+    await sleep(200);
+    assert.strictEqual(s.messages.filter((m) => m.method === "notifications/tools/list_changed").length, 1, "delivered once");
+    assert.strictEqual(s.messages.filter((m) => m.method === "notifications/message").length, 2, "delivered once each");
+    assert.match(s.stderr(), /fake-relay: started pid=\d+/, "the relay writes to the stub's stderr (inherited)");
   } finally { await s.stop(); }
 });
 
@@ -230,6 +276,21 @@ test("relay crash: in-flight calls get an error, a call inside the restart windo
     const again = await s.call("echo", { n: 2 }, 53);
     assert.deepStrictEqual(text(again), { id: 53, args: { n: 2 } });
     assert.strictEqual(s.pids().length, 2, "restarted once");
+  } finally { await s.stop(); }
+});
+
+test("a relay that closes its stderr and then crashes: error replies, then a restart (the stub never reads the relay's stderr)", OPTS, async () => {
+  const s = startStub({ mode: "close-stderr", timings: "5,1,1.5" });
+  try {
+    await s.handshake();
+    await s.call("echo");
+    await sleep(200);
+    const r = await s.call("crash", {}, 61);
+    assert.match(r.error.message, /exited \(code 3\)/);
+    await sleep(1100);
+    assert.deepStrictEqual(text(await s.call("echo", { n: 2 }, 62)), { id: 62, args: { n: 2 } }, "restarted");
+    assert.strictEqual(s.pids().length, 2);
+    assert.strictEqual(s.child.exitCode, null, "the stub is still running");
   } finally { await s.stop(); }
 });
 
@@ -330,13 +391,13 @@ test("stderr never carries a message body: tool arguments in every path stay out
   } finally { await s.stop(); }
 });
 
-test("the test-child override is refused unless it is a file under the system temp dir (nothing is started)", OPTS, async () => {
+test("the test-child override is refused unless it is a file under the temp dir (nothing is started)", OPTS, async () => {
   for (const bad of ["/etc/hosts", path.join(os.tmpdir(), "no-such-fake.js")]) {
     const s = startStub({ fakePath: bad });
     try {
       const ex = await exitedWithin(s, 5000);
       assert.strictEqual(ex.code, 2, bad);
-      assert.match(s.stderr(), /PLAINFLAGS_STUB_TEST_CHILD is set but is not a file under the system temp dir — refusing/);
+      assert.match(s.stderr(), /PLAINFLAGS_STUB_TEST_CHILD is set but is not a file under the temp dir — refusing/);
       assert.deepStrictEqual(s.pids(), []);
     } finally { await s.stop(); }
   }
@@ -354,12 +415,13 @@ const homeBraves = (home) => (spawnSync("ps", ["-eo", "pid,command", "-ww"], { e
   .split("\n").filter((l) => /brave/i.test(l) && l.includes(`--user-data-dir=${home}`)).map((l) => Number(l.trim().split(/\s+/)[0]));
 const resultText = (r) => r.result.content.filter((c) => c.type === "text" && !c.text.startsWith("[browser-mcp-relay]")).map((c) => c.text).join("\n");
 
-test("e2e: the REAL plain-flags relay through the stub — handshake with no relay; first call starts it; navigation_go-to a local page and challenge_detect work; EOF leaves no relay or Brave", E2E, async () => {
+/** A local page, a temp HOME and project, the plain-flags test fixture, and the relay env. */
+async function realSetup(tag) {
   const { homeTmp } = require("./helpers/isolation.js");
   const http = require("node:http");
   const server = http.createServer((req, res) => { res.writeHead(200, { "content-type": "text/html" }); res.end("<!doctype html><html><head><link rel=icon href=data:,></head><body><h1>STUB-E2E</h1></body></html>"); });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  const home = homeTmp("home-pfstub-");
+  const home = homeTmp(`home-pfstub-${tag}-`);
   const proj = path.join(home, "proj-pfstub");
   fs.mkdirSync(proj);
   const signin = path.join(home, "plainflags-signin.json");
@@ -373,10 +435,24 @@ test("e2e: the REAL plain-flags relay through the stub — handshake with no rel
     BROWSER_RELAY_POOL_DIR: "", // the launcher sets it
   };
   delete process.env.BROWSER_RELAY_INSECURE_TLS;
+  return { server, home, proj, env, url: `http://127.0.0.1:${server.address().port}/stub-page` };
+}
+
+/** Every descendant of `pid` (the relay, its upstream, …). */
+function descendants(pid) {
+  const out = [];
+  for (const c of childrenOf(pid)) out.push(c, ...descendants(c));
+  return out;
+}
+
+test("e2e: the REAL plain-flags relay through the stub — Claude Code's opening (server/discover first) starts no relay; first call starts it; navigation_go-to a local page and challenge_detect work; EOF leaves no relay or Brave", E2E, async () => {
+  const { server, home, proj, env, url } = await realSetup("eof");
   const s = startStub({ real: true, env, cwd: proj });
   try {
+    assert.deepStrictEqual((await s.request("server/discover", {}, "server-discover-probe-1")).error, { code: -32601, message: "Method not found" });
     await s.handshake();
     assert.deepStrictEqual((await s.request("tools/list", {})).result, untoken(FILE.toolsList, os.tmpdir()));
+    await sleep(500);
     assert.deepStrictEqual(childrenOf(s.child.pid), [], "no relay before a tool call");
 
     let t0 = Date.now();
@@ -389,7 +465,6 @@ test("e2e: the REAL plain-flags relay through the stub — handshake with no rel
     const relayPids = childrenOf(s.child.pid);
     assert.strictEqual(relayPids.length, 1, "one relay process");
 
-    const url = `http://127.0.0.1:${server.address().port}/stub-page`;
     t0 = Date.now();
     const nav = await s.call("navigation_go-to", { url, includeScreenshot: false }, 201, 120000);
     const navMs = Date.now() - t0;
@@ -411,6 +486,32 @@ test("e2e: the REAL plain-flags relay through the stub — handshake with no rel
   } finally {
     await s.stop();
     for (const p of homeBraves(home)) { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } }
+    server.close();
+  }
+});
+
+test("e2e: a bare SIGKILL of the stub leaves no relay and no Brave (the relay sees its stdin close; its stderr is not a pipe to the dead stub)", E2E, async () => {
+  const { server, home, proj, env, url } = await realSetup("kill");
+  const s = startStub({ real: true, env, cwd: proj });
+  let tree = [];
+  try {
+    await s.handshake();
+    const nav = await s.call("navigation_go-to", { url, includeScreenshot: false }, 300, 120000);
+    assert.ok(!nav.error && !nav.result.isError, JSON.stringify(nav).slice(0, 2000));
+    tree = descendants(s.child.pid);
+    assert.ok(tree.length >= 1 && homeBraves(home).length > 0, "relay and Brave running");
+    const t0 = Date.now();
+    s.child.kill("SIGKILL");
+    await exitedWithin(s, 5000);
+    const end = Date.now() + 15000;
+    while ((tree.some(alive) || homeBraves(home).length) && Date.now() < end) await sleep(100);
+    const left = tree.filter(alive);
+    assert.deepStrictEqual(left, [], `relay processes still alive after SIGKILL: ${left.join(", ")}`);
+    assert.deepStrictEqual(homeBraves(home), [], "no Brave left on the test profile");
+    process.stderr.write(`[plainflags-stub e2e] after SIGKILL of the stub: relay tree and Brave gone in ${Date.now() - t0} ms\n`);
+  } finally {
+    await s.stop();
+    for (const p of [...tree, ...homeBraves(home)]) { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } }
     server.close();
   }
 });

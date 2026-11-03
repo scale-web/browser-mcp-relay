@@ -4,7 +4,8 @@
 //   FAKE_DIR     received.jsonl (every line it read), pids (one line per start:
 //                "<pid> <grandchild pid>"), info-<pid>.json (cwd, profile mode)
 //   FAKE_MODE    comma list: no-init (never answers initialize), init-error,
-//                ignore-term (ignores SIGTERM and stdin EOF)
+//                ignore-term (ignores SIGTERM and stdin EOF), close-stderr
+//                (closes its stderr once initialized)
 //   FAKE_STATIC  plainflags-tools.json — its toolsList is served by default
 //   FAKE_TOOLS   a toolsList JSON to serve instead (the drift case)
 // Tools: echo {delayMs} → {id, args} as the relay saw them, after a
@@ -36,7 +37,9 @@ function handle(msg) {
   if (msg.method === "initialize") {
     if (modes.has("no-init")) return;
     if (modes.has("init-error")) return send({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "no" } });
-    return send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: msg.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "fake", version: "0" } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: msg.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "fake", version: "0" } } });
+    if (modes.has("close-stderr")) fs.closeSync(2);
+    return;
   }
   if (msg.method === "tools/list") return send({ jsonrpc: "2.0", id: msg.id, result: toolsList() });
   if (msg.method === "ping") return send({ jsonrpc: "2.0", id: msg.id, result: {} });

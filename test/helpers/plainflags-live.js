@@ -14,6 +14,13 @@ const { REPO, homeTmp } = require("./isolation.js");
 const { startRelay } = require("./mcp.js");
 
 const TOOLS_FILE = path.join(REPO, "plainflags-tools.json");
+// Methods a client may send without meaning to use a tool (Claude Code 2.1.296
+// opens every server with `server/discover`, before initialize). The relay's
+// replies are recorded; the stub answers a "Method not found" one itself, so
+// none of these starts the relay.
+const PROBE_METHODS = Object.freeze([
+  "server/discover", "resources/list", "resources/templates/list", "prompts/list", "logging/setLevel", "completion/complete",
+]);
 // Upstream puts the relay's os.tmpdir() into two schema defaults (screenshot
 // outputPath). The file holds this token instead — the stub puts back its own
 // env's value, computed as Node does — so the file is the same on every machine.
@@ -28,7 +35,38 @@ function tokenizeTmpdir(v, tmp) {
 
 /** The parts of the file that must equal the live relay (everything but the note). */
 function comparable(file) {
-  return { protocol: file.protocol, initialize: file.initialize, toolsList: file.toolsList };
+  return { protocol: file.protocol, initialize: file.initialize, toolsList: file.toolsList, otherMethods: file.otherMethods };
+}
+
+/** The relay's raw reply ({error} or {result}) to each probe method. */
+function probe(r) {
+  return new Promise((resolve, reject) => {
+    const want = new Map(PROBE_METHODS.map((m, i) => [`probe-${i}`, m]));
+    const got = {};
+    let buf = "";
+    const t = setTimeout(() => { r.child.stdout.off("data", onData); reject(new Error(`no reply to ${[...want.values()].join(", ")}`)); }, 30000);
+    function onData(c) {
+      buf += c;
+      let nl;
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        let msg;
+        try { msg = JSON.parse(line); } catch { continue; }
+        const m = want.get(msg.id);
+        if (!m) continue;
+        want.delete(msg.id);
+        got[m] = "error" in msg ? { error: msg.error } : { result: msg.result };
+      }
+      if (want.size === 0) {
+        clearTimeout(t);
+        r.child.stdout.off("data", onData);
+        resolve(Object.fromEntries(PROBE_METHODS.map((m) => [m, got[m]])));
+      }
+    }
+    r.child.stdout.on("data", onData);
+    for (const [id, method] of want) r.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params: {} }) + "\n");
+  });
 }
 
 async function captureLive() {
@@ -53,6 +91,7 @@ async function captureLive() {
   });
   try {
     const toolsList = await r.request("tools/list", {}, 60000);
+    const otherMethods = await probe(r);
     const { protocolVersion, ...initialize } = r.init; // negotiated per client: the stub does that itself
     return {
       // The relay's MCP SDK: an offered version it supports is echoed, any other gets `latest`.
@@ -60,10 +99,11 @@ async function captureLive() {
       initialize,
       // The relay inherits this process's TMPDIR, so its os.tmpdir() is ours.
       toolsList: tokenizeTmpdir(toolsList, require("node:os").tmpdir()),
+      otherMethods,
     };
   } finally {
     await r.stop();
   }
 }
 
-module.exports = { captureLive, comparable, TOOLS_FILE, TMPDIR_TOKEN };
+module.exports = { captureLive, comparable, TOOLS_FILE, TMPDIR_TOKEN, PROBE_METHODS };

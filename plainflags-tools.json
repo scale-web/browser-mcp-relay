@@ -1773,5 +1773,43 @@
         }
       }
     ]
+  },
+  "otherMethods": {
+    "server/discover": {
+      "error": {
+        "code": -32601,
+        "message": "Method not found"
+      }
+    },
+    "resources/list": {
+      "error": {
+        "code": -32601,
+        "message": "Method not found"
+      }
+    },
+    "resources/templates/list": {
+      "error": {
+        "code": -32601,
+        "message": "Method not found"
+      }
+    },
+    "prompts/list": {
+      "error": {
+        "code": -32601,
+        "message": "Method not found"
+      }
+    },
+    "logging/setLevel": {
+      "error": {
+        "code": -32601,
+        "message": "Method not found"
+      }
+    },
+    "completion/complete": {
+      "error": {
+        "code": -32601,
+        "message": "Method not found"
+      }
+    }
   }
 }
