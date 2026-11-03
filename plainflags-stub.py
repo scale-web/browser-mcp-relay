@@ -43,6 +43,10 @@ TEST_TIMINGS_ENV = "PLAINFLAGS_STUB_TEST_TIMINGS"
 INIT_TIMEOUT_S = 30.0   # the relay must answer the replayed initialize in this
 RESTART_EVERY_S = 30.0  # at most one start per this
 EXIT_GRACE_S = 10.0     # after SIGTERM, before it and its process tree are SIGKILLed
+TREE_EVERY_S = 1.0      # the relay's tree is re-read after its lines, at most this often
+# Claude Code (2.1.296) ends a server with SIGINT, SIGTERM 100 ms later and SIGKILL
+# ~400 ms after that, to its pid only: the SECOND signal kills the relay's tree at
+# once, so nothing outlives the stub's SIGKILL — as a direct launch's SIGKILL ends it.
 
 INIT_ID = "plainflags-stub:initialize"
 LIST_ID = "plainflags-stub:tools/list"
@@ -178,8 +182,10 @@ class Stub:
         self.stdin_open = True
         self.bufs = {}
         self.signalled = None
+        self.signals = 0         # termination signals received
         self.tree = {}           # the relay's descendants when last seen: {pid: start time}
         self.tree_at = 0.0
+        self.tree_stale = False  # a relay line came after the last read: re-read (run loop)
 
     # ── output ────────────────────────────────────────────────────────────────
 
@@ -283,15 +289,17 @@ class Stub:
             self.proc = None
             return self.fail("could not be started (%s)" % (e.strerror or type(e).__name__))
         self.state = "starting"
-        self.tree, self.tree_at = {}, 0.0
+        self.tree, self.tree_at, self.tree_stale = {}, 0.0, False
         self.deadline = time.monotonic() + self.init_timeout
         log("relay pid=%d starting" % self.proc.pid)
         self.to_child_msg({"jsonrpc": "2.0", "id": INIT_ID, "method": "initialize", "params": self.client_init})
         return None
 
     def from_child(self, line):
-        if time.monotonic() - self.tree_at >= 5.0:
-            self.note_tree()
+        # A Brave the relay launched for a call is up by the time its reply comes:
+        # the run loop re-reads the relay's tree after this line is passed on (a
+        # read is ~35 ms), at most once per TREE_EVERY_S.
+        self.tree_stale = True
         msg = parse(line)
         if msg and "method" not in msg and "id" in msg:
             if msg["id"] == INIT_ID:
@@ -333,7 +341,7 @@ class Stub:
         exits they are reparented to pid 1 and no walk from it finds them."""
         rows = ps_table()
         self.tree = {c: rows[c][1] for c in descendants(self.proc.pid, rows)}
-        self.tree_at = time.monotonic()
+        self.tree_at, self.tree_stale = time.monotonic(), False
 
     def kill_tree(self):
         """SIGKILL the relay (not reaped yet, so its pid is still ours) and every
@@ -359,7 +367,7 @@ class Stub:
             except OSError:
                 pass
         self.bufs.clear()
-        self.proc, self.deadline = None, None
+        self.proc, self.deadline, self.tree_stale = None, None, False
         if why is None:
             why = "exited (code %d)" % code if code >= 0 else "was killed (signal %d)" % -code
         self.why, self.state = "the plain-flags relay " + why, "failed"
@@ -410,6 +418,7 @@ class Stub:
 
     def on_signal(self, signum, _frame):
         self.signalled = signum
+        self.signals += 1
 
     def lines(self, fd, data):
         parts = self.bufs.setdefault(fd, [])
@@ -439,7 +448,9 @@ class Stub:
                 fds.append(0)
             if self.proc is not None:
                 fds.append(self.proc.stdout.fileno())
-            timeout = None if self.deadline is None else max(0.0, self.deadline - time.monotonic())
+            stale_at = self.tree_at + TREE_EVERY_S if self.tree_stale and self.proc is not None else None
+            wake_at = [t for t in (self.deadline, stale_at) if t is not None]
+            timeout = max(0.0, min(wake_at) - time.monotonic()) if wake_at else None
             readable = select.select(fds, [], [], timeout)[0]
             relay = self.proc
             for fd in readable:
@@ -468,6 +479,11 @@ class Stub:
             if self.signalled is not None:
                 self.begin_stop(signal.Signals(self.signalled).name)
                 self.signalled = None
+                if self.signals >= 2 and self.proc is not None:
+                    log("relay pid=%d: a second termination signal — killing its process tree now" % self.proc.pid)
+                    self.end_relay("was stopped (second termination signal)")
+            if self.tree_stale and self.proc is not None and time.monotonic() - self.tree_at >= TREE_EVERY_S:
+                self.note_tree()
             if self.deadline is not None and time.monotonic() >= self.deadline and self.proc is not None:
                 self.on_deadline()
         log("exit")

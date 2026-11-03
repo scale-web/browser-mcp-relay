@@ -111,17 +111,20 @@ function startStub({ mode = "", timings = "5,3,1.5", tools = null, env = {}, fak
   const pids = () => {
     try { return fs.readFileSync(path.join(dir, "pids"), "utf8").trim().split("\n").filter(Boolean).map((l) => l.split(" ").map(Number)); } catch { return []; }
   };
+  const spawned = () => {
+    try { return fs.readFileSync(path.join(dir, "spawned"), "utf8").trim().split("\n").filter(Boolean).map(Number); } catch { return []; }
+  };
   const info = (pid) => JSON.parse(fs.readFileSync(path.join(dir, `info-${pid}.json`), "utf8"));
   const stop = async () => {
     LIVE.delete(api);
     if (child.exitCode === null && child.signalCode === null) { child.stdin.end(); await Promise.race([exited, sleep(15000)]); }
     if (child.exitCode === null && child.signalCode === null) { child.kill("SIGKILL"); await exited; }
     // Anything a failing test left: this test's fake relays and their grandchildren only.
-    for (const p of pids().flat()) { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } }
+    for (const p of [...pids().flat(), ...spawned()]) { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } }
     fs.rmSync(dir, { recursive: true, force: true });
     if (!real) fs.rmSync(cwd, { recursive: true, force: true });
   };
-  const api = { child, cwd, dir, messages, waitFor, send, sendRaw, request, handshake, call, received, pids, info, exited, stop, stderr: () => stderr };
+  const api = { child, cwd, dir, messages, waitFor, send, sendRaw, request, handshake, call, received, pids, spawned, info, exited, stop, stderr: () => stderr };
   LIVE.add(api);
   return api;
 }
@@ -418,6 +421,64 @@ for (const how of ["EOF", "SIGTERM", "SIGHUP"]) {
   });
 }
 
+/** Claude Code 2.1.296's shutdown of a server: SIGINT, SIGTERM 100 ms later, SIGKILL ~400 ms after that, to its pid only. */
+async function claudeCodeShutdown(child) {
+  const sig = (s) => { try { child.kill(s); } catch { /* already gone */ } };
+  sig("SIGINT"); await sleep(100); sig("SIGTERM"); await sleep(400); sig("SIGKILL");
+  return Date.now();
+}
+
+test("Claude Code's shutdown (SIGINT, +100 ms SIGTERM, +400 ms SIGKILL) with a relay that takes 7 s to stop: the second signal kills its tree — nothing left within 1 s of the SIGKILL", OPTS, async () => {
+  const s = startStub({ mode: "slow-exit" });
+  try {
+    await s.handshake();
+    await s.call("spawn", {}, 500);
+    const all = [...s.pids().flat(), ...s.spawned()];
+    assert.strictEqual(all.length, 3);
+    await claudeCodeShutdown(s.child);
+    await waitDead(all, 1000);
+    assert.match(s.stderr(), /a second termination signal — killing its process tree now/);
+  } finally { await s.stop(); }
+});
+
+test("an EOF stop right after the first call kills the descendant that call started (the stop's own tree read)", OPTS, async () => {
+  const s = startStub();
+  try {
+    await s.handshake();
+    await s.call("spawn", {}, 510);
+    const [extra] = s.spawned();
+    s.child.stdin.end(); // well inside TREE_EVERY_S of the ready-time read
+    await exitedWithin(s, 8000);
+    await waitDead([...s.pids().flat(), extra], 3000);
+  } finally { await s.stop(); }
+});
+
+test("a crash right after a relay line that came >1 s after the last tree read kills the descendant started for it", OPTS, async () => {
+  const s = startStub({ timings: "5,30,1.5" });
+  try {
+    await s.handshake();
+    await s.call("echo", {}, 520);
+    await sleep(2200); // the deferred read has run; the next line is >1 s after it
+    await s.call("spawn", {}, 521);
+    const [extra] = s.spawned();
+    const r = await s.call("crash", {}, 522); // at once: only the read on the spawn reply knows it
+    assert.match(r.error.message, /exited \(code 3\)/);
+    await waitDead([extra], 3000);
+  } finally { await s.stop(); }
+});
+
+test("a crash 1.5 s after a quick first call kills the descendant it started (the deferred tree read)", OPTS, async () => {
+  const s = startStub({ timings: "5,30,1.5" });
+  try {
+    await s.handshake();
+    await s.call("spawn", {}, 530); // its reply comes < 1 s after the ready-time read: deferred
+    const [extra] = s.spawned();
+    await sleep(1500);
+    await s.call("crash", {}, 531);
+    await waitDead([extra], 3000);
+  } finally { await s.stop(); }
+});
+
 test("stub exit: a relay that ignores SIGTERM and EOF is SIGKILLed with its process tree after the grace", OPTS, async () => {
   const s = startStub({ mode: "ignore-term", timings: "5,3,1" });
   try {
@@ -671,6 +732,30 @@ test("e2e: the client dies abruptly (its stderr pipe closed, then stdin EOF) —
     assert.deepStrictEqual(tree.filter(alive), [], "every process of the relay's tree is gone");
     assert.deepStrictEqual(homeBraves(home), [], "no Brave left on the test profile");
     process.stderr.write(`[plainflags-stub e2e] client gone abruptly (broken stderr + EOF): stub exited and relay tree + Brave gone in ${Date.now() - t0} ms\n`);
+  } finally {
+    await s.stop();
+    for (const p of [...tree, ...homeBraves(home)]) { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } }
+    server.close();
+  }
+});
+
+test("e2e: Claude Code's shutdown sequence while the real relay is still launching Brave — nothing left within ~1.5 s of the SIGKILL", E2E, async () => {
+  const { server, home, proj, env, url } = await realSetup("ccstop");
+  const s = startStub({ real: true, env, cwd: proj });
+  let tree = [];
+  try {
+    await s.handshake();
+    s.call("navigation_go-to", { url, includeScreenshot: false }, 600, 120000).catch(() => { /* never answered: the stub is stopped */ });
+    const end0 = Date.now() + 60000;
+    while (!homeBraves(home).length && Date.now() < end0) await sleep(20);
+    assert.ok(homeBraves(home).length > 0, "Brave is launching");
+    tree = descendants(s.child.pid);
+    const killedAt = await claudeCodeShutdown(s.child);
+    const end = killedAt + 1500;
+    while ((tree.some(alive) || homeBraves(home).length) && Date.now() < end) await sleep(50);
+    const left = [...new Set([...tree.filter(alive), ...homeBraves(home)])];
+    assert.deepStrictEqual(left, [], `still running 1.5 s after the SIGKILL: ${left.join(", ")}`);
+    process.stderr.write(`[plainflags-stub e2e] Claude Code's shutdown during a Brave launch: nothing left ${Date.now() - killedAt} ms after the SIGKILL\n`);
   } finally {
     await s.stop();
     for (const p of [...tree, ...homeBraves(home)]) { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } }

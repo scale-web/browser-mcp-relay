@@ -5,11 +5,14 @@
 //                "<pid> <grandchild pid>"), info-<pid>.json (cwd, profile mode)
 //   FAKE_MODE    comma list: no-init (never answers initialize), init-error,
 //                ignore-term (ignores SIGTERM and stdin EOF), close-stderr
-//                (closes its stderr once initialized)
+//                (closes its stderr once initialized), slow-exit (on stdin EOF or
+//                a signal, exits only after 7 s — a wedged closeBrave)
 //   FAKE_STATIC  plainflags-tools.json — its toolsList is served by default
 //   FAKE_TOOLS   a toolsList JSON to serve instead (the drift case)
 // Tools: echo {delayMs} → {id, args} as the relay saw them, after a
-// notifications/message; crash → exit 3; listchanged → a list_changed first.
+// notifications/message; crash → exit 3; listchanged → a list_changed first;
+// spawn → starts another descendant (its pid appended to FAKE_DIR/spawned) that
+// it leaves behind on exit, as a Brave launched for a call.
 // It starts a grandchild, as the real relay starts its upstream child and Brave,
 // so a kill of only this pid (or an exit that does not stop it) leaves that one
 // behind — the stub's process-tree kill must find it.
@@ -48,6 +51,10 @@ function handle(msg) {
     const { name, arguments: args = {} } = msg.params || {};
     if (name === "crash") process.exit(3);
     if (name === "listchanged") send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+    if (name === "spawn") {
+      const extra = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      fs.appendFileSync(path.join(dir, "spawned"), `${extra.pid}\n`);
+    }
     send({ jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "fake-note" } });
     const reply = () => send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: JSON.stringify({ id: msg.id, args }) }] } });
     return args.delayMs ? setTimeout(reply, args.delayMs) : reply();
@@ -68,7 +75,12 @@ process.stdin.on("data", (c) => {
     handle(msg);
   }
 });
-if (modes.has("ignore-term")) {
+if (modes.has("slow-exit")) {
+  let leaving = false;
+  const leave = () => { if (!leaving) { leaving = true; setTimeout(() => process.exit(0), 7000); } };
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, leave);
+  process.stdin.on("end", leave);
+} else if (modes.has("ignore-term")) {
   process.on("SIGTERM", () => {});
   process.stdin.on("end", () => {});
   setInterval(() => {}, 1000);
