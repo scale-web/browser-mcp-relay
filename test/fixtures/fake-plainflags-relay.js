@@ -10,8 +10,9 @@
 //   FAKE_TOOLS   a toolsList JSON to serve instead (the drift case)
 // Tools: echo {delayMs} → {id, args} as the relay saw them, after a
 // notifications/message; crash → exit 3; listchanged → a list_changed first.
-// It starts a grandchild in its own process group, as the real relay starts
-// its upstream child, so a kill of only this pid leaves that one behind.
+// It starts a grandchild, as the real relay starts its upstream child and Brave,
+// so a kill of only this pid (or an exit that does not stop it) leaves that one
+// behind — the stub's process-tree kill must find it.
 
 const fs = require("node:fs");
 const os = require("node:os");

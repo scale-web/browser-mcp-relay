@@ -43,7 +43,8 @@ const childrenOf = (pid) => (spawnSync("pgrep", ["-P", String(pid)], { encoding:
 
 /** The stub, its client side, and the fake relay's records. */
 /** `real`: no test child — the stub starts the real launcher beside it, with `env` and `cwd`. */
-function startStub({ mode = "", timings = "5,3,1.5", tools = null, env = {}, fakePath = null, real = false, cwd = null } = {}) {
+/** `file`: a different plainflags-tools.json — the stub is then run from a copy beside it. */
+function startStub({ mode = "", timings = "5,3,1.5", tools = null, env = {}, fakePath = null, real = false, cwd = null, file = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-stub-"));
   const fake = fakePath || path.join(dir, "fake-relay.js");
   if (!fakePath && !real) fs.copyFileSync(FAKE, fake);
@@ -59,7 +60,13 @@ function startStub({ mode = "", timings = "5,3,1.5", tools = null, env = {}, fak
     ...env,
   };
   cwd = cwd || fs.mkdtempSync(path.join(os.tmpdir(), "pf-stub-cwd-"));
-  const child = spawn(PY, [STUB], { cwd, env: fullEnv, stdio: ["pipe", "pipe", "pipe"] });
+  let stubPath = STUB;
+  if (file) {
+    stubPath = path.join(dir, "plainflags-stub.py");
+    fs.copyFileSync(STUB, stubPath);
+    fs.writeFileSync(path.join(dir, "plainflags-tools.json"), JSON.stringify(file));
+  }
+  const child = spawn(PY, [stubPath], { cwd, env: fullEnv, stdio: ["pipe", "pipe", "pipe"] });
   const messages = [];
   const waiters = [];
   let stderr = "";
@@ -190,6 +197,83 @@ test("a request before initialize is refused and starts no relay; after initiali
   } finally { await s.stop(); }
 });
 
+test("only a recorded -32601 is served by the stub: another recorded error or a result goes to the relay", OPTS, async () => {
+  const file = JSON.parse(JSON.stringify(FILE));
+  file.otherMethods["resources/list"] = { error: { code: -32603, message: "recorded internal error" } };
+  file.otherMethods["prompts/list"] = { result: { prompts: [] } };
+  const s = startStub({ file });
+  try {
+    await s.handshake();
+    assert.deepStrictEqual((await s.request("server/discover", {}, 70)).error, FILE.otherMethods["server/discover"].error);
+    assert.deepStrictEqual(s.pids(), [], "a -32601 one is still answered locally");
+    const rl = await s.request("resources/list", {}, 71);
+    const pl = await s.request("prompts/list", {}, 72);
+    assert.deepStrictEqual([rl.error, pl.error], [{ code: -32601, message: "Method not found" }, { code: -32601, message: "Method not found" }], "the (fake) relay's own answers");
+    assert.strictEqual(s.pids().length, 1, "the relay was started for them");
+    assert.deepStrictEqual(s.received().filter((m) => m.id === 71 || m.id === 72).map((m) => m.method), ["resources/list", "prompts/list"]);
+  } finally { await s.stop(); }
+});
+
+test("the recorded -32601 replies are served while the relay is starting and after it failed, not only while idle", OPTS, async () => {
+  const want = FILE.otherMethods["server/discover"].error;
+  const a = startStub({ mode: "no-init", timings: "3,30,1.5" });
+  try {
+    await a.handshake();
+    const pending = a.call("echo", {}, 80); // starts a relay that never answers initialize
+    await sleep(300);
+    assert.deepStrictEqual((await a.request("server/discover", {}, 81, 1500)).error, want, "answered at once while starting");
+    assert.ok((await pending).error, "the call fails at the initialize timeout");
+  } finally { await a.stop(); }
+  const b = startStub({ timings: "5,30,1.5" });
+  try {
+    await b.handshake();
+    await b.call("echo");
+    await b.call("crash", {}, 82);
+    const after = await b.request("server/discover", {}, 83);
+    assert.deepStrictEqual(after.error, want, "answered by the stub inside the restart window, not refused");
+    assert.strictEqual(b.pids().length, 1, "and no restart");
+  } finally { await b.stop(); }
+});
+
+test("a NOTIFICATION named like a recorded method (no id) is dropped: no reply, no crash, no relay", OPTS, async () => {
+  const s = startStub();
+  try {
+    s.send({ jsonrpc: "2.0", method: "server/discover" });
+    await s.handshake();
+    s.send({ jsonrpc: "2.0", method: "server/discover", params: {} });
+    s.send({ jsonrpc: "2.0", method: "resources/list" });
+    assert.deepStrictEqual((await s.request("ping", undefined, 90)).result, {}, "the stub is alive");
+    await sleep(300);
+    assert.strictEqual(s.child.exitCode, null);
+    assert.deepStrictEqual(s.messages.map((m) => m.id), [1, 90], "nothing answered the notifications");
+    assert.deepStrictEqual(s.pids(), []);
+  } finally { await s.stop(); }
+});
+
+test("kill_targets: live descendants and orphaned remembered ones only — a reused pid, a re-parented one, the stub and pid 1 never", OPTS, () => {
+  // rows: pid -> [ppid, start]; the relay is 100, the stub 50 (its parent), a bystander 60.
+  const rows = {
+    50: [1, "S"], 60: [50, "B"], 100: [50, "R"],
+    101: [100, "a"], 102: [101, "b"], // live tree
+    200: [1, "c"],                    // remembered, orphaned, same start → killed
+    201: [1, "NEW"],                  // remembered, but a new process on that pid → kept
+    202: [60, "d"],                   // remembered, now under a bystander → kept
+  };
+  const remembered = { 101: "a", 200: "c", 201: "old", 202: "d", 999: "gone" };
+  const code = [
+    "import importlib.util, json, sys",
+    `spec = importlib.util.spec_from_file_location("stub", ${JSON.stringify(STUB)})`,
+    "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)",
+    "a = json.loads(sys.argv[1])",
+    "rows = {int(k): tuple(v) for k, v in a['rows'].items()}",
+    "rem = {int(k): v for k, v in a['remembered'].items()}",
+    "print(json.dumps(sorted(m.kill_targets(100, rows, rem))))",
+  ].join("\n");
+  const r = spawnSync(PY, ["-c", code, JSON.stringify({ rows, remembered })], { encoding: "utf8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.deepStrictEqual(JSON.parse(r.stdout), [101, 102, 200]);
+});
+
 test("tools/list: the tmpdir token becomes the session's os.tmpdir() (trailing slash dropped, as Node does)", OPTS, async () => {
   const tmp = fs.realpathSync(os.tmpdir());
   const s = startStub({ env: { TMPDIR: tmp + "/" } });
@@ -294,7 +378,7 @@ test("a relay that closes its stderr and then crashes: error replies, then a res
   } finally { await s.stop(); }
 });
 
-test("a relay that refuses the replayed initialize: the call gets an error, its group is killed", OPTS, async () => {
+test("a relay that refuses the replayed initialize: the call gets an error, its process tree is killed", OPTS, async () => {
   const s = startStub({ mode: "init-error" });
   try {
     await s.handshake();
@@ -304,7 +388,7 @@ test("a relay that refuses the replayed initialize: the call gets an error, its 
   } finally { await s.stop(); }
 });
 
-test("initialize timeout: a relay that never answers is killed with its process group, the call gets an error", OPTS, async () => {
+test("initialize timeout: a relay that never answers is killed with its process tree, the call gets an error", OPTS, async () => {
   const s = startStub({ mode: "no-init", timings: "1,30,1.5" });
   try {
     await s.handshake();
@@ -318,8 +402,9 @@ test("initialize timeout: a relay that never answers is killed with its process 
 });
 
 for (const how of ["EOF", "SIGTERM", "SIGHUP"]) {
-  test(`stub exit on ${how}: the relay and its whole process group are gone`, OPTS, async () => {
+  test(`stub exit on ${how}: the relay and its whole process tree are gone, nothing else is touched`, OPTS, async () => {
     const s = startStub();
+    const bystander = spawn("sleep", ["30"], { stdio: "ignore" }); // same process group, not the relay's
     try {
       await s.handshake();
       await s.call("echo");
@@ -328,11 +413,12 @@ for (const how of ["EOF", "SIGTERM", "SIGHUP"]) {
       if (how === "EOF") s.child.stdin.end(); else s.child.kill(how);
       await exitedWithin(s, 8000);
       await waitDead(all, 3000);
-    } finally { await s.stop(); }
+      assert.ok(alive(bystander.pid), "a process outside the relay's tree survives");
+    } finally { bystander.kill("SIGKILL"); await s.stop(); }
   });
 }
 
-test("stub exit: a relay that ignores SIGTERM and EOF is SIGKILLed with its group after the grace", OPTS, async () => {
+test("stub exit: a relay that ignores SIGTERM and EOF is SIGKILLed with its process tree after the grace", OPTS, async () => {
   const s = startStub({ mode: "ignore-term", timings: "5,3,1" });
   try {
     await s.handshake();
@@ -344,7 +430,7 @@ test("stub exit: a relay that ignores SIGTERM and EOF is SIGKILLed with its grou
     const ms = Date.now() - t0;
     assert.ok(ms >= 900 && ms < 5000, `exited after ${ms} ms`);
     await waitDead(all, 3000);
-    assert.match(s.stderr(), /still running 1 s after SIGTERM — killing its process group/);
+    assert.match(s.stderr(), /still running 1 s after SIGTERM — killing its process tree/);
   } finally { await s.stop(); }
 });
 
@@ -509,6 +595,82 @@ test("e2e: a bare SIGKILL of the stub leaves no relay and no Brave (the relay se
     assert.deepStrictEqual(left, [], `relay processes still alive after SIGKILL: ${left.join(", ")}`);
     assert.deepStrictEqual(homeBraves(home), [], "no Brave left on the test profile");
     process.stderr.write(`[plainflags-stub e2e] after SIGKILL of the stub: relay tree and Brave gone in ${Date.now() - t0} ms\n`);
+  } finally {
+    await s.stop();
+    for (const p of [...tree, ...homeBraves(home)]) { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } }
+    server.close();
+  }
+});
+
+test("e2e: a process-group SIGKILL of the client and the stub together (a window crash) leaves no relay and no Brave — the relay is in that group, as a direct launch is", E2E, async () => {
+  const { server, home, proj, env, url } = await realSetup("group");
+  // A stand-in for Claude Code: its own process group, which the stub (and so the relay) joins.
+  const client = path.join(home, "client.js");
+  fs.writeFileSync(client, `
+    const { spawn } = require("node:child_process");
+    const stub = spawn(${JSON.stringify(PY)}, [${JSON.stringify(STUB)}], { cwd: ${JSON.stringify(proj)}, env: { ...process.env, ...JSON.parse(process.argv[2]) }, stdio: ["pipe", "pipe", "inherit"] });
+    const send = (m) => stub.stdin.write(JSON.stringify(m) + "\\n");
+    let buf = "";
+    stub.stdout.on("data", (c) => {
+      buf += c;
+      let nl;
+      while ((nl = buf.indexOf("\\n")) !== -1) {
+        const m = JSON.parse(buf.slice(0, nl)); buf = buf.slice(nl + 1);
+        if (m.id === 1) { send({ jsonrpc: "2.0", method: "notifications/initialized" }); send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "navigation_go-to", arguments: { url: process.argv[3], includeScreenshot: false } } }); }
+        if (m.id === 2) console.log("READY " + stub.pid + " " + (m.error || m.result.isError ? "ERR" : "OK"));
+      }
+    });
+    send({ jsonrpc: "2.0", id: 1, method: "initialize", params: ${JSON.stringify(CLIENT_INIT)} });
+    setInterval(() => {}, 1000);
+  `);
+  const c = spawn(process.execPath, [client, JSON.stringify(env), url], { env: process.env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+  let out = ""; let err = "";
+  c.stdout.on("data", (d) => { out += d; });
+  c.stderr.on("data", (d) => { err += d; });
+  let tree = [];
+  try {
+    const end0 = Date.now() + 120000;
+    while (!/READY \d+ \w+/.test(out) && Date.now() < end0 && c.exitCode === null) await sleep(100);
+    const m = /READY (\d+) (\w+)/.exec(out);
+    assert.ok(m, `client never got the navigation result\n${err.slice(-3000)}`);
+    assert.strictEqual(m[2], "OK", err.slice(-3000));
+    tree = descendants(c.pid);
+    const relay = childrenOf(Number(m[1]));
+    assert.strictEqual(relay.length, 1, "one relay under the stub");
+    assert.strictEqual(spawnSync("ps", ["-o", "pgid=", "-p", String(relay[0])], { encoding: "utf8" }).stdout.trim(), String(c.pid), "the relay is in the client's process group");
+    assert.ok(homeBraves(home).length > 0, "Brave running");
+    const t0 = Date.now();
+    process.kill(-c.pid, "SIGKILL");
+    const end = Date.now() + 15000;
+    while ((tree.some(alive) || homeBraves(home).length) && Date.now() < end) await sleep(100);
+    assert.deepStrictEqual(tree.filter(alive), [], "every process of the client's tree is gone");
+    assert.deepStrictEqual(homeBraves(home), [], "no Brave left on the test profile");
+    process.stderr.write(`[plainflags-stub e2e] after a process-group SIGKILL of client + stub: relay tree and Brave gone in ${Date.now() - t0} ms\n`);
+  } finally {
+    try { process.kill(-c.pid, "SIGKILL"); } catch { /* gone */ }
+    for (const p of [...tree, ...homeBraves(home)]) { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } }
+    server.close();
+  }
+});
+
+test("e2e: the client dies abruptly (its stderr pipe closed, then stdin EOF) — the relay inherits a broken stderr; the stub's grace and tree kill still leave no relay or Brave", E2E, async () => {
+  const { server, home, proj, env, url } = await realSetup("abrupt");
+  const s = startStub({ real: true, env, cwd: proj });
+  let tree = [];
+  try {
+    await s.handshake();
+    const nav = await s.call("navigation_go-to", { url, includeScreenshot: false }, 400, 120000);
+    assert.ok(!nav.error && !nav.result.isError, JSON.stringify(nav).slice(0, 2000));
+    tree = descendants(s.child.pid);
+    const t0 = Date.now();
+    s.child.stderr.destroy(); // the reader is gone: the stub's and the relay's stderr writes now fail
+    s.child.stdin.end();
+    await exitedWithin(s, 20000);
+    const end = Date.now() + 10000;
+    while ((tree.some(alive) || homeBraves(home).length) && Date.now() < end) await sleep(100);
+    assert.deepStrictEqual(tree.filter(alive), [], "every process of the relay's tree is gone");
+    assert.deepStrictEqual(homeBraves(home), [], "no Brave left on the test profile");
+    process.stderr.write(`[plainflags-stub e2e] client gone abruptly (broken stderr + EOF): stub exited and relay tree + Brave gone in ${Date.now() - t0} ms\n`);
   } finally {
     await s.stop();
     for (const p of [...tree, ...homeBraves(home)]) { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } }

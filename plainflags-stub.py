@@ -42,7 +42,7 @@ TEST_TIMINGS_ENV = "PLAINFLAGS_STUB_TEST_TIMINGS"
 
 INIT_TIMEOUT_S = 30.0   # the relay must answer the replayed initialize in this
 RESTART_EVERY_S = 30.0  # at most one start per this
-EXIT_GRACE_S = 10.0     # after SIGTERM, before its process group is SIGKILLed
+EXIT_GRACE_S = 10.0     # after SIGTERM, before it and its process tree are SIGKILLed
 
 INIT_ID = "plainflags-stub:initialize"
 LIST_ID = "plainflags-stub:tools/list"
@@ -87,6 +87,45 @@ def untokenize(v, tmp):
     if isinstance(v, dict):
         return {k: untokenize(x, tmp) for k, x in v.items()}
     return v
+
+
+def ps_table():
+    """{pid: (ppid, start time)} for every process — read only."""
+    import subprocess
+    try:
+        out = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,lstart="], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, universal_newlines=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    rows = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            rows[int(parts[0])] = (int(parts[1]), parts[2].strip())
+    return rows
+
+
+def descendants(root, rows):
+    kids = {}
+    for pid, (ppid, _) in rows.items():
+        kids.setdefault(ppid, []).append(pid)
+    out, todo = [], [root]
+    while todo:
+        for c in kids.get(todo.pop(), []):
+            out.append(c)
+            todo.append(c)
+    return out
+
+
+def kill_targets(relay, rows, remembered):
+    """The relay's live descendants, plus remembered ones ({pid: start time})
+    now orphaned: same start time (not a reused pid) and a parent that is pid 1
+    or the relay's tree. Never the relay itself, pid 1 or the stub."""
+    live = set(descendants(relay, rows))
+    known = set(remembered) | live | {relay}
+    left = {c for c, start in remembered.items()
+            if c in rows and rows[c][1] == start and (rows[c][0] == 1 or rows[c][0] in known)}
+    return (live | left) - {relay, 1, os.getpid()}
 
 
 def load_tools_file():
@@ -139,6 +178,8 @@ class Stub:
         self.stdin_open = True
         self.bufs = {}
         self.signalled = None
+        self.tree = {}           # the relay's descendants when last seen: {pid: start time}
+        self.tree_at = 0.0
 
     # ── output ────────────────────────────────────────────────────────────────
 
@@ -237,17 +278,20 @@ class Stub:
         try:
             self.proc = subprocess.Popen(
                 ["node", self.script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,  # stderr: the stub's own
-                env=env, bufsize=0, start_new_session=True)  # own process group: killed as one
+                env=env, bufsize=0)  # the caller's process group, as a direct launch: a group kill takes it too
         except OSError as e:
             self.proc = None
             return self.fail("could not be started (%s)" % (e.strerror or type(e).__name__))
         self.state = "starting"
+        self.tree, self.tree_at = {}, 0.0
         self.deadline = time.monotonic() + self.init_timeout
         log("relay pid=%d starting" % self.proc.pid)
         self.to_child_msg({"jsonrpc": "2.0", "id": INIT_ID, "method": "initialize", "params": self.client_init})
         return None
 
     def from_child(self, line):
+        if time.monotonic() - self.tree_at >= 5.0:
+            self.note_tree()
         msg = parse(line)
         if msg and "method" not in msg and "id" in msg:
             if msg["id"] == INIT_ID:
@@ -264,6 +308,7 @@ class Stub:
         if "result" not in msg:
             return self.end_relay("refused the replayed initialize")
         self.state, self.deadline = "ready", None
+        self.note_tree()
         log("relay pid=%d ready in %d ms" % (self.proc.pid, (time.monotonic() - self.started_at) * 1000))
         self.to_child_msg({"jsonrpc": "2.0", "method": "notifications/initialized"})
         self.to_child_msg({"jsonrpc": "2.0", "id": LIST_ID, "method": "tools/list", "params": {}})
@@ -283,15 +328,30 @@ class Stub:
             self.to_client_msg({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
         return None
 
-    def end_relay(self, why=None):
-        """The relay is gone or must go: SIGKILL its group before reaping it (so
-        the group id cannot have been reused), reap it, and answer everything
-        that waited on it with an error."""
+    def note_tree(self):
+        """Remember the relay's descendants (upstream, Brave, …): once the relay
+        exits they are reparented to pid 1 and no walk from it finds them."""
+        rows = ps_table()
+        self.tree = {c: rows[c][1] for c in descendants(self.proc.pid, rows)}
+        self.tree_at = time.monotonic()
+
+    def kill_tree(self):
+        """SIGKILL the relay (not reaped yet, so its pid is still ours) and every
+        process that is — or was, and is now orphaned — its descendant. A
+        remembered pid counts only with the same start time, and only while its
+        parent is pid 1 or the relay's tree: never anything that was not the relay's."""
         p = self.proc
-        try:
-            os.killpg(p.pid, signal.SIGKILL)
-        except OSError:
-            pass
+        for pid in [p.pid] + sorted(kill_targets(p.pid, ps_table(), self.tree)):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def end_relay(self, why=None):
+        """The relay is gone or must go: SIGKILL it and its process tree, reap
+        it, and answer everything that waited on it with an error."""
+        p = self.proc
+        self.kill_tree()
         code = p.wait()
         for f in (p.stdout, p.stdin):
             try:
@@ -329,6 +389,7 @@ class Stub:
         log("%s — stopping" % why)
         if self.proc is None:
             return
+        self.note_tree()  # while the tree is intact
         try:
             self.proc.stdin.close()  # the relay shuts itself down on stdin EOF…
         except OSError:
@@ -341,11 +402,11 @@ class Stub:
 
     def on_deadline(self):
         if self.stopping:
-            log("relay pid=%d still running %d s after SIGTERM — killing its process group"
+            log("relay pid=%d still running %d s after SIGTERM — killing its process tree"
                 % (self.proc.pid, self.exit_grace))
             self.end_relay("was stopped")
         else:
-            self.end_relay("did not answer initialize within %d s — its process group was killed" % self.init_timeout)
+            self.end_relay("did not answer initialize within %d s — its process tree was killed" % self.init_timeout)
 
     def on_signal(self, signum, _frame):
         self.signalled = signum
