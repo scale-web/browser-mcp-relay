@@ -45,8 +45,10 @@ RESTART_EVERY_S = 30.0  # at most one start per this
 EXIT_GRACE_S = 10.0     # after SIGTERM, before it and its process tree are SIGKILLed
 TREE_EVERY_S = 1.0      # the relay's tree is re-read after its lines, at most this often
 # Claude Code (2.1.296) ends a server with SIGINT, SIGTERM 100 ms later and SIGKILL
-# ~400 ms after that, to its pid only: the SECOND signal kills the relay's tree at
-# once, so nothing outlives the stub's SIGKILL — as a direct launch's SIGKILL ends it.
+# ~400 ms after that, to its pid only. On the SECOND signal the stub SIGKILLs the
+# relay — its pid only, as that SIGKILL ends a direct launch — and its Brave then
+# closes gracefully on its own when the Playwright pipe closes (round 3 killed the
+# whole tree here, which SIGKILLed Brave mid-close and lost its cookies).
 
 INIT_ID = "plainflags-stub:initialize"
 LIST_ID = "plainflags-stub:tools/list"
@@ -169,6 +171,7 @@ class Stub:
     def __init__(self):
         self.protocol, self.server, self.tools, self.not_found = load_tools_file()
         self.script, (self.init_timeout, self.restart_every, self.exit_grace) = test_overrides()
+        self.trace = self.script != LAUNCHER  # tests only: log each tree read
         self.client_init = None  # params of the client's initialize, replayed to the relay
         self.proc = None
         self.state = "idle"      # idle | starting | ready | failed
@@ -340,7 +343,13 @@ class Stub:
         """Remember the relay's descendants (upstream, Brave, …): once the relay
         exits they are reparented to pid 1 and no walk from it finds them."""
         rows = ps_table()
-        self.tree = {c: rows[c][1] for c in descendants(self.proc.pid, rows)}
+        if self.trace:
+            log("tree read")
+        # Merge, never replace: a read against a relay that has just exited finds
+        # no descendants, but the ones remembered are still its orphans.
+        kept = {c: start for c, start in self.tree.items() if c in rows and rows[c][1] == start}
+        kept.update({c: rows[c][1] for c in descendants(self.proc.pid, rows)})
+        self.tree = kept
         self.tree_at, self.tree_stale = time.monotonic(), False
 
     def kill_tree(self):
@@ -355,11 +364,18 @@ class Stub:
             except OSError:
                 pass
 
-    def end_relay(self, why=None):
-        """The relay is gone or must go: SIGKILL it and its process tree, reap
-        it, and answer everything that waited on it with an error."""
+    def end_relay(self, why=None, tree=True):
+        """The relay is gone or must go: SIGKILL it (and, unless `tree` is false,
+        its process tree), reap it, and answer everything that waited on it with
+        an error."""
         p = self.proc
-        self.kill_tree()
+        if tree:
+            self.kill_tree()
+        else:
+            try:
+                os.kill(p.pid, signal.SIGKILL)  # not reaped yet, so the pid is still ours
+            except OSError:
+                pass
         code = p.wait()
         for f in (p.stdout, p.stdin):
             try:
@@ -480,8 +496,9 @@ class Stub:
                 self.begin_stop(signal.Signals(self.signalled).name)
                 self.signalled = None
                 if self.signals >= 2 and self.proc is not None:
-                    log("relay pid=%d: a second termination signal — killing its process tree now" % self.proc.pid)
-                    self.end_relay("was stopped (second termination signal)")
+                    # The relay only: its Brave closes gracefully on pipe close (cookies kept).
+                    log("relay pid=%d: a second termination signal — killing the relay now" % self.proc.pid)
+                    self.end_relay("was stopped (second termination signal)", tree=False)
             if self.tree_stale and self.proc is not None and time.monotonic() - self.tree_at >= TREE_EVERY_S:
                 self.note_tree()
             if self.deadline is not None and time.monotonic() >= self.deadline and self.proc is not None:

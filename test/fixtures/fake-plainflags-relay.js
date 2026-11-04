@@ -12,7 +12,8 @@
 // Tools: echo {delayMs} → {id, args} as the relay saw them, after a
 // notifications/message; crash → exit 3; listchanged → a list_changed first;
 // spawn → starts another descendant (its pid appended to FAKE_DIR/spawned) that
-// it leaves behind on exit, as a Brave launched for a call.
+// it leaves behind on exit, as a Brave launched for a call; lineexit → writes one
+// notification line and exits at once (code 4).
 // It starts a grandchild, as the real relay starts its upstream child and Brave,
 // so a kill of only this pid (or an exit that does not stop it) leaves that one
 // behind — the stub's process-tree kill must find it.
@@ -50,6 +51,10 @@ function handle(msg) {
   if (msg.method === "tools/call") {
     const { name, arguments: args = {} } = msg.params || {};
     if (name === "crash") process.exit(3);
+    if (name === "lineexit") {
+      fs.writeSync(1, JSON.stringify({ jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "last-line" } }) + "\n");
+      process.exit(4);
+    }
     if (name === "listchanged") send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
     if (name === "spawn") {
       const extra = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });

@@ -40,11 +40,13 @@ async function waitDead(pids, ms = 8000) {
 }
 const LIVE = new Set();
 const childrenOf = (pid) => (spawnSync("pgrep", ["-P", String(pid)], { encoding: "utf8" }).stdout || "").trim().split("\n").filter(Boolean).map(Number);
+/** The stub's relay child only — not a short-lived `ps` the stub runs to read the relay's tree. */
+const relayOf = (pid) => childrenOf(pid).filter((c) => /launch-project-isolated\.js/.test(spawnSync("ps", ["-o", "command=", "-p", String(c)], { encoding: "utf8" }).stdout || ""));
 
 /** The stub, its client side, and the fake relay's records. */
 /** `real`: no test child — the stub starts the real launcher beside it, with `env` and `cwd`. */
 /** `file`: a different plainflags-tools.json — the stub is then run from a copy beside it. */
-function startStub({ mode = "", timings = "5,3,1.5", tools = null, env = {}, fakePath = null, real = false, cwd = null, file = null } = {}) {
+function startStub({ mode = "", timings = "5,3,1.5", tools = null, env = {}, fakePath = null, real = false, cwd = null, file = null, stub = STUB } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-stub-"));
   const fake = fakePath || path.join(dir, "fake-relay.js");
   if (!fakePath && !real) fs.copyFileSync(FAKE, fake);
@@ -60,7 +62,7 @@ function startStub({ mode = "", timings = "5,3,1.5", tools = null, env = {}, fak
     ...env,
   };
   cwd = cwd || fs.mkdtempSync(path.join(os.tmpdir(), "pf-stub-cwd-"));
-  let stubPath = STUB;
+  let stubPath = stub;
   if (file) {
     stubPath = path.join(dir, "plainflags-stub.py");
     fs.copyFileSync(STUB, stubPath);
@@ -428,17 +430,63 @@ async function claudeCodeShutdown(child) {
   return Date.now();
 }
 
-test("Claude Code's shutdown (SIGINT, +100 ms SIGTERM, +400 ms SIGKILL) with a relay that takes 7 s to stop: the second signal kills its tree — nothing left within 1 s of the SIGKILL", OPTS, async () => {
+test("Claude Code's shutdown (SIGINT, +100 ms SIGTERM, +400 ms SIGKILL) with a relay that takes 7 s to stop: the second signal SIGKILLs the relay only — its descendants are left to close themselves (a Brave closes gracefully on pipe close)", OPTS, async () => {
   const s = startStub({ mode: "slow-exit" });
   try {
     await s.handshake();
     await s.call("spawn", {}, 500);
-    const all = [...s.pids().flat(), ...s.spawned()];
-    assert.strictEqual(all.length, 3);
-    await claudeCodeShutdown(s.child);
-    await waitDead(all, 1000);
-    assert.match(s.stderr(), /a second termination signal — killing its process tree now/);
+    const [[relay, grandchild]] = s.pids();
+    const [extra] = s.spawned();
+    const t0 = Date.now();
+    s.child.kill("SIGINT"); await sleep(100); s.child.kill("SIGTERM");
+    await waitDead([relay], 400); // before Claude Code's SIGKILL at +500 ms, and long before its own 7 s
+    assert.ok(Date.now() - t0 < 600, "the relay was killed at the second signal");
+    await exitedWithin(s, 2000);
+    assert.ok(alive(grandchild) && alive(extra), "the stub did not kill the relay's descendants");
+    assert.match(s.stderr(), /a second termination signal — killing the relay now/);
   } finally { await s.stop(); }
+});
+
+test("two termination signals back to back to an IDLE stub (no relay) exit cleanly", OPTS, async () => {
+  for (let i = 0; i < 10; i++) {
+    const s = startStub();
+    try {
+      await s.handshake();
+      s.child.kill("SIGINT"); s.child.kill("SIGTERM");
+      const ex = await exitedWithin(s, 5000);
+      assert.deepStrictEqual(ex, { code: 0, sig: null }, s.stderr());
+      assert.ok(!/Traceback/.test(s.stderr()), s.stderr());
+    } finally { await s.stop(); }
+  }
+});
+
+test("the relay's tree is not re-read while the relay is idle (no lines)", OPTS, async () => {
+  const s = startStub();
+  try {
+    await s.handshake();
+    await s.call("echo", {}, 540);
+    await sleep(1500); // the deferred read after the last line has run
+    const reads = () => (s.stderr().match(/\[plainflags-stub\] tree read/g) || []).length;
+    const before = reads();
+    assert.ok(before >= 1, "reads are traced in test mode");
+    await sleep(3000);
+    assert.strictEqual(reads(), before, "no tree read in 3 s without a relay line");
+  } finally { await s.stop(); }
+});
+
+test("a relay that writes a line and exits at once, >1 s after the last tree read: its remembered descendants are still killed (a read against a dead relay merges, never wipes)", OPTS, async () => {
+  for (const gap of [2200, 6000]) {
+    const s = startStub({ timings: "5,30,1.5" });
+    try {
+      await s.handshake();
+      await s.call("echo", {}, 550);
+      const [[, grandchild]] = s.pids();
+      await sleep(gap);
+      const r = await s.call("lineexit", {}, 551);
+      assert.match(r.error.message, /exited \(code 4\)/);
+      await waitDead([grandchild], 3000);
+    } finally { await s.stop(); }
+  }
 });
 
 test("an EOF stop right after the first call kills the descendant that call started (the stop's own tree read)", OPTS, async () => {
@@ -566,7 +614,12 @@ const resultText = (r) => r.result.content.filter((c) => c.type === "text" && !c
 async function realSetup(tag) {
   const { homeTmp } = require("./helpers/isolation.js");
   const http = require("node:http");
-  const server = http.createServer((req, res) => { res.writeHead(200, { "content-type": "text/html" }); res.end("<!doctype html><html><head><link rel=icon href=data:,></head><body><h1>STUB-E2E</h1></body></html>"); });
+  const server = http.createServer((req, res) => {
+    // /cookie-page sets a persistent cookie: it reaches the profile's Cookies file only if Brave shuts down cleanly.
+    const extra = req.url.startsWith("/cookie-page") ? { "set-cookie": "pfstub_keep=1; Max-Age=86400; Path=/" } : {};
+    res.writeHead(200, { "content-type": "text/html", ...extra });
+    res.end("<!doctype html><html><head><link rel=icon href=data:,></head><body><h1>STUB-E2E</h1></body></html>");
+  });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const home = homeTmp(`home-pfstub-${tag}-`);
   const proj = path.join(home, "proj-pfstub");
@@ -609,7 +662,7 @@ test("e2e: the REAL plain-flags relay through the stub — Claude Code's opening
     const status = JSON.parse(resultText(st));
     assert.strictEqual(status.profileMode, "plainflags");
     assert.strictEqual(status.dir, path.join(home, "Library", "Caches", "browser-mcp-relay", "profiles-plainflags", "proj-pfstub"));
-    const relayPids = childrenOf(s.child.pid);
+    const relayPids = relayOf(s.child.pid);
     assert.strictEqual(relayPids.length, 1, "one relay process");
 
     t0 = Date.now();
@@ -696,7 +749,7 @@ test("e2e: a process-group SIGKILL of the client and the stub together (a window
     assert.ok(m, `client never got the navigation result\n${err.slice(-3000)}`);
     assert.strictEqual(m[2], "OK", err.slice(-3000));
     tree = descendants(c.pid);
-    const relay = childrenOf(Number(m[1]));
+    const relay = relayOf(Number(m[1]));
     assert.strictEqual(relay.length, 1, "one relay under the stub");
     assert.strictEqual(spawnSync("ps", ["-o", "pgid=", "-p", String(relay[0])], { encoding: "utf8" }).stdout.trim(), String(c.pid), "the relay is in the client's process group");
     assert.ok(homeBraves(home).length > 0, "Brave running");
@@ -756,6 +809,51 @@ test("e2e: Claude Code's shutdown sequence while the real relay is still launchi
     const left = [...new Set([...tree.filter(alive), ...homeBraves(home)])];
     assert.deepStrictEqual(left, [], `still running 1.5 s after the SIGKILL: ${left.join(", ")}`);
     process.stderr.write(`[plainflags-stub e2e] Claude Code's shutdown during a Brave launch: nothing left ${Date.now() - killedAt} ms after the SIGKILL\n`);
+  } finally {
+    await s.stop();
+    for (const p of [...tree, ...homeBraves(home)]) { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } }
+    server.close();
+  }
+});
+
+/** A copy of the relay whose closeBrave waits 400 ms first (a Brave that needs >= 300 ms to close), with the stub beside it. */
+function slowCloseCopy(root) {
+  const dst = path.join(root, "relay-copy");
+  fs.mkdirSync(dst);
+  for (const f of ["launch-project-isolated.js", "package.json", "plainflags-stub.py", "plainflags-tools.json"]) fs.copyFileSync(path.join(REPO, f), path.join(dst, f));
+  for (const d of ["src", "scripts"]) fs.cpSync(path.join(REPO, d), path.join(dst, d), { recursive: true });
+  fs.symlinkSync(fs.realpathSync(path.join(REPO, "node_modules")), path.join(dst, "node_modules"));
+  const bridge = path.join(dst, "src", "cdp-bridge.js");
+  const text = fs.readFileSync(bridge, "utf8");
+  const anchor = "async function closeBrave(handle) {\n  if (!handle) return;\n";
+  assert.strictEqual(text.split(anchor).length, 2, "closeBrave anchor");
+  fs.writeFileSync(bridge, text.replace(anchor, anchor + "  await new Promise((r) => setTimeout(r, 400)); // test copy: a slow close\n"));
+  return path.join(dst, "plainflags-stub.py");
+}
+
+test("e2e: Claude Code's exact stop sequence lets Brave close GRACEFULLY (relay closeBrave slowed to 400 ms in a copy) — a page-set persistent cookie is in the profile and exit_type is Normal", E2E, async () => {
+  const { server, home, proj, env, url } = await realSetup("graceful");
+  const s = startStub({ real: true, env, cwd: proj, stub: slowCloseCopy(home) });
+  let tree = [];
+  try {
+    await s.handshake();
+    const nav = await s.call("navigation_go-to", { url: url.replace("/stub-page", "/cookie-page"), includeScreenshot: false }, 700, 120000);
+    assert.ok(!nav.error && !nav.result.isError, JSON.stringify(nav).slice(0, 2000));
+    await sleep(500);
+    tree = descendants(s.child.pid);
+    assert.ok(homeBraves(home).length > 0, "Brave running");
+    const killedAt = await claudeCodeShutdown(s.child);
+    const end = killedAt + 15000;
+    while ((tree.some(alive) || homeBraves(home).length) && Date.now() < end) await sleep(100);
+    assert.deepStrictEqual(homeBraves(home), [], "Brave closed");
+    const goneMs = Date.now() - killedAt;
+    const profile = path.join(home, "Library", "Caches", "browser-mcp-relay", "profiles-plainflags", "proj-pfstub", "Default");
+    const prefs = JSON.parse(fs.readFileSync(path.join(profile, "Preferences"), "utf8"));
+    assert.strictEqual(prefs.profile && prefs.profile.exit_type, "Normal", "Brave recorded a clean exit");
+    const q = spawnSync("/usr/bin/sqlite3", ["-readonly", path.join(profile, "Cookies"), "select count(*) from cookies where name='pfstub_keep'"], { encoding: "utf8" });
+    assert.strictEqual(q.status, 0, q.stderr);
+    assert.strictEqual(q.stdout.trim(), "1", "the page's persistent cookie was written to the profile");
+    process.stderr.write(`[plainflags-stub e2e] Claude Code's stop with a 400 ms closeBrave: Brave closed cleanly ${goneMs} ms after the SIGKILL, cookie kept\n`);
   } finally {
     await s.stop();
     for (const p of [...tree, ...homeBraves(home)]) { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } }
