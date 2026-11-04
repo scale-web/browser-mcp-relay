@@ -62,6 +62,42 @@ def log(text):
         pass
 
 
+# One line per stop and per kill in ~/Library/Logs/plainflags-stub.log (ask as-ops/ask-qdzhjt): measures how often a
+# kill takes Brave with it (`others` = processes besides the relay that were SIGKILLed). Kinds, reasons and counts
+# only, never a message body. Tests name their own file under the temp dir; a fake relay never writes the real log.
+EVENT_LOG_ENV = "PLAINFLAGS_STUB_EVENT_LOG"
+
+
+def event_log_path():
+    p = os.environ.get(EVENT_LOG_ENV)
+    if p:
+        import tempfile
+        tmp = os.path.realpath(tempfile.gettempdir())
+        d = os.path.realpath(os.path.dirname(os.path.abspath(p)))
+        return p if d == tmp or d.startswith(tmp + os.sep) else None
+    if os.environ.get(TEST_CHILD_ENV):
+        return None
+    return os.path.join(os.path.expanduser("~"), "Library", "Logs", "plainflags-stub.log")
+
+
+def event(kind, **fields):
+    """Append one event line; never raises (a log must not change what the stub does)."""
+    try:
+        p = event_log_path()
+        if not p:
+            return
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        line = "%s stub=%d %s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), os.getpid(), kind,
+                                       " ".join("%s=%s" % (k, json.dumps(v)) for k, v in fields.items()))
+        fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
 def show_id(i):
     """An integer id as is; any other id by its type only."""
     return str(i) if isinstance(i, int) and not isinstance(i, bool) else "<%s>" % type(i).__name__
@@ -358,19 +394,23 @@ class Stub:
         remembered pid counts only with the same start time, and only while its
         parent is pid 1 or the relay's tree: never anything that was not the relay's."""
         p = self.proc
+        others = 0
         for pid in [p.pid] + sorted(kill_targets(p.pid, ps_table(), self.tree)):
             try:
                 os.kill(pid, signal.SIGKILL)
+                others += pid != p.pid
             except OSError:
                 pass
+        return others
 
     def end_relay(self, why=None, tree=True):
         """The relay is gone or must go: SIGKILL it (and, unless `tree` is false,
         its process tree), reap it, and answer everything that waited on it with
         an error."""
         p = self.proc
+        others = 0
         if tree:
-            self.kill_tree()
+            others = self.kill_tree()
         else:
             try:
                 os.kill(p.pid, signal.SIGKILL)  # not reaped yet, so the pid is still ours
@@ -386,6 +426,7 @@ class Stub:
         self.proc, self.deadline, self.tree_stale = None, None, False
         if why is None:
             why = "exited (code %d)" % code if code >= 0 else "was killed (signal %d)" % -code
+        event("tree-kill" if tree else "relay-kill", why=why, others=others)
         self.why, self.state = "the plain-flags relay " + why, "failed"
         log("relay pid=%d %s" % (p.pid, why))
         waiting = list(self.inflight.values()) + [m["id"] for _, m in self.queue
@@ -413,6 +454,7 @@ class Stub:
         log("%s — stopping" % why)
         if self.proc is None:
             return
+        event("stop", why=why)
         self.note_tree()  # while the tree is intact
         try:
             self.proc.stdin.close()  # the relay shuts itself down on stdin EOF…

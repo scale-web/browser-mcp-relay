@@ -543,6 +543,76 @@ test("stub exit: a relay that ignores SIGTERM and EOF is SIGKILLed with its proc
   } finally { await s.stop(); }
 });
 
+/** The event log's lines as {kind, why, others}; [] when the file does not exist. */
+const readEvents = (file) => (fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean) : []).map((l) => {
+  const m = /^\S+Z stub=\d+ (\S+) (.*)$/.exec(l);
+  assert.ok(m, `event line shape: ${l}`);
+  return { kind: m[1], why: (/why=("(?:[^"\\]|\\.)*")/.exec(m[2]) || [])[1] && JSON.parse(/why=("(?:[^"\\]|\\.)*")/.exec(m[2])[1]),
+           others: /others=(\d+)/.test(m[2]) ? Number(/others=(\d+)/.exec(m[2])[1]) : undefined };
+});
+
+test("event log: a single SIGTERM to a relay that ignores it logs a stop, then a tree-kill naming the descendants it SIGKILLed", OPTS, async () => {
+  const log = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pf-ev-")), "events.log");
+  const s = startStub({ mode: "ignore-term", timings: "5,3,1", env: { PLAINFLAGS_STUB_EVENT_LOG: log } });
+  try {
+    await s.handshake();
+    await s.call("echo");
+    s.child.kill("SIGTERM");
+    await exitedWithin(s, 8000);
+    const ev = readEvents(log);
+    assert.deepStrictEqual(ev.map((e) => e.kind), ["stop", "tree-kill"], JSON.stringify(ev));
+    assert.strictEqual(ev[0].why, "SIGTERM");
+    assert.strictEqual(ev[1].why, "was stopped");
+    assert.ok(ev[1].others >= 1, `the grandchild counted: ${ev[1].others}`);
+    assert.strictEqual(fs.statSync(log).mode & 0o777, 0o600);
+  } finally { await s.stop(); }
+});
+
+test("event log: Claude Code's shutdown logs a stop and a relay-only kill (others=0); an init timeout logs a tree-kill", OPTS, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-ev-"));
+  const log = path.join(dir, "a.log");
+  const s = startStub({ mode: "slow-exit", env: { PLAINFLAGS_STUB_EVENT_LOG: log } });
+  try {
+    await s.handshake();
+    await s.call("echo");
+    s.child.kill("SIGINT"); await sleep(100); s.child.kill("SIGTERM");
+    await exitedWithin(s, 3000);
+    const ev = readEvents(log);
+    assert.deepStrictEqual(ev.map((e) => [e.kind, e.others]), [["stop", undefined], ["relay-kill", 0]], JSON.stringify(ev));
+  } finally { await s.stop(); }
+  const log2 = path.join(dir, "b.log");
+  const t = startStub({ mode: "no-init", timings: "1,30,1.5", env: { PLAINFLAGS_STUB_EVENT_LOG: log2 } });
+  try {
+    await t.handshake();
+    await t.call("echo", {}, 70);
+    const ev = readEvents(log2);
+    assert.strictEqual(ev.length, 1, JSON.stringify(ev));
+    assert.strictEqual(ev[0].kind, "tree-kill");
+    assert.match(ev[0].why, /did not answer initialize within 1 s/);
+  } finally { await t.stop(); }
+});
+
+test("event log: a fake-relay run never writes the real log, and a log path outside the temp dir is ignored", OPTS, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pf-ev-home-"));
+  const real = path.join(home, "Library", "Logs", "plainflags-stub.log");
+  const outDir = fs.mkdtempSync("/private/var/tmp/pf-ev-out-"); // writable and outside the temp dir: a broken guard WOULD write here
+  assert.ok(!fs.realpathSync(outDir).startsWith(fs.realpathSync(os.tmpdir()) + path.sep), "the outside dir is not under the temp dir");
+  const outside = path.join(outDir, "events.log");
+  for (const env of [{ HOME: home }, { HOME: home, PLAINFLAGS_STUB_EVENT_LOG: outside }]) {
+    const s = startStub({ mode: "ignore-term", timings: "5,3,1", env });
+    try {
+      await s.handshake();
+      await s.call("echo");
+      s.child.kill("SIGTERM");
+      await exitedWithin(s, 8000);
+    } finally { await s.stop(); }
+  }
+  assert.ok(!fs.existsSync(real), "no event log under the fake HOME");
+  const wrote = fs.existsSync(outside);
+  fs.rmSync(outDir, { recursive: true, force: true });
+  assert.ok(!wrote, "no event log outside the temp dir");
+});
+
 test("drift: the relay's tools/list differs from the file → notifications/tools/list_changed, then the relay's list", OPTS, async () => {
   const changed = untoken(FILE.toolsList, os.tmpdir());
   changed.tools = changed.tools.slice(1);
