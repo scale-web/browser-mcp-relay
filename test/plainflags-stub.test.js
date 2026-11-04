@@ -548,7 +548,8 @@ const readEvents = (file) => (fs.existsSync(file) ? fs.readFileSync(file, "utf8"
   const m = /^\S+Z stub=\d+ (\S+) (.*)$/.exec(l);
   assert.ok(m, `event line shape: ${l}`);
   return { kind: m[1], why: (/why=("(?:[^"\\]|\\.)*")/.exec(m[2]) || [])[1] && JSON.parse(/why=("(?:[^"\\]|\\.)*")/.exec(m[2])[1]),
-           others: /others=(\d+)/.test(m[2]) ? Number(/others=(\d+)/.exec(m[2])[1]) : undefined };
+           others: /others=(\d+)/.test(m[2]) ? Number(/others=(\d+)/.exec(m[2])[1]) : undefined,
+           brave: /brave=(\d+)/.test(m[2]) ? Number(/brave=(\d+)/.exec(m[2])[1]) : undefined };
 });
 
 test("event log: a single SIGTERM to a relay that ignores it logs a stop, then a tree-kill naming the descendants it SIGKILLed", OPTS, async () => {
@@ -564,6 +565,7 @@ test("event log: a single SIGTERM to a relay that ignores it logs a stop, then a
     assert.strictEqual(ev[0].why, "SIGTERM");
     assert.strictEqual(ev[1].why, "was stopped");
     assert.ok(ev[1].others >= 1, `the grandchild counted: ${ev[1].others}`);
+    assert.strictEqual(ev[1].brave, 0, "a fake relay's descendants are not Brave");
     assert.strictEqual(fs.statSync(log).mode & 0o777, 0o600);
   } finally { await s.stop(); }
 });
@@ -578,7 +580,7 @@ test("event log: Claude Code's shutdown logs a stop and a relay-only kill (other
     s.child.kill("SIGINT"); await sleep(100); s.child.kill("SIGTERM");
     await exitedWithin(s, 3000);
     const ev = readEvents(log);
-    assert.deepStrictEqual(ev.map((e) => [e.kind, e.others]), [["stop", undefined], ["relay-kill", 0]], JSON.stringify(ev));
+    assert.deepStrictEqual(ev.map((e) => [e.kind, e.others, e.brave]), [["stop", undefined, undefined], ["relay-kill", 0, 0]], JSON.stringify(ev));
   } finally { await s.stop(); }
   const log2 = path.join(dir, "b.log");
   const t = startStub({ mode: "no-init", timings: "1,30,1.5", env: { PLAINFLAGS_STUB_EVENT_LOG: log2 } });
@@ -611,6 +613,24 @@ test("event log: a fake-relay run never writes the real log, and a log path outs
   const wrote = fs.existsSync(outside);
   fs.rmSync(outDir, { recursive: true, force: true });
   assert.ok(!wrote, "no event log outside the temp dir");
+});
+
+test("event log: a FIFO at the log path never blocks a stop (the open is non-blocking; nothing is logged)", OPTS, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-ev-"));
+  const fifo = path.join(dir, "events.log");
+  assert.strictEqual(spawnSync("mkfifo", [fifo]).status, 0, "mkfifo");
+  const s = startStub({ mode: "ignore-term", timings: "5,3,1", env: { PLAINFLAGS_STUB_EVENT_LOG: fifo } });
+  try {
+    await s.handshake();
+    await s.call("echo");
+    const all = s.pids().flat();
+    const t0 = Date.now();
+    s.child.kill("SIGTERM");
+    await exitedWithin(s, 8000);
+    const ms = Date.now() - t0;
+    assert.ok(ms >= 900 && ms < 5000, `exited after ${ms} ms (the 1 s grace, not a hang)`);
+    await waitDead(all, 3000);
+  } finally { await s.stop(); }
 });
 
 test("drift: the relay's tools/list differs from the file → notifications/tools/list_changed, then the relay's list", OPTS, async () => {
@@ -854,7 +874,11 @@ test("e2e: the client dies abruptly (its stderr pipe closed, then stdin EOF) —
     while ((tree.some(alive) || homeBraves(home).length) && Date.now() < end) await sleep(100);
     assert.deepStrictEqual(tree.filter(alive), [], "every process of the relay's tree is gone");
     assert.deepStrictEqual(homeBraves(home), [], "no Brave left on the test profile");
-    process.stderr.write(`[plainflags-stub e2e] client gone abruptly (broken stderr + EOF): stub exited and relay tree + Brave gone in ${Date.now() - t0} ms\n`);
+    const ev = readEvents(path.join(home, "Library", "Logs", "plainflags-stub.log"));
+    const kill = ev.find((e) => e.kind === "tree-kill");
+    assert.ok(ev[0] && ev[0].kind === "stop" && kill && kill.brave >= 1 && kill.others > kill.brave,
+      `the event log names the Brave the tree kill took (and the upstream besides): ${JSON.stringify(ev)}`);
+    process.stderr.write(`[plainflags-stub e2e] client gone abruptly (broken stderr + EOF): stub exited and relay tree + Brave gone in ${Date.now() - t0} ms; logged ${JSON.stringify(kill)}\n`);
   } finally {
     await s.stop();
     for (const p of [...tree, ...homeBraves(home)]) { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } }

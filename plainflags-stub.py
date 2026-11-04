@@ -63,7 +63,8 @@ def log(text):
 
 
 # One line per stop and per kill in ~/Library/Logs/plainflags-stub.log (ask as-ops/ask-qdzhjt): measures how often a
-# kill takes Brave with it (`others` = processes besides the relay that were SIGKILLed). Kinds, reasons and counts
+# kill takes Brave with it (`others` = processes besides the relay that were SIGKILLed, the relay's upstream node child
+# included; `brave` = how many of those were Brave, by executable name). Kinds, reasons and counts
 # only, never a message body. Tests name their own file under the temp dir; a fake relay never writes the real log.
 EVENT_LOG_ENV = "PLAINFLAGS_STUB_EVENT_LOG"
 
@@ -89,7 +90,7 @@ def event(kind, **fields):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         line = "%s stub=%d %s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), os.getpid(), kind,
                                        " ".join("%s=%s" % (k, json.dumps(v)) for k, v in fields.items()))
-        fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK, 0o600)  # a FIFO never blocks a stop
         try:
             os.write(fd, line.encode("utf-8"))
         finally:
@@ -168,6 +169,20 @@ def kill_targets(relay, rows, remembered):
     left = {c for c, start in remembered.items()
             if c in rows and rows[c][1] == start and (rows[c][0] == 1 or rows[c][0] in known)}
     return (live | left) - {relay, 1, os.getpid()}
+
+
+def brave_count(pids):
+    """How many of `pids` are Brave processes (browser or helper), by executable name — for the event log only;
+    None when ps cannot say. Read before the kill, never part of the kill decision."""
+    import subprocess
+    if not pids:
+        return 0
+    try:
+        out = subprocess.run(["/bin/ps", "-o", "comm=", "-p", ",".join(str(x) for x in pids)], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, universal_newlines=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return sum(1 for line in out.splitlines() if "brave" in os.path.basename(line.strip()).lower())
 
 
 def load_tools_file():
@@ -395,22 +410,24 @@ class Stub:
         parent is pid 1 or the relay's tree: never anything that was not the relay's."""
         p = self.proc
         others = 0
-        for pid in [p.pid] + sorted(kill_targets(p.pid, ps_table(), self.tree)):
+        targets = sorted(kill_targets(p.pid, ps_table(), self.tree))
+        braves = brave_count(targets)
+        for pid in [p.pid] + targets:
             try:
                 os.kill(pid, signal.SIGKILL)
                 others += pid != p.pid
             except OSError:
                 pass
-        return others
+        return others, braves
 
     def end_relay(self, why=None, tree=True):
         """The relay is gone or must go: SIGKILL it (and, unless `tree` is false,
         its process tree), reap it, and answer everything that waited on it with
         an error."""
         p = self.proc
-        others = 0
+        others, braves = 0, 0
         if tree:
-            others = self.kill_tree()
+            others, braves = self.kill_tree()
         else:
             try:
                 os.kill(p.pid, signal.SIGKILL)  # not reaped yet, so the pid is still ours
@@ -426,7 +443,7 @@ class Stub:
         self.proc, self.deadline, self.tree_stale = None, None, False
         if why is None:
             why = "exited (code %d)" % code if code >= 0 else "was killed (signal %d)" % -code
-        event("tree-kill" if tree else "relay-kill", why=why, others=others)
+        event("tree-kill" if tree else "relay-kill", why=why, others=others, brave=braves)
         self.why, self.state = "the plain-flags relay " + why, "failed"
         log("relay pid=%d %s" % (p.pid, why))
         waiting = list(self.inflight.values()) + [m["id"] for _, m in self.queue
