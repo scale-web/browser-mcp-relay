@@ -171,18 +171,24 @@ def kill_targets(relay, rows, remembered):
     return (live | left) - {relay, 1, os.getpid()}
 
 
-def brave_count(pids):
-    """How many of `pids` are Brave processes (browser or helper), by executable name — for the event log only;
-    None when ps cannot say. Read before the kill, never part of the kill decision."""
-    import subprocess
-    if not pids:
-        return 0
+def brave_pids(pids):
+    """The pids among `pids` that are Brave processes (browser or helper), by executable name — for the event log
+    only; empty when ps cannot say. Never raises (any process can set its own name, bytes included): it runs before
+    the kill and must never stop it."""
     try:
-        out = subprocess.run(["/bin/ps", "-o", "comm=", "-p", ",".join(str(x) for x in pids)], stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, universal_newlines=True, timeout=2).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return sum(1 for line in out.splitlines() if "brave" in os.path.basename(line.strip()).lower())
+        import subprocess
+        if not pids:
+            return set()
+        out = subprocess.run(["/bin/ps", "-o", "pid=,comm=", "-p", ",".join(str(x) for x in pids)],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2).stdout
+        found = set()
+        for line in out.decode("utf-8", "replace").splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].isdigit() and "brave" in os.path.basename(parts[1]).lower():
+                found.add(int(parts[0]))
+        return found
+    except Exception:
+        return set()
 
 
 def load_tools_file():
@@ -411,11 +417,13 @@ class Stub:
         p = self.proc
         others = 0
         targets = sorted(kill_targets(p.pid, ps_table(), self.tree))
-        braves = brave_count(targets)
+        brave = brave_pids(targets)
+        braves = 0
         for pid in [p.pid] + targets:
             try:
                 os.kill(pid, signal.SIGKILL)
                 others += pid != p.pid
+                braves += pid in brave        # counted only when the kill landed: brave <= others
             except OSError:
                 pass
         return others, braves

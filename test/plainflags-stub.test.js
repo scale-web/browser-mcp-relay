@@ -279,6 +279,28 @@ test("kill_targets: live descendants and orphaned remembered ones only — a reu
   assert.deepStrictEqual(JSON.parse(r.stdout), [101, 102, 200]);
 });
 
+test("brave_pids: a process name that is not UTF-8 never raises (it runs before the kill); only Brave-named pids are returned", OPTS, () => {
+  const odd = spawn("perl", ["-e", '$0 = "/x/\\xff\\xfeBrave Browser Helper"; sleep 30'], { stdio: "ignore" });
+  const plain = spawn("sleep", ["30"], { stdio: "ignore" });
+  try {
+    const t0 = Date.now();
+    while (!/Brave/.test(spawnSync("ps", ["-o", "comm=", "-p", String(odd.pid)], { encoding: "latin1" }).stdout || "") && Date.now() - t0 < 3000) spawnSync("sleep", ["0.05"]);
+    const UTF8 = { ...process.env, LC_ALL: "en_US.UTF-8", PYTHONDONTWRITEBYTECODE: "1" }; // under C, ps escapes the bytes
+    const raw = spawnSync("ps", ["-o", "comm=", "-p", String(odd.pid)], { env: UTF8 }).stdout;
+    assert.ok(raw.includes(0xff) && /Brave/.test(raw.toString("latin1")), `the name really is not UTF-8: ${raw.toString("hex")}`);
+    const code = [
+      "import importlib.util, json, sys",
+      `spec = importlib.util.spec_from_file_location("stub", ${JSON.stringify(STUB)})`,
+      "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)",
+      "a = json.loads(sys.argv[1])",
+      "print(json.dumps(sorted(m.brave_pids(a))))",
+    ].join("\n");
+    const r = spawnSync(PY, ["-c", code, JSON.stringify([odd.pid, plain.pid, 999999])], { encoding: "utf8", env: UTF8 });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.deepStrictEqual(JSON.parse(r.stdout), [odd.pid]);
+  } finally { odd.kill("SIGKILL"); plain.kill("SIGKILL"); }
+});
+
 test("tools/list: the tmpdir token becomes the session's os.tmpdir() (trailing slash dropped, as Node does)", OPTS, async () => {
   const tmp = fs.realpathSync(os.tmpdir());
   const s = startStub({ env: { TMPDIR: tmp + "/" } });
