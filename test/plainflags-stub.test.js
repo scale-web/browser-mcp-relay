@@ -281,7 +281,7 @@ test("kill_targets: live descendants and orphaned remembered ones only — a reu
 
 test("brave_pids: a process name that is not UTF-8 never raises (it runs before the kill); only Brave-named pids are returned", OPTS, () => {
   const odd = spawn("perl", ["-e", '$0 = "/x/\\xff\\xfeBrave Browser Helper"; sleep 30'], { stdio: "ignore" });
-  const plain = spawn("sleep", ["30"], { stdio: "ignore" });
+  const plain = spawn("sleep", ["30"], { stdio: "ignore" }); // plus an exited pid (a real, reaped one: ps refuses >99999)
   try {
     const t0 = Date.now();
     while (!/Brave/.test(spawnSync("ps", ["-o", "comm=", "-p", String(odd.pid)], { encoding: "latin1" }).stdout || "") && Date.now() - t0 < 3000) spawnSync("sleep", ["0.05"]);
@@ -295,7 +295,7 @@ test("brave_pids: a process name that is not UTF-8 never raises (it runs before 
       "a = json.loads(sys.argv[1])",
       "print(json.dumps(sorted(m.brave_pids(a))))",
     ].join("\n");
-    const r = spawnSync(PY, ["-c", code, JSON.stringify([odd.pid, plain.pid, 999999])], { encoding: "utf8", env: UTF8 });
+    const r = spawnSync(PY, ["-c", code, JSON.stringify([odd.pid, plain.pid, spawnSync("true").pid])], { encoding: "utf8", env: UTF8 });
     assert.strictEqual(r.status, 0, r.stderr);
     assert.deepStrictEqual(JSON.parse(r.stdout), [odd.pid]);
   } finally { odd.kill("SIGKILL"); plain.kill("SIGKILL"); }
