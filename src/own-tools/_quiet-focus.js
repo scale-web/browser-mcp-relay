@@ -11,7 +11,10 @@
 // already the frontmost app (the user is looking at it; nothing to steal).
 // Matched by pid: the user's own Brave and other relays' Braves share its
 // bundle id (review 2026-10-29).
-// Not covered: pages upstream creates itself with its own Playwright.
+// Pages upstream creates itself with its own Playwright (its session page and
+// that page's re-creation) were not covered here; since 2026-11-10 (A1)
+// scripts/patch-bdmcp-quiet-page.js routes them through the same
+// background createTarget.
 
 const { execFile } = require("node:child_process");
 const { _cdpCall } = require("../cdp-bridge.js");

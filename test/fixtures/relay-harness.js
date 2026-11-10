@@ -7,6 +7,7 @@
 //                       layer 1 (checkToolArgs) stays real
 //   - scripts/patch-bdmcp-bundle.js → no-op (never write node_modules)
 //   - scripts/patch-bdmcp-request-body.js → no-op that logs "HARNESS a76-patch <distDir>"
+//   - scripts/patch-bdmcp-quiet-page.js → no-op that logs "HARNESS a1-patch <distDir>"
 // The upstream child is test/fixtures/mock-bdmcp-session.js via
 // BROWSER_RELAY_UPSTREAM_PATH.
 //
@@ -167,6 +168,10 @@ stubModule(path.join(SCRIPTS, "patch-bdmcp-request-body.js"), {
     if (fs.existsSync(path.join(dir, "a76-unpatched"))) return { patched: false, reason: "harness: forced unpatched" };
     return { patched: true };
   },
+});
+
+stubModule(path.join(SCRIPTS, "patch-bdmcp-quiet-page.js"), {
+  applyPatch: (opts = {}) => { log(`a1-patch ${opts.distDir}`); return { patched: true }; },
 });
 
 // $HARNESS_DIR/lsof-bin = /abs/path: the relay's CDP-client check runs that

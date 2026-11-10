@@ -343,6 +343,20 @@ async function main() {
       process.stderr.write(`[mcp-relay] WARNING A76 request-body patch threw: ${e.message} — execute and scenario-run are refused until it applies\n`);
     }
     require("./request-body-filter.js").setSourcePatchInEffect(a76Applied);
+    // A1 (2026-11-10): upstream's own session page (its first tool call, and
+    // its re-creation after that page is closed) opens in the background, as
+    // the relay's tabs do (src/own-tools/_quiet-focus.js). Without it,
+    // Playwright's newPage() activates Brave and macOS switches the user out
+    // of their Space. Not applied → that page activates Brave, nothing else.
+    try {
+      const { applyPatch } = require("../scripts/patch-bdmcp-quiet-page.js");
+      const result = applyPatch({ distDir: bdmcpDist });
+      if (!result.patched) {
+        process.stderr.write(`[mcp-relay] A1 quiet-page patch skipped: ${result.reason} (upstream's session page may activate Brave)\n`);
+      }
+    } catch (e) {
+      process.stderr.write(`[mcp-relay] A1 quiet-page patch threw (continuing): ${e.message}\n`);
+    }
     process.stderr.write(`[mcp-relay] spawning upstream child (no Brave yet, entry=${bdmcpEntry})...\n`);
     // CDP env points at the exact ws endpoint of OUR Brave (pinned to its
     // uuid, so it can reach no other browser). Before any Brave exists it is

@@ -585,3 +585,21 @@ test("desync guard (real relay process): a blank tabs_select refuses execute; a 
     await r.stop();
   }
 });
+
+test("A1: the quiet-page patch runs before EVERY upstream spawn, on the bundle actually spawned", T, async () => {
+  const r = await startRelay();
+  try {
+    await r.request("tools/list", {});
+    await r.call();
+    await r.killBrave();
+    await r.call();
+    const spawns = (r.stderr().match(/spawning upstream child/g) || []).length;
+    const patches = (r.stderr().match(/HARNESS a1-patch/g) || []).length;
+    assert.ok(spawns >= 3, `precondition: placeholder + two Brave generations (${spawns} spawns)`);
+    assert.strictEqual(patches, spawns, `each spawn must run the A1 patch first:\n${r.stderr()}`);
+    const dirs = new Set((r.stderr().match(/HARNESS a1-patch \S+/g) || []).map((l) => l.split(" ")[2]));
+    assert.deepStrictEqual([...dirs], [path.dirname(MOCK_BDMCP)]);
+  } finally {
+    await r.stop();
+  }
+});
