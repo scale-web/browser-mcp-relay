@@ -43,7 +43,22 @@ function fixture() {
   put(clone, "Default/Local Storage/leveldb/000042.log", "old-ls-log");
   put(clone, "Default/Local Storage/leveldb/CURRENT", "MANIFEST-000041");
   put(clone, "Default/Preferences", "clone-prefs");
+  // The base changed after the clone's last seed (NOW - 13 h) unless a test says otherwise.
+  setBaseCookieTimes(base, NOW - 1 * H, NOW - 1 * H);
   return { root, base, clone };
+}
+
+/** mtimes (ms) of the base's Cookies DB and its -wal. */
+function setBaseCookieTimes(base, mainMs, walMs) {
+  fs.utimesSync(path.join(base, "Default/Network/Cookies"), mainMs / 1000, mainMs / 1000);
+  fs.utimesSync(path.join(base, "Default/Network/Cookies-wal"), walMs / 1000, walMs / 1000);
+}
+
+/** Run `fn` with fs.copyFileSync replaced by `fake(real, src, dst)`. */
+async function withCopy(fake, fn) {
+  const real = fs.copyFileSync;
+  fs.copyFileSync = (s, d, ...rest) => fake(real, s, d, ...rest);
+  try { return await fn(); } finally { fs.copyFileSync = real; }
 }
 
 function run(f, extra = {}) {
@@ -73,8 +88,63 @@ test("refreshStaleClone: a clone older than the limit is re-seeded from its base
     assert.strictEqual(read(f.base, "Default/Network/Cookies"), "base-cookies");
     assert.deepStrictEqual(fs.readdirSync(path.join(f.base, "Default/Local Storage/leveldb")).sort(), ["000010.log", "CURRENT"]);
     assert.strictEqual(logs.length, 1, "one log line per refresh");
-    assert.match(logs[0], /refreshed session clone as-ops-p123-abc from as-ops: snapshot age 13\.0h > limit 12\.0h; copied 4\/\d+ files \+ 1\/2 storage dirs, cleared 3 stale/);
+    assert.match(logs[0], /refreshed session clone as-ops-p123-abc from as-ops: snapshot age 13\.0h > limit 12\.0h; copied 4\/\d+ files \+ 1\/2 storage dirs, cleared 4 stale/);
     assert.ok(!/base-|old-|cookies"/.test(logs[0]), "no profile contents in the log");
+  } finally {
+    fs.rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("refreshStaleClone: skips (keeping the snapshot time) when the base's cookie DB has not changed since the seed; a newer -wal alone counts", () => {
+  const f = fixture();
+  try {
+    setBaseCookieTimes(f.base, NOW - 14 * H, NOW - 14 * H);
+    const { r, logs } = run(f);
+    assert.deepStrictEqual(r, { refreshed: false, reason: "base not newer", snapshotAt: NOW - 13 * H });
+    assert.strictEqual(logs.length, 0);
+    assert.strictEqual(read(f.clone, "Default/Network/Cookies"), "old-cookies", "a sign-in made in the clone must survive");
+    assert.ok(exists(f.clone, "Default/Network/Cookies-shm"));
+    assert.ok(exists(f.clone, "Default/Local Storage/leveldb/000042.log"));
+    // Exactly at the seed time is not newer either.
+    setBaseCookieTimes(f.base, NOW - 13 * H, NOW - 13 * H);
+    assert.strictEqual(run(f).r.reason, "base not newer");
+    // The main DB unchanged but its -wal written since: the base changed.
+    setBaseCookieTimes(f.base, NOW - 14 * H, NOW - 2 * H);
+    const r2 = run(f).r;
+    assert.deepStrictEqual([r2.refreshed, r2.snapshotAt], [true, NOW]);
+    assert.strictEqual(read(f.clone, "Default/Network/Cookies"), "base-cookies");
+  } finally {
+    fs.rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("refreshStaleClone: a base -wal that vanishes between the check and the copy leaves no stale -wal in the clone", async () => {
+  const f = fixture();
+  try {
+    const baseWal = path.join(f.base, "Default/Network/Cookies-wal");
+    const { r } = await withCopy((real, s, d) => {
+      if (s === baseWal) { fs.unlinkSync(baseWal); const e = new Error("ENOENT"); e.code = "ENOENT"; throw e; }
+      return real(s, d);
+    }, () => run(f));
+    assert.deepStrictEqual([r.refreshed, r.snapshotAt], [true, NOW], "the main DB copied, so this is a refresh");
+    assert.strictEqual(read(f.clone, "Default/Network/Cookies"), "base-cookies");
+    assert.ok(!exists(f.clone, "Default/Network/Cookies-wal"), "the clone's OLD -wal must not survive beside the new DB");
+  } finally {
+    fs.rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("refreshStaleClone: a replaced DB that fails to copy is not a refresh — the snapshot time stays, so the next launch retries", async () => {
+  const f = fixture();
+  try {
+    const baseCookies = path.join(f.base, "Default/Network/Cookies");
+    const { r, logs } = await withCopy((real, s, d) => {
+      if (s === baseCookies) { const e = new Error("EIO"); e.code = "EIO"; throw e; }
+      return real(s, d);
+    }, () => run(f));
+    assert.deepStrictEqual(r, { refreshed: false, reason: "copy failed", snapshotAt: NOW - 13 * H });
+    assert.match(logs.join(""), /INCOMPLETE: 1 DB\(s\) failed to copy \(Cookies\)/);
+    assert.ok(!exists(f.clone, "Default/Network/Cookies-wal"), "no old -wal beside whatever DB is left");
   } finally {
     fs.rmSync(f.root, { recursive: true, force: true });
   }

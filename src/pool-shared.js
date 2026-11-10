@@ -877,7 +877,7 @@ function reapDirUnderFlock(dir, opts = {}) {
  * standalone mode (sourceProfile is null). Returns the count of files copied
  * — caller can log it.
  */
-function snapshotCookiesFrom(srcProfile, dstProfile, { excludeLoginData = false } = {}) {
+function snapshotCookiesFrom(srcProfile, dstProfile, { excludeLoginData = false, _copied = null } = {}) {
   if (!srcProfile || !fs.existsSync(srcProfile)) return 0;
   let copied = 0;
   for (const rel of SNAPSHOT_FILES) {
@@ -897,6 +897,7 @@ function snapshotCookiesFrom(srcProfile, dstProfile, { excludeLoginData = false 
           try { fs.chmodSync(d, 0o600); } catch { /* best-effort */ }
         }
         copied++;
+        if (_copied) _copied.push(rel);
       }
     } catch (e) {
       process.stderr.write(`[mcp-relay] snapshot copy ${rel} failed: ${e.code || e.message}\n`);
@@ -981,13 +982,18 @@ function cloneRefreshMaxAgeMs(env = process.env) {
  * clone or the process list cannot be read. The base may be live: the copy
  * is the same one the start snapshot makes.
  *
+ * It refreshes only when the base's cookie DB (or its -wal) changed after
+ * the last seed; otherwise it skips without advancing `snapshotAt`.
+ *
  * Unlike the start snapshot, the clone already has a profile of its own, so
  * whatever the copy would leave stale beside a replaced file is removed first:
- * a main DB's -wal/-shm/-journal that the base does not supply (SQLite would
- * replay an old -wal onto the new DB), and each storage dir that is replaced
- * (LevelDB would replay old .log files). Sign-ins made inside the clone since
- * its last snapshot are replaced by the base's, as they would be lost when
- * the clone ends anyway.
+ * every -wal/-shm/-journal of each DB being replaced (SQLite would replay an
+ * old -wal onto the new DB), and each storage dir that is replaced (LevelDB
+ * would replay old .log files). If a replaced DB fails to copy, the result is
+ * not a refresh and `snapshotAt` stays, so the next launch tries again.
+ * When the base did change, sign-ins made only inside the clone since its
+ * last seed ARE replaced by the base's (they would be lost when the clone
+ * ends anyway, but a refresh loses them sooner).
  *
  * Logs one line per refresh: age, limit, counts (names only, no contents).
  *
@@ -1005,6 +1011,16 @@ function refreshStaleClone(opts) {
   const ageMs = now - snapshotAt;
   if (!(ageMs >= maxAgeMs)) return keep("fresh");
   if (!baseDir || !fs.existsSync(baseDir)) return keep("base missing");
+  // Only when the base has changed since the last seed: otherwise a refresh
+  // would just overwrite sign-ins made inside the clone with an older copy.
+  // The base's cookie DB (and its -wal) mtime is the signal; the snapshot
+  // time is NOT advanced, so a later change in the base still counts.
+  const baseCookies = findCookiesFile(baseDir);
+  let baseChangedAt = -Infinity;
+  for (const f of baseCookies ? [baseCookies, `${baseCookies}-wal`] : []) {
+    try { baseChangedAt = Math.max(baseChangedAt, fs.statSync(f).mtimeMs); } catch { /* no -wal */ }
+  }
+  if (!(baseChangedAt > snapshotAt)) return keep("base not newer");
   // Never while a Brave runs on the clone. The process probe must SUCCEED:
   // an unreadable process list is not "no Brave".
   const platform = opts._platform || process.platform;
@@ -1026,15 +1042,18 @@ function refreshStaleClone(opts) {
   }
 
   const has = (root, rel) => fs.existsSync(path.join(root, rel));
-  const listed = new Set(SNAPSHOT_FILES);
   let cleared = 0;
+  // Every sidecar of every DB about to be replaced goes, whatever the base
+  // has: the copy brings the base's back, and one it cannot copy (gone by
+  // then, or failing) must not leave the clone's old -wal beside a new DB.
+  const replaced = [];
   for (const rel of SNAPSHOT_FILES) {
     if (/-(wal|shm|journal)$/.test(rel)) continue;
     if (excludeLoginData && plainflagsMode.isLoginDataPath(rel)) continue;
     if (!has(baseDir, rel)) continue; // this DB is not replaced
+    replaced.push(rel);
     for (const suffix of ["-wal", "-shm", "-journal"]) {
       const side = rel + suffix;
-      if (listed.has(side) && has(baseDir, side)) continue; // the copy overwrites it
       if (!has(cloneDir, side)) continue;
       try { fs.rmSync(path.join(cloneDir, side), { force: true }); cleared++; } catch { /* copy still runs */ }
     }
@@ -1045,12 +1064,26 @@ function refreshStaleClone(opts) {
     if (!has(baseDir, rel) || !has(cloneDir, rel)) continue;
     try { fs.rmSync(path.join(cloneDir, rel), { recursive: true, force: true }); cleared++; } catch { /* copy still runs */ }
   }
-  const files = snapshotCookiesFrom(baseDir, cloneDir, { excludeLoginData });
+  const copiedRels = [];
+  const files = snapshotCookiesFrom(baseDir, cloneDir, { excludeLoginData, _copied: copiedRels });
   const dirRes = snapshotDirsFrom(baseDir, cloneDir, { includeIndexedDB });
+  const missed = replaced.filter((rel) => !copiedRels.includes(rel));
+  const counts = `copied ${files}/${SNAPSHOT_FILES.length} files + ${dirRes.copied}/${dirRes.total} storage dirs, cleared ${cleared} stale`;
+  if (missed.length > 0) {
+    // The base's -wal may have copied beside the clone's OLD DB: drop it, so
+    // the old DB is left on its own. Not a refresh: the snapshot time stays,
+    // so the next launch tries again.
+    for (const rel of missed) {
+      for (const suffix of ["-wal", "-shm", "-journal"]) {
+        try { fs.rmSync(path.join(cloneDir, rel + suffix), { force: true }); } catch { /* best-effort */ }
+      }
+    }
+    log(`[mcp-relay] session clone refresh of ${path.basename(cloneDir)} INCOMPLETE: ${missed.length} DB(s) failed to copy (${missed.map((r) => path.basename(r)).join(", ")}); ${counts}\n`);
+    return keep("copy failed");
+  }
   log(
     `[mcp-relay] refreshed session clone ${path.basename(cloneDir)} from ${path.basename(baseDir)}: ` +
-    `snapshot age ${(ageMs / 3_600_000).toFixed(1)}h > limit ${(maxAgeMs / 3_600_000).toFixed(1)}h; ` +
-    `copied ${files}/${SNAPSHOT_FILES.length} files + ${dirRes.copied}/${dirRes.total} storage dirs, cleared ${cleared} stale\n`,
+    `snapshot age ${(ageMs / 3_600_000).toFixed(1)}h > limit ${(maxAgeMs / 3_600_000).toFixed(1)}h; ${counts}\n`,
   );
   return { refreshed: true, reason: "refreshed", snapshotAt: now };
 }
