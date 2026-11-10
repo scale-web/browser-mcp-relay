@@ -918,7 +918,7 @@ function snapshotCookiesFrom(srcProfile, dstProfile, { excludeLoginData = false,
  *   Default/IndexedDB. Off by default (typically 100+ MB).
  * @returns {{ copied: number, total: number, bytes: number, elapsedMs: number }}
  */
-function snapshotDirsFrom(srcProfile, dstProfile, { includeIndexedDB = false } = {}) {
+function snapshotDirsFrom(srcProfile, dstProfile, { includeIndexedDB = false, _copied = null } = {}) {
   if (!srcProfile || !fs.existsSync(srcProfile)) {
     return { copied: 0, total: 0, bytes: 0, elapsedMs: 0 };
   }
@@ -935,6 +935,7 @@ function snapshotDirsFrom(srcProfile, dstProfile, { includeIndexedDB = false } =
         fs.mkdirSync(path.dirname(d), { recursive: true });
         fs.cpSync(s, d, { recursive: true, force: true });
         copied++;
+        if (_copied) _copied.push(rel);
         // Best-effort byte counter for the launch banner. Walks dest after copy.
         try {
           const stack = [d];
@@ -989,8 +990,10 @@ function cloneRefreshMaxAgeMs(env = process.env) {
  * whatever the copy would leave stale beside a replaced file is removed first:
  * every -wal/-shm/-journal of each DB being replaced (SQLite would replay an
  * old -wal onto the new DB), and each storage dir that is replaced (LevelDB
- * would replay old .log files). If a replaced DB fails to copy, the result is
- * not a refresh and `snapshotAt` stays, so the next launch tries again.
+ * would replay old .log files). If a replaced DB or storage dir fails to
+ * copy, the result is INCOMPLETE (logged): a failed DB is left old but
+ * consistent (its sidecars removed), and `snapshotAt` still advances so a
+ * persistent failure does not re-seed the clone at every launch.
  * When the base did change, sign-ins made only inside the clone since its
  * last seed ARE replaced by the base's (they would be lost when the clone
  * ends anyway, but a refresh loses them sooner).
@@ -1060,26 +1063,34 @@ function refreshStaleClone(opts) {
   }
   const dirs = SNAPSHOT_DIRS.slice();
   if (includeIndexedDB) dirs.push("Default/IndexedDB");
+  const replacedDirs = [];
   for (const rel of dirs) {
-    if (!has(baseDir, rel) || !has(cloneDir, rel)) continue;
+    if (!has(baseDir, rel)) continue;
+    replacedDirs.push(rel);
+    if (!has(cloneDir, rel)) continue;
     try { fs.rmSync(path.join(cloneDir, rel), { recursive: true, force: true }); cleared++; } catch { /* copy still runs */ }
   }
   const copiedRels = [];
   const files = snapshotCookiesFrom(baseDir, cloneDir, { excludeLoginData, _copied: copiedRels });
-  const dirRes = snapshotDirsFrom(baseDir, cloneDir, { includeIndexedDB });
-  const missed = replaced.filter((rel) => !copiedRels.includes(rel));
+  const dirRes = snapshotDirsFrom(baseDir, cloneDir, { includeIndexedDB, _copied: copiedRels });
+  const missedDbs = replaced.filter((rel) => !copiedRels.includes(rel));
+  const missedDirs = replacedDirs.filter((rel) => !copiedRels.includes(rel));
   const counts = `copied ${files}/${SNAPSHOT_FILES.length} files + ${dirRes.copied}/${dirRes.total} storage dirs, cleared ${cleared} stale`;
-  if (missed.length > 0) {
+  if (missedDbs.length + missedDirs.length > 0) {
     // The base's -wal may have copied beside the clone's OLD DB: drop it, so
-    // the old DB is left on its own. Not a refresh: the snapshot time stays,
-    // so the next launch tries again.
-    for (const rel of missed) {
+    // the old DB is left on its own (old but consistent). A storage dir that
+    // failed is left as far as it got (possibly absent). The snapshot time
+    // still ADVANCES: a failure that persists must not re-seed the clone at
+    // every launch, overwriting sign-ins made in it between launches; the
+    // next attempt comes after the next base change past the limit.
+    for (const rel of missedDbs) {
       for (const suffix of ["-wal", "-shm", "-journal"]) {
         try { fs.rmSync(path.join(cloneDir, rel + suffix), { force: true }); } catch { /* best-effort */ }
       }
     }
-    log(`[mcp-relay] session clone refresh of ${path.basename(cloneDir)} INCOMPLETE: ${missed.length} DB(s) failed to copy (${missed.map((r) => path.basename(r)).join(", ")}); ${counts}\n`);
-    return keep("copy failed");
+    const names = [...missedDbs, ...missedDirs].map((r) => path.basename(r)).join(", ");
+    log(`[mcp-relay] session clone refresh of ${path.basename(cloneDir)} INCOMPLETE: ${missedDbs.length} DB(s) and ${missedDirs.length} storage dir(s) failed to copy (${names}); ${counts}\n`);
+    return { refreshed: false, reason: "incomplete", snapshotAt: now };
   }
   log(
     `[mcp-relay] refreshed session clone ${path.basename(cloneDir)} from ${path.basename(baseDir)}: ` +
