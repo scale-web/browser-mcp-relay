@@ -31,7 +31,14 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const MARKER = "/*A1: session page opened in the background*/";
+// The helper's version. Bump it whenever HELPER_SOURCE changes: a bundle
+// patched with a LOWER version gets the new helper; an equal or HIGHER one is
+// left alone, so a relay still running an older copy of this script never
+// writes the shared bundle back to its older helper. (The first build's
+// marker had no version: it reads as v1.)
+const HELPER_VERSION = 2;
+const MARKER = `/*A1: session page opened in the background v${HELPER_VERSION}*/`;
+const MARKER_RE = /\/\*A1: session page opened in the background(?: v(\d+))?\*\//;
 const HELPER_NAME = "__relayQuietNewPage";
 
 // createToolSessionContext's page: `async function newPage(browserContext,pageOptions={}){return await browserContext.newPage()}`
@@ -69,7 +76,7 @@ const HELPER_SOURCE = `async function ${HELPER_NAME}(browserContext,timeoutMs=10
 
 function patchSource(content) {
   if (typeof content !== "string") return null;
-  if (content.includes(MARKER)) return null;
+  if (MARKER_RE.test(content)) return null;
   const fnHits = content.match(MATCH_NEW_PAGE_FN);
   const ensureHits = content.match(MATCH_ENSURE_PAGE);
   if (!fnHits || fnHits.length !== 1 || !ensureHits || ensureHits.length !== 1) return null;
@@ -97,7 +104,7 @@ function findSessionFile(opts = {}) {
 }
 
 /**
- * Returns { patched: true, file, action: "applied" | "updated" | "already" } or
+ * Returns { patched: true, file, action: "applied" | "updated" | "already" | "newer" } or
  * { patched: false, reason } (safe no-op; the caller logs it loudly).
  */
 function applyPatch(opts = {}) {
@@ -109,14 +116,14 @@ function applyPatch(opts = {}) {
   catch (e) { return { patched: false, reason: `read failed: ${e.message}` }; }
   let out;
   let action = "applied";
-  const at = content.indexOf(MARKER);
-  if (at !== -1) {
-    // Patched before. The helper is everything after the marker: when this
-    // script's helper has changed since, replace it (the call sites already
-    // point at it by name), so a fix to the helper reaches a patched bundle.
-    const current = `${content.slice(0, at)}${MARKER}\n${HELPER_SOURCE}\n`;
-    if (current === content) return { patched: true, file, action: "already" };
-    out = current;
+  const found = MARKER_RE.exec(content);
+  if (found) {
+    // Patched before. The helper is everything after the marker; the call
+    // sites already point at it by name. Replace it only with a NEWER version.
+    const version = found[1] ? Number(found[1]) : 1;
+    if (version > HELPER_VERSION) return { patched: true, file, action: "newer", version };
+    if (version === HELPER_VERSION) return { patched: true, file, action: "already" };
+    out = `${content.slice(0, found.index)}${MARKER}\n${HELPER_SOURCE}\n`;
     action = "updated";
   } else {
     out = patchSource(content);
@@ -136,7 +143,7 @@ function applyPatch(opts = {}) {
   return { patched: true, file, action };
 }
 
-module.exports = { MARKER, HELPER_NAME, HELPER_SOURCE, MATCH_NEW_PAGE_FN, MATCH_ENSURE_PAGE, patchSource, findSessionFile, applyPatch };
+module.exports = { HELPER_VERSION, MARKER, MARKER_RE, HELPER_NAME, HELPER_SOURCE, MATCH_NEW_PAGE_FN, MATCH_ENSURE_PAGE, patchSource, findSessionFile, applyPatch };
 
 if (require.main === module) {
   const result = applyPatch();

@@ -65,17 +65,33 @@ test("A1: applyPatch on a fixture distDir applies atomically, then reports alrea
   }
 });
 
-test("A1: applyPatch replaces an OLDER helper in an already-patched bundle, and only the helper", () => {
+test("A1: applyPatch replaces a LOWER-version helper (and only the helper), never an equal or HIGHER one", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "a1-patch-"));
   try {
     const file = path.join(dir, "core-TEST1234.js");
     const current = patcher.patchSource(`function createToolSessionContext(){}${SHAPE}`);
     const head = current.slice(0, current.indexOf(patcher.MARKER));
-    fs.writeFileSync(file, `${head}${patcher.MARKER}\nasync function ${patcher.HELPER_NAME}(c){return c.newPage()}\n`);
+    const oldHelper = `async function ${patcher.HELPER_NAME}(c){return c.newPage()}`;
+    const v = patcher.HELPER_VERSION;
+    // Lower: the first build's unversioned marker (v1), and an explicit v(N-1).
+    for (const oldMarker of ["/*A1: session page opened in the background*/", `/*A1: session page opened in the background v${v - 1}*/`]) {
+      fs.writeFileSync(file, `${head}${oldMarker}\n${oldHelper}\n`);
+      const r = patcher.applyPatch({ distDir: dir, log: () => {} });
+      assert.deepStrictEqual([r.patched, r.action], [true, "updated"], oldMarker);
+      assert.strictEqual(fs.readFileSync(file, "utf8"), current, "the bundle must carry exactly the current helper");
+      assert.strictEqual(patcher.applyPatch({ distDir: dir, log: () => {} }).action, "already");
+    }
+    // Higher: a newer relay patched it; this (older) script must not write it back.
+    const newer = `${head}/*A1: session page opened in the background v${v + 1}*/\nasync function ${patcher.HELPER_NAME}(c){return "newer"}\n`;
+    fs.writeFileSync(file, newer);
     const r = patcher.applyPatch({ distDir: dir, log: () => {} });
-    assert.deepStrictEqual([r.patched, r.action], [true, "updated"]);
-    assert.strictEqual(fs.readFileSync(file, "utf8"), current, "the bundle must carry exactly the current helper");
+    assert.deepStrictEqual([r.patched, r.action, r.version], [true, "newer", v + 1]);
+    assert.strictEqual(fs.readFileSync(file, "utf8"), newer, "a newer helper must be left as it is");
+    // Equal version with different text: left alone too (a version bump is what replaces).
+    const same = `${head}${patcher.MARKER}\n${oldHelper}\n`;
+    fs.writeFileSync(file, same);
     assert.strictEqual(patcher.applyPatch({ distDir: dir, log: () => {} }).action, "already");
+    assert.strictEqual(fs.readFileSync(file, "utf8"), same);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
