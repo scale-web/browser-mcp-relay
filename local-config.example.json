@@ -31,5 +31,8 @@
   "_BROWSER_RELAY_VAULT_FILES_doc": "Optional: semicolon-separated absolute paths to Brave/Chrome password CSV exports (header: name,url,username,password,note). Enables autofill on login forms. Loaded into memory only — never logged or re-written. Only point this at CSVs you trust. Default: empty (autofill disabled).",
 
   "BROWSER_RELAY_SNAPSHOT_INDEXEDDB": "false",
-  "_BROWSER_RELAY_SNAPSHOT_INDEXEDDB_doc": "Optional: include IndexedDB in the cookie-source snapshot (pool mode only). Default false because IndexedDB is typically 100+ MB across 1000+ files."
+  "_BROWSER_RELAY_SNAPSHOT_INDEXEDDB_doc": "Optional: include IndexedDB in the cookie-source snapshot (pool mode only). Default false because IndexedDB is typically 100+ MB across 1000+ files.",
+
+  "BROWSER_RELAY_CLONE_REFRESH_HOURS": "",
+  "_BROWSER_RELAY_CLONE_REFRESH_HOURS_doc": "Optional: before launching a new Brave on a session clone whose last seed from the base profile is older than this many hours, re-seed it from the base. Default 12; 0 disables."
 }

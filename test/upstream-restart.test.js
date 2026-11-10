@@ -603,3 +603,54 @@ test("A1: the quiet-page patch runs before EVERY upstream spawn, on the bundle a
     await r.stop();
   }
 });
+
+test("clone refresh: a CLONE relay checks its clone before EVERY Brave launch, carrying the refreshed snapshot time; a base relay never does", T, async () => {
+  const r = await startRelay({ clone: true, extraEnv: { BROWSER_RELAY_CLONE_REFRESH_HOURS: "5" } });
+  try {
+    const t0 = Date.now();
+    await r.call();
+    await r.killBrave();
+    await r.call();
+    const lines = r.stderr().split("\n");
+    const checks = lines.filter((l) => l.startsWith("HARNESS clone-refresh "));
+    assert.strictEqual(checks.length, 2, `one check per launch:\n${r.stderr()}`);
+    const field = (l, k) => l.match(new RegExp(`${k}=(\\S+)`))[1];
+    assert.strictEqual(field(checks[0], "cloneDir"), path.join(r.dir, "clone"));
+    assert.strictEqual(field(checks[0], "baseDir"), path.join(r.dir, "profile"));
+    assert.strictEqual(field(checks[0], "maxAgeMs"), String(5 * 3_600_000), "the limit comes from the relay env (local-config overlay)");
+    const first = Number(field(checks[0], "snapshotAt"));
+    assert.ok(first <= t0 && first > t0 - 60_000, "first launch: the start snapshot's time");
+    assert.strictEqual(field(checks[1], "snapshotAt"), "12345", "a refresh's new snapshot time is used next time");
+    // Each check comes BEFORE its launch (no Brave runs on the clone yet).
+    const idx = (re, from = 0) => lines.findIndex((l, i) => i >= from && re.test(l));
+    const c1 = idx(/^HARNESS clone-refresh /);
+    const l1 = idx(/Brave ready/);
+    const c2 = idx(/^HARNESS clone-refresh /, c1 + 1);
+    const l2 = idx(/Brave ready/, l1 + 1);
+    assert.ok(c1 < l1 && l1 < c2 && c2 < l2, "check → launch → check → launch");
+  } finally {
+    await r.stop();
+  }
+  const base = await startRelay();
+  try {
+    await base.call();
+    await base.killBrave();
+    await base.call();
+    assert.doesNotMatch(base.stderr(), /HARNESS clone-refresh/);
+  } finally {
+    await base.stop();
+  }
+});
+
+test("clone refresh: attaching to a Brave already running on the clone never refreshes it", T, async () => {
+  const ws = "ws://127.0.0.1:10040/devtools/browser/abcdefab-0000-0000-0000-000000000040";
+  const r = await startRelay({ clone: true, attachable: { pid: 1, port: 10040, wsEndpoint: ws } });
+  try {
+    const res = await r.call();
+    assert.strictEqual(res.isError, false, res.text);
+    assert.match(r.stderr(), /attaching, tabs preserved/);
+    assert.doesNotMatch(r.stderr(), /HARNESS clone-refresh/);
+  } finally {
+    await r.stop();
+  }
+});

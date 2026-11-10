@@ -217,6 +217,11 @@ async function main() {
   );
 
   // 2. Profile snapshot from source (skipped in standalone mode — sourceProfile is null).
+  const includeIndexedDB = RELAY_ENV.BROWSER_RELAY_SNAPSHOT_INDEXEDDB === "true";
+  // A clone's snapshot time: ensureBrave re-seeds the clone from its base
+  // before launching a new Brave on it once this is older than the limit
+  // (pool-shared refreshStaleClone; the relay can outlive many Braves).
+  let cloneSnapshotAt = Date.now();
   if (src && fs.existsSync(src)) {
     if (!ephemeral && ageDays !== null && ageDays > pool.CONFIG.cookieFreshnessWarnDays) {
       process.stderr.write(
@@ -231,7 +236,6 @@ async function main() {
     // Directory snapshots (Local Storage, Session Storage, optional IndexedDB).
     // Many SPAs store auth tokens in localStorage rather than cookies, so this
     // is what makes Discord/Slack/Linear/Notion/Mercury sessions work.
-    const includeIndexedDB = RELAY_ENV.BROWSER_RELAY_SNAPSHOT_INDEXEDDB === "true";
     const dirRes = pool.snapshotDirsFrom(src, dir, { includeIndexedDB });
     if (dirRes.total > 0) {
       process.stderr.write(
@@ -677,6 +681,25 @@ async function main() {
           }
         } catch (reapErr) {
           process.stderr.write(`[mcp-relay] pre-launch reap failed (continuing): ${reapErr.message}\n`);
+        }
+        // A clone seeded long ago lacks sign-ins made in the base since then
+        // (2026-11-10: 3.8 days, a GHL sign-in wall). No Brave of ours runs on
+        // it here; refreshStaleClone re-checks that and fails closed.
+        // Best-effort: on any failure this Brave launches on the clone as is.
+        if (mode === "clone") {
+          try {
+            const r = pool.refreshStaleClone({
+              cloneDir: dir,
+              baseDir,
+              snapshotAt: cloneSnapshotAt,
+              maxAgeMs: pool.cloneRefreshMaxAgeMs(RELAY_ENV),
+              excludeLoginData: plain,
+              includeIndexedDB,
+            });
+            cloneSnapshotAt = r.snapshotAt;
+          } catch (e) {
+            process.stderr.write(`[mcp-relay] session clone refresh failed (launching on the clone as is): ${e.message}\n`);
+          }
         }
         const extensionPath = launchInputs.extensionPath;
         // V0-1/V0-2: launchBrave resolves with a live Brave subprocess +

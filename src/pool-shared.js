@@ -953,8 +953,113 @@ function snapshotDirsFrom(srcProfile, dstProfile, { includeIndexedDB = false } =
   return { copied, total: dirs.length, bytes, elapsedMs: Date.now() - t0 };
 }
 
+// ───────────────────────── Clone refresh ─────────────────────────────
+//
+// A session clone is seeded from its base profile once, at relay start, but a
+// relay can live for days: the idle reaper (or a crash) closes its Brave and
+// the next tool call launches a new Brave on the same clone. Measured
+// 2026-11-10: a clone seeded 3.8 days earlier lacked a GHL sign-in made in the
+// base the day before, and the session hit a sign-in wall. So when a NEW Brave
+// is about to launch on a clone whose snapshot is older than this, the clone
+// is re-seeded from the base first. Hours; BROWSER_RELAY_CLONE_REFRESH_HOURS
+// (env or local-config.json) overrides it, 0 disables.
+const CLONE_REFRESH_HOURS = 12;
+
+/** The clone refresh age limit in ms from `env` (RELAY_ENV), or 0 = never. */
+function cloneRefreshMaxAgeMs(env = process.env) {
+  const raw = env.BROWSER_RELAY_CLONE_REFRESH_HOURS;
+  const hours = raw === undefined || raw === "" ? CLONE_REFRESH_HOURS : Number(raw);
+  if (!Number.isFinite(hours) || hours < 0) return CLONE_REFRESH_HOURS * 3_600_000;
+  return hours * 3_600_000;
+}
+
+/**
+ * Re-seed session clone `cloneDir` from `baseDir` when its last snapshot
+ * (`snapshotAt`, ms) is older than `maxAgeMs`. Call only where no Brave of
+ * this relay runs on the clone (ensureBrave's launch path, after the
+ * pre-launch reap); it also refuses, fail-closed, if a live Brave holds the
+ * clone or the process list cannot be read. The base may be live: the copy
+ * is the same one the start snapshot makes.
+ *
+ * Unlike the start snapshot, the clone already has a profile of its own, so
+ * whatever the copy would leave stale beside a replaced file is removed first:
+ * a main DB's -wal/-shm/-journal that the base does not supply (SQLite would
+ * replay an old -wal onto the new DB), and each storage dir that is replaced
+ * (LevelDB would replay old .log files). Sign-ins made inside the clone since
+ * its last snapshot are replaced by the base's, as they would be lost when
+ * the clone ends anyway.
+ *
+ * Logs one line per refresh: age, limit, counts (names only, no contents).
+ *
+ * @returns {{ refreshed: boolean, reason: string, snapshotAt: number }}
+ */
+function refreshStaleClone(opts) {
+  const {
+    cloneDir, baseDir, snapshotAt, maxAgeMs,
+    excludeLoginData = false, includeIndexedDB = false,
+  } = opts;
+  const now = opts._now ?? Date.now();
+  const log = opts.log || ((m) => process.stderr.write(m));
+  const keep = (reason) => ({ refreshed: false, reason, snapshotAt });
+  if (!(maxAgeMs > 0)) return keep("disabled");
+  const ageMs = now - snapshotAt;
+  if (!(ageMs >= maxAgeMs)) return keep("fresh");
+  if (!baseDir || !fs.existsSync(baseDir)) return keep("base missing");
+  // Never while a Brave runs on the clone. The process probe must SUCCEED:
+  // an unreadable process list is not "no Brave".
+  const platform = opts._platform || process.platform;
+  const spawn = opts._spawnSync || require("node:child_process").spawnSync;
+  let probeOk = true;
+  const recorded = (...a) => {
+    const r = spawn(...a);
+    if (!r || r.status !== 0) probeOk = false;
+    return r;
+  };
+  const braves = processShim.listProcessesByCommand(braveNeedle(platform), { ...opts, _spawnSync: recorded });
+  if (!probeOk) {
+    log(`[mcp-relay] session clone refresh skipped for ${path.basename(cloneDir)}: process list unavailable\n`);
+    return keep("process list unavailable");
+  }
+  if (braves.some((p) => commandHasUserDataDir(p.command, cloneDir))) {
+    log(`[mcp-relay] session clone refresh skipped for ${path.basename(cloneDir)}: a live Brave holds it\n`);
+    return keep("live Brave holds the clone");
+  }
+
+  const has = (root, rel) => fs.existsSync(path.join(root, rel));
+  const listed = new Set(SNAPSHOT_FILES);
+  let cleared = 0;
+  for (const rel of SNAPSHOT_FILES) {
+    if (/-(wal|shm|journal)$/.test(rel)) continue;
+    if (excludeLoginData && plainflagsMode.isLoginDataPath(rel)) continue;
+    if (!has(baseDir, rel)) continue; // this DB is not replaced
+    for (const suffix of ["-wal", "-shm", "-journal"]) {
+      const side = rel + suffix;
+      if (listed.has(side) && has(baseDir, side)) continue; // the copy overwrites it
+      if (!has(cloneDir, side)) continue;
+      try { fs.rmSync(path.join(cloneDir, side), { force: true }); cleared++; } catch { /* copy still runs */ }
+    }
+  }
+  const dirs = SNAPSHOT_DIRS.slice();
+  if (includeIndexedDB) dirs.push("Default/IndexedDB");
+  for (const rel of dirs) {
+    if (!has(baseDir, rel) || !has(cloneDir, rel)) continue;
+    try { fs.rmSync(path.join(cloneDir, rel), { recursive: true, force: true }); cleared++; } catch { /* copy still runs */ }
+  }
+  const files = snapshotCookiesFrom(baseDir, cloneDir, { excludeLoginData });
+  const dirRes = snapshotDirsFrom(baseDir, cloneDir, { includeIndexedDB });
+  log(
+    `[mcp-relay] refreshed session clone ${path.basename(cloneDir)} from ${path.basename(baseDir)}: ` +
+    `snapshot age ${(ageMs / 3_600_000).toFixed(1)}h > limit ${(maxAgeMs / 3_600_000).toFixed(1)}h; ` +
+    `copied ${files}/${SNAPSHOT_FILES.length} files + ${dirRes.copied}/${dirRes.total} storage dirs, cleared ${cleared} stale\n`,
+  );
+  return { refreshed: true, reason: "refreshed", snapshotAt: now };
+}
+
 module.exports = {
   CONFIG,
+  CLONE_REFRESH_HOURS,
+  cloneRefreshMaxAgeMs,
+  refreshStaleClone,
   COOKIE_FILES,
   SNAPSHOT_FILES,
   SNAPSHOT_DIRS,

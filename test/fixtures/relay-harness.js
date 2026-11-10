@@ -144,6 +144,13 @@ stubModule(path.join(SRC, "pool-shared.js"), {
     : { dir: path.join(dir, "profile"), lock: null, role: "default",
       release: () => { log("pool-released"); }, ephemeral: false, baseDir: null }),
   gcSessionClones: () => 0,
+  // Clone refresh: logs what ensureBrave passed; "refreshes" with a sentinel
+  // snapshot time so a test can see it carried into the next launch.
+  cloneRefreshMaxAgeMs: (env) => Number(env.BROWSER_RELAY_CLONE_REFRESH_HOURS || 12) * 3_600_000,
+  refreshStaleClone: (o) => {
+    log(`clone-refresh cloneDir=${o.cloneDir} baseDir=${o.baseDir} snapshotAt=${o.snapshotAt} maxAgeMs=${o.maxAgeMs}`);
+    return { refreshed: true, reason: "refreshed", snapshotAt: 12345 };
+  },
   findBraveMainPid: () => null,
   sessionClonesRoot: () => path.join(dir, "clones"),
   userCacheRoot: () => path.join(dir, "cache"),
