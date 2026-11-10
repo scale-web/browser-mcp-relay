@@ -390,6 +390,10 @@ async function main() {
     // On a failed attach BDMCP otherwise runs `open -a "Google Chrome"
     // chrome://inspect/...` in the user's own Chrome.
     upstreamEnv.BROWSER_CDP_OPEN_INSPECT = "false";
+    // Upstream sends PostHog usage telemetry unless TELEMETRY_ENABLE is "false" (its telemetry init:
+    // `process.env.TELEMETRY_ENABLE!=="false"`). Sessions here work in client accounts, so it is always off,
+    // whatever the relay's own environment says (ask as-ops/ask-3prlrq).
+    upstreamEnv.TELEMETRY_ENABLE = "false";
 
     const child = spawn(process.execPath, [bdmcpEntry, "--cursor-mcp-server"], {
       stdio: ["pipe", "pipe", "inherit"],

@@ -266,7 +266,8 @@ test("§1b: the tools/list child carries the unreachable placeholder and the fir
 });
 
 test("§1b/§1e: the pre-Brave child gets the unreachable ws placeholder, no chrome://inspect side effect, no messaging env", T, async () => {
-  const r = await startRelay({ extraEnv: { CLAUDE_CODE_MESSAGING_TOKEN: "fake-token", CLAUDE_CODE_MESSAGING_SOCKET: "/tmp/fake.sock" } });
+  const r = await startRelay({ extraEnv: { CLAUDE_CODE_MESSAGING_TOKEN: "fake-token", CLAUDE_CODE_MESSAGING_SOCKET: "/tmp/fake.sock",
+                                           TELEMETRY_ENABLE: "true" } });
   try {
     await r.request("tools/list", {});
     const res = await r.call();
@@ -278,6 +279,7 @@ test("§1b/§1e: the pre-Brave child gets the unreachable ws placeholder, no chr
     for (const e of envs) {
       assert.strictEqual(e.openInspect, "false", "a failed attach must not open chrome://inspect in the user's Chrome");
       assert.deepStrictEqual(e.messagingKeys, [], "CLAUDE_CODE_MESSAGING_* must not reach the upstream child");
+      assert.strictEqual(e.telemetry, "false", "upstream telemetry is always off, even when the relay's env says true");
     }
   } finally {
     await r.stop();

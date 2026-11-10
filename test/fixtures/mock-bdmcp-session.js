@@ -20,6 +20,7 @@ fs.appendFileSync(path.join(dir, "upstream-env"), JSON.stringify({
   pid: process.pid,
   endpoint: process.env.BROWSER_CDP_ENDPOINT_URL || null,
   openInspect: process.env.BROWSER_CDP_OPEN_INSPECT || null,
+  telemetry: process.env.TELEMETRY_ENABLE === undefined ? null : process.env.TELEMETRY_ENABLE,
   messagingKeys: Object.keys(process.env).filter((k) => k.startsWith("CLAUDE_CODE_MESSAGING_")),
 }) + "\n");
 // $HARNESS_DIR/upstream-connects: hold a TCP connection to the endpoint's
