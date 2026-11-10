@@ -221,8 +221,10 @@ async function main() {
       process.stderr.write(`[test-harness] could not remove temp HOME ${home}: ${e.message}\n`);
       exitCode = exitCode || 5;
     }
+    // Here, not after the try: the refusal's early `return` skipped a
+    // trailing assignment, so a refused run exited 0 and read as green.
+    process.exitCode = exitCode;
   }
-  process.exitCode = exitCode;
 }
 
 if (require.main === module) {
