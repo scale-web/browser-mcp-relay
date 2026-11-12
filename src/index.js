@@ -900,7 +900,11 @@ async function main() {
   // with a small custom BROWSER_RELAY_IDLE_MINUTES would otherwise get its
   // Brave killed mid-flight).
   let inFlightRequests = 0;
-  function bumpActivity() { lastActivityAt = Date.now(); }
+  // Overlap-window log state (review r1 L2): an overlap hold is logged once per
+  // reason, and a failed lsof once, per idle period — activity starts a new one.
+  let lastOverlapHold = null;
+  let overlapLsofFailLogged = false;
+  function bumpActivity() { lastActivityAt = Date.now(); lastOverlapHold = null; overlapLsofFailLogged = false; }
 
   let reapLogFile = null;
   try { reapLogFile = path.join(pool.userCacheRoot(), REAP_LOG_NAME); } catch { /* no log */ }
@@ -941,7 +945,8 @@ async function main() {
         cdpClientCheckFailureLogged = true;
         process.stderr.write(`[mcp-relay] idle reaper: external-CDP-client check unavailable (${r.reason}); falling back to MCP-only idleness for such ticks (logged once)\n`);
       }
-      reapLog.write("lsof-failed", { reason: r.reason, idleS });
+      if (!failClosed || !overlapLsofFailLogged) reapLog.write("lsof-failed", { reason: r.reason, idleS });
+      if (failClosed) overlapLsofFailLogged = true;
       endReapHold("lsof-failed");
       return failClosed;
     }
@@ -997,22 +1002,22 @@ async function main() {
     const overlapMs = (Number.isFinite(overlapMinutes) && overlapMinutes > 0 && overlapMinutes * 60_000 < idleMs)
       ? overlapMinutes * 60_000
       : null;
-    let lastOverlapHold = null; // log an overlap hold once per reason, not every tick
     /** null = no early reap; else { others } — another relay Brave is alive and nothing holds. */
     async function overlapReapAllowed() {
       if (!bridge) return null; // an upstream-only relay waits for the full window
       const o = await otherRelayBraves({ cacheRoot, ownDir: dir, ownPid: sidecar.data.bravePid, timeoutMs: 2000 });
-      if (!o.ok || o.pids.length === 0) { lastOverlapHold = null; return null; }
+      const held = (reason, fields) => {
+        if (lastOverlapHold === reason) return null;
+        lastOverlapHold = reason;
+        reapLog.write("overlap-held", { reason, ...fields, idleS: idleSeconds() });
+        return null;
+      };
+      if (!o.ok) return held("ps-failed", { detail: o.reason });
+      if (o.pids.length === 0) { lastOverlapHold = null; return null; }
       const b = bridge;
       if (!b) return null;
       const h = await signInHold(b.context, { timeoutMs: 4000 });
-      if (h.hold) {
-        if (lastOverlapHold !== h.reason) {
-          lastOverlapHold = h.reason;
-          reapLog.write("overlap-held", { reason: h.reason, host: h.host || null, others: o.pids.length, idleS: idleSeconds() });
-        }
-        return null;
-      }
+      if (h.hold) return held(h.reason, { host: h.host || null, others: o.pids.length });
       lastOverlapHold = null;
       if (await reapHeld(idleMs, { failClosed: true })) return null;
       return { others: o.pids.length };
