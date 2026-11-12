@@ -81,12 +81,25 @@ function fakeBrave(port, attached, wsEndpoint) {
   context.browser = () => browser;
   context.close = async () => { context.emit("close"); };
   // $HARNESS_DIR/fake-pages = JSON array of URLs: the tabs this Brave has
-  // (tabs_select needs some). Default: none.
+  // (tabs_select needs some). Default: none. An entry may instead be
+  // {url, secret, throws, hang, frameUrls}: its main frame's evaluate() (the
+  // overlap reaper's secret-field probe) returns `secret`, throws, or never
+  // settles; frameUrls adds child frames with those URLs.
   let pages = [];
   try {
-    pages = JSON.parse(fs.readFileSync(path.join(dir, "fake-pages"), "utf8")).map((u) => Object.assign(new EventEmitter(), {
-      url: () => u, isClosed: () => false, bringToFront: async () => {},
-    }));
+    pages = JSON.parse(fs.readFileSync(path.join(dir, "fake-pages"), "utf8")).map((entry) => {
+      const spec = typeof entry === "string" ? { url: entry } : entry;
+      const evaluate = async () => {
+        if (spec.hang) await new Promise(() => {});
+        if (spec.throws) throw new Error("harness: frame unreadable");
+        return !!spec.secret;
+      };
+      const frames = [{ url: () => spec.url, evaluate },
+        ...(spec.frameUrls || []).map((fu) => ({ url: () => fu, evaluate: async () => false }))];
+      return Object.assign(new EventEmitter(), {
+        url: () => spec.url, isClosed: () => false, bringToFront: async () => {}, frames: () => frames,
+      });
+    });
   } catch { /* none */ }
   context.pages = () => pages;
   const handle = { context, cdpConnectUrl: `http://127.0.0.1:${port}`, port, wsEndpoint, id };
@@ -191,6 +204,27 @@ if (lsofBin) {
   stubModule(path.join(SRC, "cdp-clients.js"), {
     ...realCdpClients,
     listExternalCdpClients: (opts) => realCdpClients.listExternalCdpClients({ ...opts, _lsofPath: lsofBin }),
+  });
+}
+
+// $HARNESS_DIR/ps-overlap = text: the overlap reaper's `ps -axww` returns that
+// text (re-read on every call) — the real parser in src/overlap-reap.js runs
+// on it. $HARNESS_DIR/ps-overlap-fail: that ps fails. Neither file: the real
+// ps runs (and finds nothing under $HARNESS_DIR/cache).
+{
+  const realOverlap = require(path.join(SRC, "overlap-reap.js"));
+  const psFile = path.join(dir, "ps-overlap");
+  const failFile = path.join(dir, "ps-overlap-fail");
+  stubModule(path.join(SRC, "overlap-reap.js"), {
+    ...realOverlap,
+    otherRelayBraves: (opts) => {
+      fs.appendFileSync(path.join(dir, "ps-overlap-calls"), "1\n");
+      if (fs.existsSync(failFile)) {
+        return realOverlap.otherRelayBraves({ ...opts, _execFile: (c, a, o, cb) => cb(Object.assign(new Error("harness ps failed"), { code: "EHARNESS" }), "", "") });
+      }
+      if (!fs.existsSync(psFile)) return realOverlap.otherRelayBraves(opts);
+      return realOverlap.otherRelayBraves({ ...opts, _execFile: (c, a, o, cb) => cb(null, fs.readFileSync(psFile, "utf8"), "") });
+    },
   });
 }
 

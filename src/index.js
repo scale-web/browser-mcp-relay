@@ -46,6 +46,7 @@ const { loadVaultFromEnv } = require("./vault.js");
 const { attachAutofill } = require("./autofill-injector.js");
 const { listExternalCdpClients } = require("./cdp-clients.js");
 const { freshKeepaliveAgeMs, ReapLog, REAP_LOG_NAME, KEEPALIVE_NAME } = require("./reap-hold.js");
+const { otherRelayBraves, signInHold } = require("./overlap-reap.js");
 // Spec v8 §5.6 (phase 1c): the plain-flags launch profile.
 const plainflagsMode = require("./plainflags-mode.js");
 const { createSigninLoader, SIGNIN_FILE } = require("./plainflags-signin.js");
@@ -917,8 +918,9 @@ async function main() {
   let cdpClientCheckFailureLogged = false;
   /** True when the reap must be skipped: a fresh keep-alive file, or a foreign
    *  process holding an ESTABLISHED CDP connection to the current Brave (both
-   *  bump activity). False when neither, or the CDP check failed. */
-  async function reapHeld(idleMs) {
+   *  bump activity). False when neither, or the CDP check failed — unless
+   *  `failClosed` (the overlap reap): then a failed check holds. */
+  async function reapHeld(idleMs, { failClosed = false } = {}) {
     const idleS = idleSeconds();
     const kaAge = freshKeepaliveAgeMs(dir, idleMs);
     if (kaAge !== null) {
@@ -941,7 +943,7 @@ async function main() {
       }
       reapLog.write("lsof-failed", { reason: r.reason, idleS });
       endReapHold("lsof-failed");
-      return false;
+      return failClosed;
     }
     if (r.clients.length === 0) { endReapHold("no-clients"); return false; }
     bumpActivity();
@@ -980,30 +982,80 @@ async function main() {
     : parseFloat(idleMinutesRaw);
   if (Number.isFinite(idleMinutes) && idleMinutes > 0) {
     const idleMs = idleMinutes * 60_000;
+    // Overlap window (2026-11-12, asks as-ops/ask-fr3yfn + ask-ocrmvy; see
+    // src/overlap-reap.js): a SHORTER idle window that applies only while
+    // another relay Brave is alive (replayd's one-connection-per-bundle-id
+    // loop) and no tab shows a sign-in page or a visible password /
+    // one-time-code field. Every full-window hold still applies (keep-alive
+    // within the FULL window, external CDP clients, in-flight calls), and any
+    // check that cannot answer holds. 0 / unparseable / >= the full window
+    // disables it.
+    const overlapMinutesRaw = RELAY_ENV.BROWSER_RELAY_OVERLAP_IDLE_MINUTES;
+    const overlapMinutes = (overlapMinutesRaw === undefined || overlapMinutesRaw === "")
+      ? 10
+      : parseFloat(overlapMinutesRaw);
+    const overlapMs = (Number.isFinite(overlapMinutes) && overlapMinutes > 0 && overlapMinutes * 60_000 < idleMs)
+      ? overlapMinutes * 60_000
+      : null;
+    let lastOverlapHold = null; // log an overlap hold once per reason, not every tick
+    /** null = no early reap; else { others } — another relay Brave is alive and nothing holds. */
+    async function overlapReapAllowed() {
+      if (!bridge) return null; // an upstream-only relay waits for the full window
+      const o = await otherRelayBraves({ cacheRoot, ownDir: dir, ownPid: sidecar.data.bravePid, timeoutMs: 2000 });
+      if (!o.ok || o.pids.length === 0) { lastOverlapHold = null; return null; }
+      const b = bridge;
+      if (!b) return null;
+      const h = await signInHold(b.context, { timeoutMs: 4000 });
+      if (h.hold) {
+        if (lastOverlapHold !== h.reason) {
+          lastOverlapHold = h.reason;
+          reapLog.write("overlap-held", { reason: h.reason, host: h.host || null, others: o.pids.length, idleS: idleSeconds() });
+        }
+        return null;
+      }
+      lastOverlapHold = null;
+      if (await reapHeld(idleMs, { failClosed: true })) return null;
+      return { others: o.pids.length };
+    }
     // One check at a time: a slow lsof must not stack ticks (or lsofs).
     let reapCheckRunning = false;
     const tick = setInterval(async () => {
       if (reapCheckRunning) return;
       if (inFlightRequests > 0) return;
-      if (Date.now() - lastActivityAt < idleMs) return;
+      if (Date.now() - lastActivityAt < (overlapMs || idleMs)) return;
       if (!bridge && !upstreamChild) return;
       reapCheckRunning = true;
+      let overlap = null;
+      let overlapPath = false;
       try {
-        if (await reapHeld(idleMs)) return;
+        if (Date.now() - lastActivityAt < idleMs) {
+          overlapPath = true;
+          overlap = await overlapReapAllowed();
+          if (!overlap) return;
+        } else if (await reapHeld(idleMs)) return;
       } catch (e) {
         process.stderr.write(`[mcp-relay] idle reaper: hold check threw: ${e.message}\n`);
+        if (overlapPath) return; // the overlap path fails closed; the full window keeps its old fall-through
       } finally {
         reapCheckRunning = false;
       }
       // A call may have started or finished while lsof ran.
       if (inFlightRequests > 0) return;
-      if (Date.now() - lastActivityAt < idleMs) return;
+      if (Date.now() - lastActivityAt < (overlap ? overlapMs : idleMs)) return;
       if (!bridge && !upstreamChild) return;
+      if (overlap && !bridge) return;
       endReapHold("reaped"); // defensive: every path that lets a reap through has already released
-      reapLog.write("reaped", { idleS: idleSeconds() });
-      process.stderr.write(
-        `[mcp-relay] idle ${idleMinutes}min — reaping Brave + upstream to reclaim RAM (both relaunch on next tool call; logins persist)\n`,
-      );
+      if (overlap) {
+        reapLog.write("reaped-overlap", { idleS: idleSeconds(), others: overlap.others });
+        process.stderr.write(
+          `[mcp-relay] idle ${overlapMinutes}min while ${overlap.others} other relay Brave(s) are open — reaping Brave + upstream (macOS replayd loops on 2+ Braves; both relaunch on next tool call; logins persist)\n`,
+        );
+      } else {
+        reapLog.write("reaped", { idleS: idleSeconds() });
+        process.stderr.write(
+          `[mcp-relay] idle ${idleMinutes}min — reaping Brave + upstream to reclaim RAM (both relaunch on next tool call; logins persist)\n`,
+        );
+      }
       // Upstream FIRST: if it happened to exit on its own while we awaited
       // the Brave close, its exit handler would still see itself as the
       // current child and treat that as a fatal upstream death (full relay
@@ -1023,10 +1075,10 @@ async function main() {
       } catch (e) {
         process.stderr.write(`[mcp-relay] idle Brave reap failed: ${e.message}\n`);
       }
-    }, Math.min(60_000, idleMs));
+    }, Math.min(60_000, idleMs, overlapMs || Infinity));
     // unref: the reaper must never be what keeps the relay process alive.
     tick.unref();
-    process.stderr.write(`[mcp-relay] idle reaper armed (${idleMinutes}min)\n`);
+    process.stderr.write(`[mcp-relay] idle reaper armed (${idleMinutes}min${overlapMs ? `; ${overlapMinutes}min while another relay Brave is open` : ""})\n`);
   }
 
   // Expose getUpstream to own-tool handlers via globalThis. The tabs_new /
