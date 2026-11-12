@@ -904,7 +904,9 @@ async function main() {
   // reason, and a failed lsof once, per idle period — activity starts a new one.
   let lastOverlapHold = null;
   let overlapLsofFailLogged = false;
-  function bumpActivity() { lastActivityAt = Date.now(); lastOverlapHold = null; overlapLsofFailLogged = false; }
+  // Closed-shadow-root results per page URL for this idle period (review r2 LOW-2: the full-DOM CDP read).
+  const overlapClosedCache = new Map();
+  function bumpActivity() { lastActivityAt = Date.now(); lastOverlapHold = null; overlapLsofFailLogged = false; overlapClosedCache.clear(); }
 
   let reapLogFile = null;
   try { reapLogFile = path.join(pool.userCacheRoot(), REAP_LOG_NAME); } catch { /* no log */ }
@@ -1006,18 +1008,19 @@ async function main() {
     async function overlapReapAllowed() {
       if (!bridge) return null; // an upstream-only relay waits for the full window
       const o = await otherRelayBraves({ cacheRoot, ownDir: dir, ownPid: sidecar.data.bravePid, timeoutMs: 2000 });
-      const held = (reason, fields) => {
-        if (lastOverlapHold === reason) return null;
-        lastOverlapHold = reason;
-        reapLog.write("overlap-held", { reason, ...fields, idleS: idleSeconds() });
+      // `key` = what makes a hold "the same" for once-per-idle-period logging (reason, plus kind for a field).
+      const held = (key, fields) => {
+        if (lastOverlapHold === key) return null;
+        lastOverlapHold = key;
+        reapLog.write("overlap-held", { reason: key, ...fields, idleS: idleSeconds() });
         return null;
       };
       if (!o.ok) return held("ps-failed", { detail: o.reason });
       if (o.pids.length === 0) { lastOverlapHold = null; return null; }
       const b = bridge;
       if (!b) return null;
-      const h = await signInHold(b.context, { timeoutMs: 4000 });
-      if (h.hold) return held(h.reason, { host: h.host || null, others: o.pids.length });
+      const h = await signInHold(b.context, { timeoutMs: 4000, closedCache: overlapClosedCache });
+      if (h.hold) return held(h.kind ? `${h.reason}:${h.kind}` : h.reason, { reason: h.reason, kind: h.kind || null, host: h.host || null, others: o.pids.length });
       lastOverlapHold = null;
       if (await reapHeld(idleMs, { failClosed: true })) return null;
       return { others: o.pids.length };

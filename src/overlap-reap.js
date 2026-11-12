@@ -105,19 +105,31 @@ function otherRelayBraves({ cacheRoot, ownDir, ownPid, timeoutMs = 2000, _execFi
   }, timeoutMs, { ok: false, reason: "ps-timeout" });
 }
 
-// Runs in each frame's main world (review r1 M1/M2/L1). True when the frame
-// shows a field someone may be typing a secret into:
-//   - a VISIBLE password input, or a visible code box (autocomplete
-//     one-time-code; or a short text/tel/number input — maxlength 1..8 —
-//     whose name / id / label / placeholder reads like a code, or that asks
-//     for numeric entry: 2FA boxes often carry no autocomplete hint);
-//   - an email-first sign-in step: a password input (visible or not) in the
-//     same form / shadow root as a visible username or email input.
-// Inputs inside OPEN shadow roots are walked; CLOSED roots are covered by
-// closedRootSecret() over CDP. Visible = has layout boxes, a size above
-// 1×1 px, and passes checkVisibility (opacity / visibility).
+// Runs in each frame's main world. Returns the KIND of field someone may be
+// typing a secret into ("password" | "code" | "email-first"), or "" for none.
+// Review r2 (MEDIUM-1 false holds vs MEDIUM-2 missed 2FA boxes): strong signals
+// hold at any length, weak ones only on a short (maxlength 1..8) box that does
+// not read like an ordinary field:
+//   - password: a VISIBLE password input;
+//   - code: autocomplete one-time-code; a name / id / aria-label / placeholder /
+//     <label> text (camelCase split) with a strong word (otp, totp, mfa, 2fa,
+//     2sv, one time, passcode, two factor, 2 step, verification, verify,
+//     security / auth / authentication / sms / login / access code); a weak word
+//     (code, token, pin) on a short box with no ordinary-field word (zip,
+//     postal, country, currency, area, promo, discount, coupon, gift, voucher,
+//     referral, invite, hex, color, product, sku); or a run of 4+ visible
+//     maxlength=1 inputs under one parent (digit-per-box entry);
+//   - email-first: a visible email / username input in the same <form> (or the
+//     same shadow root) as any password input, visible or not.
+// Open shadow roots are walked; CLOSED roots are covered by closedRootSecret()
+// over CDP. Visible = layout boxes, > 1x1 px, checkVisibility (opacity /
+// visibility), and not placed entirely off the top/left of the page (the
+// left:-9999px anti-autofill trap).
 const SECRET_FIELD_PROBE = `(() => {
-  const HINT = /otp|one.?time|passcode|2fa|mfa|totp|verif|security.?code|auth.?code|sms|pin(?![a-z])|(^|[^a-z])code/i;
+  const STRONG = /(^| )(otp|totp|mfa|2fa|2sv|one ?time|passcode|two ?factor|2 ?step|verification|verify|(security|auth|authentication|sms|login|access|sign ?in) (code|pin))( |$)/;
+  const WEAK = /(^| )(code|token|pin)( |$)/;
+  const ORDINARY = /(^| )(zip|postal|post|country|currency|area|promo|promotion|discount|coupon|gift|voucher|referral|invite|invitation|hex|color|colour|product|sku|tracking|reference|ref)( |$)/;
+  const words = (t) => String(t || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
   const inputs = [];
   const walk = (root) => {
     for (const el of root.querySelectorAll("*")) {
@@ -130,26 +142,42 @@ const SECRET_FIELD_PROBE = `(() => {
     if (el.getClientRects().length === 0) return false;
     if (typeof el.checkVisibility === "function" && !el.checkVisibility({ opacityProperty: true, visibilityProperty: true })) return false;
     const r = el.getBoundingClientRect();
-    return r.width > 1 && r.height > 1;
+    return r.width > 1 && r.height > 1 && r.right > 0 && r.bottom > 0;
   };
   const attr = (el, n) => String(el.getAttribute(n) || "").toLowerCase();
+  const textOf = (el) => {
+    const parts = [el.name, el.id, el.getAttribute("aria-label"), el.placeholder];
+    try { for (const l of el.labels || []) parts.push(l.textContent); } catch (e) {}
+    return words(parts.join(" "));
+  };
+  const TEXTY = ["text", "tel", "number", ""];
   const isCode = (el, t) => {
     if (/(^|\\s)one-time-code(\\s|$)/.test(attr(el, "autocomplete"))) return true;
+    if (!TEXTY.includes(t)) return false;
+    const w = textOf(el);
+    if (STRONG.test(w)) return true;
     const ml = Number(el.maxLength);
-    if (!(ml >= 1 && ml <= 8) || !["text", "tel", "number", ""].includes(t)) return false;
-    if (attr(el, "inputmode") === "numeric") return true;
-    return HINT.test([el.name, el.id, el.getAttribute("aria-label"), el.placeholder].join(" "));
+    return ml >= 1 && ml <= 8 && WEAK.test(w) && !ORDINARY.test(w);
   };
-  const isUser = (el, t) => t === "email" || /(^|\\s)(username|email)(\\s|$)/.test(attr(el, "autocomplete"));
+  const groupOf = (el) => el.form || (el.getRootNode() !== document ? el.getRootNode() : null);
+  const isUser = (el, t) => t === "email" || /(^|\\s)(username|email)(\\s|$)/.test(attr(el, "autocomplete"))
+    || (TEXTY.includes(t) && /(^| )(email|e mail|username|user name|login)( |$)/.test(words([el.name, el.id].join(" "))));
   const passwordGroups = new Set();
-  for (const el of inputs) if (String(el.type).toLowerCase() === "password") passwordGroups.add(el.form || el.getRootNode());
+  for (const el of inputs) if (String(el.type).toLowerCase() === "password") { const g = groupOf(el); if (g) passwordGroups.add(g); }
+  const singleRuns = new Map();
   for (const el of inputs) {
     const t = String(el.type || "").toLowerCase();
     if (!visible(el)) continue;
-    if (t === "password" || isCode(el, t)) return true;
-    if (isUser(el, t) && passwordGroups.has(el.form || el.getRootNode())) return true;
+    if (t === "password") return "password";
+    if (isCode(el, t)) return "code";
+    if (isUser(el, t) && passwordGroups.has(groupOf(el))) return "email-first";
+    if (Number(el.maxLength) === 1 && TEXTY.includes(t)) {
+      const k = el.parentElement && el.parentElement.parentElement ? el.parentElement.parentElement : el.parentNode;
+      singleRuns.set(k, (singleRuns.get(k) || 0) + 1);
+      if (singleRuns.get(k) >= 4) return "code";
+    }
   }
-  return false;
+  return "";
 })()`;
 
 const SECRET_TYPES = new Set(["password"]);
@@ -175,16 +203,39 @@ function hostOf(url) {
   try { return new URL(url).hostname || null; } catch { return null; }
 }
 
+// Playwright's error for a frame that shares its parent's process (no CDP session of its own).
+const SAME_PROCESS_FRAME = /separate CDP session|part of the parent frame/i;
+
+/** Closed-root read of one target (a page, or an out-of-process frame) over its own CDP session.
+ *  true / false; "same-process" for a frame without its own session; throws when unreadable. */
+async function closedRootRead(context, target) {
+  let session = null;
+  try {
+    try { session = await context.newCDPSession(target); } catch (e) {
+      if (SAME_PROCESS_FRAME.test(String(e && e.message))) return "same-process";
+      throw e;
+    }
+    const { root } = await session.send("DOM.getDocument", { depth: -1, pierce: true });
+    return closedRootSecret(root);
+  } finally {
+    if (session) { try { await session.detach(); } catch { /* gone */ } }
+  }
+}
+
 /**
  * Must this Brave stay open through the overlap window because someone may be
  * signing in on it? Reads every frame of every tab of `context` (a Playwright
- * BrowserContext), plus each non-blank tab's closed shadow roots over CDP.
- * Never throws; anything it cannot read holds.
- * @returns {Promise<{hold: boolean, reason: string, host?: string|null}>}
+ * BrowserContext), plus each non-blank tab's — and each out-of-process frame's
+ * — closed shadow roots over CDP. Never throws; anything it cannot read holds.
+ * `closedCache` (a Map the caller clears on activity): the closed-root result
+ * per target URL, so the full-DOM CDP read runs once per page per idle period
+ * (review r2 LOW-2: 34 MB per tick on a 100k-node page).
+ * @returns {Promise<{hold: boolean, reason: string, kind?: string, host?: string|null}>}
  *   reason: "sign-in-page" | "secret-field" | "unreadable" | "none"
  */
-async function signInHold(context, { timeoutMs = 4000 } = {}) {
+async function signInHold(context, { timeoutMs = 4000, closedCache = null } = {}) {
   const unreadable = (host = null) => ({ hold: true, reason: "unreadable", host });
+  const secret = (kind, host) => ({ hold: true, reason: "secret-field", kind, host });
   const run = async () => {
     let pages;
     try { pages = context.pages(); } catch { return unreadable(); }
@@ -193,21 +244,29 @@ async function signInHold(context, { timeoutMs = 4000 } = {}) {
       try { frames = typeof page.frames === "function" ? page.frames() : []; } catch { return unreadable(); }
       let pageUrl = "";
       try { pageUrl = page.url(); } catch { return unreadable(); }
+      const host = hostOf(pageUrl);
       const urls = [pageUrl, ...frames.map((f) => { try { return f.url(); } catch { return ""; } })];
       for (const u of urls) if (u && matchSignInPage(u)) return { hold: true, reason: "sign-in-page", host: hostOf(u) };
       if (BLANK_URLS.has(pageUrl) && frames.length <= 1) continue;
       for (const f of frames) {
         let has;
-        try { has = await f.evaluate(SECRET_FIELD_PROBE); } catch { return unreadable(hostOf(pageUrl)); }
-        if (has === true) return { hold: true, reason: "secret-field", host: hostOf(pageUrl) };
+        try { has = await f.evaluate(SECRET_FIELD_PROBE); } catch { return unreadable(host); }
+        if (has === true) return secret("password", host);
+        if (typeof has === "string" && has) return secret(has, host);
       }
-      let session = null;
-      try {
-        session = await context.newCDPSession(page);
-        const { root } = await session.send("DOM.getDocument", { depth: -1, pierce: true });
-        if (closedRootSecret(root)) return { hold: true, reason: "secret-field", host: hostOf(pageUrl) };
-      } catch { return unreadable(hostOf(pageUrl)); } finally {
-        if (session) { try { await session.detach(); } catch { /* gone */ } }
+      // Closed shadow roots: the page target, then each child frame that has its own process.
+      const targets = [[page, pageUrl], ...frames.slice(1).map((f) => [f, (() => { try { return f.url(); } catch { return ""; } })()])];
+      for (const [target, url] of targets) {
+        const key = target === page ? `page ${url}` : `frame ${url}`;
+        if (closedCache && closedCache.has(key)) {
+          if (closedCache.get(key)) return secret("closed-root", host);
+          continue;
+        }
+        let r;
+        try { r = await closedRootRead(context, target); } catch { return unreadable(host); }
+        if (r === "same-process") continue;
+        if (closedCache) closedCache.set(key, r);
+        if (r) return secret("closed-root", host);
       }
     }
     return { hold: false, reason: "none" };

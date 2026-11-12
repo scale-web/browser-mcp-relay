@@ -103,7 +103,7 @@ test("signInHold: blank and ordinary pages do not hold", async () => {
 
 test("signInHold: a visible secret field in any frame holds", async () => {
   const r = await signInHold(fakeContext([{ url: "about:blank" }, { url: "https://vendor.example/login", secret: true }]));
-  assert.deepStrictEqual(r, { hold: true, reason: "secret-field", host: "vendor.example" });
+  assert.deepStrictEqual(r, { hold: true, reason: "secret-field", kind: "password", host: "vendor.example" });
 });
 
 test("signInHold: a known sign-in page holds even with no secret field (email-first step)", async () => {
@@ -115,11 +115,41 @@ test("signInHold: a known sign-in page holds even with no secret field (email-fi
 });
 
 test("signInHold: a secret input in a CLOSED shadow root holds; a CDP failure holds (review r1 M1)", async () => {
-  assert.deepStrictEqual(await signInHold(fakeContext([{ url: "https://w.example/", dom: CLOSED_PW }])), { hold: true, reason: "secret-field", host: "w.example" });
+  assert.deepStrictEqual(await signInHold(fakeContext([{ url: "https://w.example/", dom: CLOSED_PW }])), { hold: true, reason: "secret-field", kind: "closed-root", host: "w.example" });
   const failed = await signInHold(fakeContext([{ url: "https://w.example/" }], { cdp: async () => { throw new Error("no cdp"); } }));
   assert.strictEqual(failed.reason, "unreadable");
   // A blank tab is not read over CDP at all.
   assert.deepStrictEqual(await signInHold(fakeContext([{ url: "about:blank" }], { cdp: async () => { throw new Error("must not be called"); } })), { hold: false, reason: "none" });
+});
+
+test("signInHold: every CDP session is detached; the closed-root read is cached per URL; same-process frames are skipped (review r2)", async () => {
+  let opened = 0, detached = 0, reads = 0;
+  const ctx = (sameProcessFrames) => ({
+    pages: () => [{ url: () => "https://w.example/a", frames: () => [
+      { url: () => "https://w.example/a", evaluate: async () => "" },
+      { url: () => "https://w.example/inner", evaluate: async () => "", child: true },
+    ] }],
+    newCDPSession: async (t) => {
+      if (t.child && sameProcessFrames) throw new Error("This frame does not have a separate CDP session, it is a part of the parent frame's session");
+      opened++;
+      return { send: async () => { reads++; if (t.child) throw new Error("boom"); return { root: { nodeName: "#document" } }; }, detach: async () => { detached++; } };
+    },
+  });
+  // A same-process child frame is skipped, not unreadable.
+  assert.deepStrictEqual(await signInHold(ctx(true)), { hold: false, reason: "none" });
+  assert.strictEqual(opened, 1);
+  assert.strictEqual(detached, 1, "the page's session is detached");
+  // An out-of-process child whose read fails holds, and its session is still detached.
+  opened = detached = 0;
+  assert.strictEqual((await signInHold(ctx(false))).reason, "unreadable");
+  assert.strictEqual(detached, opened, "every opened session is detached, the failing one too");
+  // Cache: a second call within the idle period reads nothing over CDP.
+  const cache = new Map();
+  reads = 0;
+  await signInHold(ctx(true), { closedCache: cache });
+  assert.strictEqual(reads, 1);
+  await signInHold(ctx(true), { closedCache: cache });
+  assert.strictEqual(reads, 1, "cached per URL until the caller clears it");
 });
 
 test("closedRootSecret: only inputs inside a closed root, password / one-time-code / short code boxes", () => {
@@ -154,23 +184,53 @@ test("signInHold: an unreadable, throwing or hung frame holds", async () => {
 let chromium = null;
 try { ({ chromium } = require("playwright")); if (!fs.existsSync(chromium.executablePath())) chromium = null; } catch { chromium = null; }
 const PROBE_CASES = [
-  ["plain visible password", `<input type=password>`, true],
-  ["password in an OPEN shadow root", `<div id=h></div><script>h.attachShadow({mode:"open"}).innerHTML="<input type=password>"</script>`, true],
-  ["password two open roots deep", `<div id=h></div><script>const a=h.attachShadow({mode:"open"});a.innerHTML="<div id=i></div>";a.getElementById("i").attachShadow({mode:"open"}).innerHTML="<input type=password>"</script>`, true],
-  ["autocomplete one-time-code", `<input autocomplete="one-time-code">`, true],
-  ["2FA box: name=otp inputmode=numeric maxlength=6", `<input name=otp inputmode=numeric maxlength=6>`, true],
-  ["2FA box: aria-label Verification code, maxlength 6", `<input aria-label="Verification code" maxlength=6>`, true],
-  ["six single-digit boxes", `<input maxlength=1 inputmode=numeric><input maxlength=1 inputmode=numeric>`, true],
-  ["email-first: visible email + hidden password in one form", `<form><input type=email><input type=password style="display:none"></form>`, true],
-  ["email-first via autocomplete=username", `<form><input autocomplete=username><input type=password hidden></form>`, true],
-  ["display:none password alone", `<input type=password style="display:none">`, false],
-  ["visibility:hidden password", `<input type=password style="visibility:hidden">`, false],
-  ["opacity:0 password", `<input type=password style="opacity:0">`, false],
-  ["zero-size password", `<input type=password style="width:0;height:0;padding:0;border:0">`, false],
-  ["closed <details> password", `<details><input type=password></details>`, false],
-  ["email with no password anywhere (newsletter)", `<form><input type=email></form>`, false],
-  ["ordinary text + search", `<input type=text name=q><input type=search maxlength=6>`, false],
-  ["long text input named code (not a code box)", `<input name=promo_code maxlength=40>`, false],
+  // [name, html, the kind the probe must return ("" = must not hold)]
+  ["plain visible password", `<input type=password>`, "password"],
+  ["password in an OPEN shadow root", `<div id=h></div><script>h.attachShadow({mode:"open"}).innerHTML="<input type=password>"</script>`, "password"],
+  ["password two open roots deep", `<div id=h></div><script>const a=h.attachShadow({mode:"open"});a.innerHTML="<div id=i></div>";a.getElementById("i").attachShadow({mode:"open"}).innerHTML="<input type=password>"</script>`, "password"],
+  ["autocomplete one-time-code", `<input autocomplete="one-time-code">`, "code"],
+  ["2FA: name=otp maxlength=6", `<input name=otp inputmode=numeric maxlength=6>`, "code"],
+  ["2FA: aria-label Verification code", `<input aria-label="Verification code" maxlength=6>`, "code"],
+  ["2FA: name=mfaCode, no maxlength (r2 MEDIUM-2)", `<input name=mfaCode>`, "code"],
+  ["2FA: placeholder Enter security code, no maxlength", `<input placeholder="Enter security code">`, "code"],
+  ["2FA: name=twofactor_token maxlength=6", `<input name=twofactor_token maxlength=6>`, "code"],
+  ["2FA: name=token maxlength=6", `<input name=token maxlength=6>`, "code"],
+  ["2FA: <label for> Verification code", `<label for=x>Verification code</label><input id=x maxlength=6>`, "code"],
+  ["2FA: pinCode maxlength=4", `<input name=pinCode maxlength=4>`, "code"],
+  ["2FA: six unhinted maxlength=1 boxes", `<div>${"<input maxlength=1>".repeat(6)}</div>`, "code"],
+  ["2FA: four boxes each in its own span", `<div>${"<span><input maxlength=1></span>".repeat(4)}</div>`, "code"],
+  ["email-first: visible email + hidden password in one form", `<form><input type=email><input type=password style="display:none"></form>`, "email-first"],
+  ["email-first: autocomplete=username", `<form><input autocomplete=username><input type=password hidden></form>`, "email-first"],
+  ["email-first: type=text name=email", `<form><input type=text name=email><input type=password hidden></form>`, "email-first"],
+  // must NOT hold (r1 L1, r2 MEDIUM-1)
+  ["display:none password alone", `<input type=password style="display:none">`, ""],
+  ["visibility:hidden password", `<input type=password style="visibility:hidden">`, ""],
+  ["opacity:0 password", `<input type=password style="opacity:0">`, ""],
+  ["zero-size password", `<input type=password style="width:0;height:0;padding:0;border:0">`, ""],
+  ["closed <details> password", `<details><input type=password></details>`, ""],
+  ["off-screen anti-autofill password", `<input type=password style="position:absolute;left:-9999px">`, ""],
+  ["newsletter email, no password", `<form><input type=email></form>`, ""],
+  ["newsletter email outside a form + hidden modal password outside a form", `<input type=email><div hidden><input type=password></div>`, ""],
+  ["email in one form, hidden password in another", `<form><input type=email></form><form><input type=password hidden></form>`, ""],
+  ["ordinary text + search", `<input type=text name=q><input type=search maxlength=6>`, ""],
+  ["ZIP: inputmode numeric maxlength 5", `<input name=zip inputmode=numeric maxlength=5>`, ""],
+  ["postal_code maxlength 6", `<input name=postal_code maxlength=6>`, ""],
+  ["country_code maxlength 3", `<input name=country_code maxlength=3>`, ""],
+  ["countryCode maxlength 3", `<input name=countryCode maxlength=3>`, ""],
+  ["currency_code maxlength 3", `<input name=currency_code maxlength=3>`, ""],
+  ["ZIP code label", `<label for=z>ZIP code</label><input id=z maxlength=5>`, ""],
+  ["Area code", `<input aria-label="Area code" maxlength=3>`, ""],
+  ["Hex code", `<input placeholder="Hex code" maxlength=7>`, ""],
+  ["Discount code", `<input name=discount_code maxlength=8>`, ""],
+  ["promo_code long", `<input name=promo_code maxlength=40>`, ""],
+  ["card expiry MM/YY", `<input name=exp inputmode=numeric maxlength=5>`, ""],
+  ["year box", `<input name=year inputmode=numeric maxlength=4>`, ""],
+  ["time HH", `<input name=hh inputmode=numeric maxlength=2>`, ""],
+  ["go to page box", `<input aria-label="Go to page" inputmode=numeric maxlength=3>`, ""],
+  ["id=footprint-size", `<input id=footprint-size maxlength=4>`, ""],
+  ["smsConsent checkbox-ish text", `<input name=smsConsent maxlength=3>`, ""],
+  ["verified_badge long", `<input name=verified_badge_text maxlength=40>`, ""],
+  ["three single boxes only", `<div>${"<input maxlength=1>".repeat(3)}</div>`, ""],
 ];
 test("SECRET_FIELD_PROBE in real Chromium: sign-in shapes hold, hidden / ordinary inputs do not", { ...T, skip: chromium ? false : "Chrome for Testing not installed" }, async () => {
   const browser = await chromium.launch({ headless: true });
@@ -180,7 +240,7 @@ test("SECRET_FIELD_PROBE in real Chromium: sign-in shapes hold, hidden / ordinar
     for (const [name, html, want] of PROBE_CASES) {
       await page.setContent(`<!doctype html><body>${html}</body>`);
       const got = await page.evaluate(SECRET_FIELD_PROBE);
-      if (got !== want) wrong.push(`${name}: got ${got}, want ${want}`);
+      if (got !== want) wrong.push(`${name}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
     }
     assert.deepStrictEqual(wrong, []);
   } finally { await browser.close(); }
@@ -192,8 +252,8 @@ test("signInHold in real Chromium: a password in a CLOSED shadow root holds (ove
     const context = await browser.newContext();
     const page = await context.newPage();
     await page.goto(`data:text/html,${encodeURIComponent(`<div id=h></div><script>document.getElementById("h").attachShadow({mode:"closed"}).innerHTML="<input type=password>"</script>`)}`);
-    assert.strictEqual(await page.evaluate(SECRET_FIELD_PROBE), false, "the main-world probe cannot see a closed root");
-    assert.deepStrictEqual((await signInHold(context)).reason, "secret-field");
+    assert.strictEqual(await page.evaluate(SECRET_FIELD_PROBE), "", "the main-world probe cannot see a closed root");
+    assert.deepStrictEqual(await signInHold(context), { hold: true, reason: "secret-field", kind: "closed-root", host: null });
     await page.goto(`data:text/html,${encodeURIComponent("<p>dashboard</p><input type=search>")}`);
     assert.deepStrictEqual(await signInHold(context), { hold: false, reason: "none" });
   } finally { await browser.close(); }
@@ -351,4 +411,25 @@ test("main(): a failed ps holds and is logged once (overlap-held ps-failed)", T,
     assert.strictEqual(held.length, 1);
     assert.strictEqual(held[0].reason, "ps-failed");
   } finally { await r.stop(); }
+});
+
+test("signInHold in real Chromium: a closed-root password inside a CROSS-SITE iframe holds (review r2 LOW-1)", { ...T, skip: chromium ? false : "Chrome for Testing not installed" }, async () => {
+  const http = require("node:http");
+  const srv = http.createServer((req, res) => {
+    res.setHeader("content-type", "text/html");
+    if (req.url === "/inner") res.end(`<div id=h></div><script>document.getElementById("h").attachShadow({mode:"closed"}).innerHTML="<input type=password>"</script>`);
+    else res.end(`<p>outer</p><iframe src="http://localhost:${srv.address().port}/inner"></iframe>`);
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.goto(`http://127.0.0.1:${srv.address().port}/`);
+    await page.waitForLoadState("load");
+    assert.strictEqual(page.frames().length, 2);
+    const h = await signInHold(context);
+    assert.strictEqual(h.reason, "secret-field");
+    assert.strictEqual(h.kind, "closed-root");
+  } finally { await browser.close(); srv.close(); }
 });
