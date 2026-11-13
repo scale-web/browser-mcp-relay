@@ -233,8 +233,11 @@ if (lsofBin) {
     frontmostPid: (opts) => {
       let v = "1";
       try { v = fs.readFileSync(path.join(dir, "frontmost-pid"), "utf8").trim(); } catch { /* default */ }
-      const out = v === "fail" ? "" : `  6) "Some App" ASN:0x0-1: (in front)\n    pid = ${v} type="Foreground"\n`;
-      return realOverlap.frontmostPid({ ...opts, _execFile: (c, a, o, cb) => (v === "fail" ? cb(Object.assign(new Error("harness lsappinfo failed"), { code: "EHARNESS" }), "", "") : cb(null, out, "")) });
+      // Real output shapes (see test/idle-reaper-overlap.test.js LIST): `front`, then `info -only pid`.
+      const answer = { front: "ASN:0x0-1b01b:\n", info: `"pid"=${v}\n`, list: "" };
+      return realOverlap.frontmostPid({ ...opts, _execFile: (c, a, o, cb) => (v === "fail"
+        ? cb(Object.assign(new Error("harness lsappinfo failed"), { code: "EHARNESS" }), "", "")
+        : cb(null, answer[a[0]], "")) });
     },
   });
 }

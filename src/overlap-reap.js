@@ -108,27 +108,46 @@ function otherRelayBraves({ cacheRoot, ownDir, ownPid, timeoutMs = 2000, _execFi
 }
 
 /**
- * The frontmost process's pid, from one `lsappinfo list` (macOS; ~10 ms): the
- * app line marked "(in front)", then its "pid = N" line. (`lsappinfo info
- * <ASN>` returned nothing for some front apps when measured 2026-11-12.)
+ * The frontmost process's pid (macOS). Primary: `lsappinfo front` (prints e.g.
+ * `ASN:0x0-12012:`) then `lsappinfo info -only pid "ASN:0x0-0x12012:"` (prints
+ * `"pid"=876`) — the low half needs its `0x` prefix or `info` prints nothing
+ * (measured 2026-11-12; ~26 ms wall for both). Fallback when that yields no pid:
+ * `lsappinfo list`, the entry marked "(in front)", its `pid = N` line searched up
+ * to the next entry header (real entries carry bundleID / bundle path /
+ * executable path lines before it; review of 69fda6a: a fixed 3-line window
+ * found no pid on real output, so every sample was "unknown").
  * @returns {Promise<{ok: true, pid: number} | {ok: false, reason: string}>} never throws.
  */
-function frontmostPid({ timeoutMs = 2000, _execFile = execFile } = {}) {
+const LSAPPINFO = "/usr/bin/lsappinfo";
+function lsappinfoRun(args, { timeoutMs, _execFile }) {
   return capped((finish) => {
-    _execFile("/usr/bin/lsappinfo", ["list"],
-      { encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: 16 * 1024 * 1024 },
-      (err, stdout) => {
-        if (err) return finish({ ok: false, reason: `lsappinfo: ${err.code || err.message}` });
-        const lines = String(stdout || "").split("\n");
-        const i = lines.findIndex((l) => l.includes("(in front)"));
-        if (i === -1) return finish({ ok: false, reason: "lsappinfo: no front app" });
-        for (let j = i + 1; j < lines.length && j <= i + 3; j++) {
-          const m = /\bpid = (\d+)/.exec(lines[j]);
-          if (m) return finish({ ok: true, pid: Number(m[1]) });
-        }
-        finish({ ok: false, reason: "lsappinfo: front app has no pid" });
-      });
+    _execFile(LSAPPINFO, args, { encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: 16 * 1024 * 1024 },
+      (err, stdout) => finish(err ? { ok: false, reason: `lsappinfo: ${err.code || err.message}` } : { ok: true, out: String(stdout || "") }));
   }, timeoutMs, { ok: false, reason: "lsappinfo-timeout" });
+}
+/** The "(in front)" entry's pid in `lsappinfo list` output, or null. */
+function frontPidFromList(out) {
+  const lines = String(out).split("\n");
+  const i = lines.findIndex((l) => /^\s*\d+\) ".*\(in front\)/.test(l));
+  if (i === -1) return null;
+  for (let j = i + 1; j < lines.length && !/^\s*\d+\) "/.test(lines[j]); j++) {
+    const m = /^\s*pid = (\d+)\b/.exec(lines[j]);
+    if (m) return Number(m[1]);
+  }
+  return null;
+}
+async function frontmostPid({ timeoutMs = 2000, _execFile = execFile } = {}) {
+  const front = await lsappinfoRun(["front"], { timeoutMs, _execFile });
+  const asn = front.ok ? /ASN:(0x[0-9a-fA-F]+)-(?:0x)?([0-9a-fA-F]+):?/.exec(front.out) : null;
+  if (asn) {
+    const info = await lsappinfoRun(["info", "-only", "pid", `ASN:${asn[1]}-0x${asn[2]}:`], { timeoutMs, _execFile });
+    const m = info.ok ? /"pid"\s*=\s*(\d+)/.exec(info.out) : null;
+    if (m) return { ok: true, pid: Number(m[1]) };
+  }
+  const list = await lsappinfoRun(["list"], { timeoutMs, _execFile });
+  if (!list.ok) return list;
+  const pid = frontPidFromList(list.out);
+  return pid ? { ok: true, pid } : { ok: false, reason: "lsappinfo: no front app pid" };
 }
 
 /**
@@ -210,4 +229,4 @@ async function signInHold(context, { timeoutMs = 4000 } = {}) {
     Math.max(0, timeoutMs - 1000), unreadable());
 }
 
-module.exports = { otherRelayBraves, frontmostPid, presenceVerdict, signInHold, userDataDirOf, executableOf, SECRET_FIELD_PROBE, BLANK_URLS };
+module.exports = { otherRelayBraves, frontmostPid, frontPidFromList, presenceVerdict, signInHold, userDataDirOf, executableOf, SECRET_FIELD_PROBE, BLANK_URLS };

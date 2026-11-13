@@ -16,7 +16,7 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { otherRelayBraves, frontmostPid, presenceVerdict, signInHold, userDataDirOf, executableOf, SECRET_FIELD_PROBE } = require("../src/overlap-reap.js");
+const { otherRelayBraves, frontmostPid, frontPidFromList, presenceVerdict, signInHold, userDataDirOf, executableOf, SECRET_FIELD_PROBE } = require("../src/overlap-reap.js");
 const { waitFor, startRelay } = require("./helpers/reaper-relay.js");
 
 const T = { timeout: 30000 };
@@ -78,26 +78,72 @@ test("otherRelayBraves: a failed or hung ps is ok:false (the caller must not rea
   assert.strictEqual((await otherRelayBraves({ cacheRoot: null })).ok, false);
 });
 
-// Shape copied from `lsappinfo list` on macOS 14.8 (2026-11-12).
-const LSAPPINFO = [
+// VERBATIM `lsappinfo` output captured on macOS 14.8.9, 2026-11-12 (review of 69fda6a:
+// a hand-typed sample without the bundle path / executable path lines hid a parser
+// that never found the pid on real output). Only the "(in front)" marker was moved.
+const LIST = [
   ` 5) "Cursor" ASN:0x0-12012: `,
   `    bundleID="com.todesktop.230313mzl4w4u92"`,
-  `    pid = 700 type="Foreground" flavor=3 Version="1.0" fileType="APPL" creator="????" Arch=ARM64 `,
-  ` 6) "Brave Browser" ASN:0x0-13013: (in front) `,
+  `    bundle path="/Applications/Cursor.app"`,
+  `    executable path="/Applications/Cursor.app/Contents/MacOS/Cursor"`,
+  `    pid = 876 type="Foreground" flavor=3 Version="3.26.16" fileType="APPL" creator="????" Arch=ARM64 `,
+  `    parentASN="loginwindow" ASN:0x1-0x191: `,
+  ` 8) "Brave Browser" ASN:0x0-1b01b: (in front) `,
   `    bundleID="com.brave.Browser"`,
-  `    pid = 5151 type="Foreground" flavor=3 Version="199.57" fileType="APPL" creator="Cr24" Arch=ARM64 `,
+  `    bundle path="/Applications/Brave Browser.app"`,
+  `    executable path="/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"`,
+  `    pid = 899 type="Foreground" flavor=3 Version="199.55" fileType="APPL" creator="Cr24" Arch=ARM64 `,
+  `    parentASN="loginwindow" ASN:0x1-0x191: `,
+  `    launch time =  2026/11/06 12:22:35 ( 6 days, 6 hours, 24 minutes, 1.11786 seconds ago )`,
 ].join("\n");
+const FRONT = "ASN:0x0-1b01b:\n";          // `lsappinfo front`
+const INFO_PID = '"pid"=899\n';             // `lsappinfo info -only pid "ASN:0x0-0x1b01b:"`
 
-test("frontmostPid reads the '(in front)' app's pid from lsappinfo list", async () => {
-  assert.deepStrictEqual(await frontmostPid({ _execFile: fakeExec(LSAPPINFO) }), { ok: true, pid: 5151 });
-  assert.strictEqual(fakeExec.last.cmd, "/usr/bin/lsappinfo");
-  assert.deepStrictEqual(fakeExec.last.args, ["list"]);
-  assert.strictEqual((await frontmostPid({ _execFile: fakeExec(LSAPPINFO.replace("(in front)", "")) })).ok, false, "no front app → unknown");
-  assert.strictEqual((await frontmostPid({ _execFile: fakeExec(` 6) "X" ASN:0x0-1: (in front)\n    bundleID="x"\n\n\n\n    pid = 9 type=x`) })).ok, false, "a pid far below the front line is not taken");
-  assert.strictEqual((await frontmostPid({ _execFile: (c, a, o, cb) => cb(new Error("boom"), "", "") })).ok, false);
+/** A fake execFile answering `front`, `info -only pid <ASN>` and `list` per `answers` (string, or Error). */
+function fakeLsappinfo(answers) {
+  const calls = [];
+  const fn = (cmd, args, opts, cb) => {
+    calls.push([cmd, ...args]);
+    const a = answers[args[0]];
+    if (a instanceof Error) return cb(a, "", "");
+    if (a === undefined) return {}; // never answers (hang)
+    cb(null, a, "");
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+test("frontmostPid: front + info (the 0x-prefixed ASN), as on real output", async () => {
+  const ex = fakeLsappinfo({ front: FRONT, info: INFO_PID, list: LIST });
+  assert.deepStrictEqual(await frontmostPid({ _execFile: ex }), { ok: true, pid: 899 });
+  assert.deepStrictEqual(ex.calls, [["/usr/bin/lsappinfo", "front"], ["/usr/bin/lsappinfo", "info", "-only", "pid", "ASN:0x0-0x1b01b:"]]);
+});
+
+test("frontmostPid: falls back to list when info says nothing; list entry's pid is 4 lines down", async () => {
+  assert.deepStrictEqual(await frontmostPid({ _execFile: fakeLsappinfo({ front: FRONT, info: "", list: LIST }) }), { ok: true, pid: 899 });
+  assert.deepStrictEqual(await frontmostPid({ _execFile: fakeLsappinfo({ front: new Error("x"), list: LIST }) }), { ok: true, pid: 899 });
+  assert.strictEqual(frontPidFromList(LIST), 899);
+  // The pid search stops at the next entry header: a front entry with no pid line does not take the next app's.
+  const noPid = LIST.replace(/    pid = 899[^\n]*\n/, "");
+  assert.strictEqual(frontPidFromList(noPid), null);
+  assert.strictEqual(frontPidFromList(LIST.replace("(in front)", "")), null);
+  assert.strictEqual((await frontmostPid({ _execFile: fakeLsappinfo({ front: FRONT, info: "", list: noPid }) })).ok, false);
+});
+
+test("frontmostPid: failures and hangs are ok:false within the cap", async () => {
+  assert.strictEqual((await frontmostPid({ _execFile: fakeLsappinfo({ front: new Error("a"), list: new Error("b") }) })).ok, false);
   const t0 = Date.now();
-  assert.deepStrictEqual(await frontmostPid({ timeoutMs: 100, _execFile: () => ({}) }), { ok: false, reason: "lsappinfo-timeout" });
-  assert.ok(Date.now() - t0 < 2500);
+  const r = await frontmostPid({ timeoutMs: 100, _execFile: fakeLsappinfo({}) });
+  assert.deepStrictEqual(r, { ok: false, reason: "lsappinfo-timeout" });
+  assert.ok(Date.now() - t0 < 4500, "each step is capped");
+});
+
+test("frontmostPid against the real lsappinfo (macOS only): a live pid", { skip: process.platform === "darwin" && fs.existsSync("/usr/bin/lsappinfo") ? false : "not macOS" }, async () => {
+  const r = await frontmostPid();
+  assert.strictEqual(r.ok, true, JSON.stringify(r));
+  assert.ok(Number.isInteger(r.pid) && r.pid > 0);
+  let alive = true; try { process.kill(r.pid, 0); } catch (e) { alive = e.code === "EPERM"; }
+  assert.ok(alive, "the pid names a live process");
 });
 
 test("presenceVerdict: frontmost / away / unknown (no own pid, gaps, a failed sample)", () => {
