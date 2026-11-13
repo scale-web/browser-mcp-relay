@@ -126,6 +126,10 @@ test("frontmostPid: falls back to list when info says nothing; list entry's pid 
   // The pid search stops at the next entry header: a front entry with no pid line does not take the next app's.
   const noPid = LIST.replace(/    pid = 899[^\n]*\n/, "");
   assert.strictEqual(frontPidFromList(noPid), null);
+  // ...also when a LATER entry has one: Cursor in front with its pid line gone, Brave (pid 899) after it.
+  const frontNoPid = LIST.replace("(in front) ", "").replace(`ASN:0x0-12012: `, `ASN:0x0-12012: (in front) `).replace(/    pid = 876[^\n]*\n/, "");
+  assert.ok(frontNoPid.includes(`"Cursor" ASN:0x0-12012: (in front)`) && !frontNoPid.includes("pid = 876"));
+  assert.strictEqual(frontPidFromList(frontNoPid), null, "must not take the next entry's pid");
   assert.strictEqual(frontPidFromList(LIST.replace("(in front)", "")), null);
   assert.strictEqual((await frontmostPid({ _execFile: fakeLsappinfo({ front: FRONT, info: "", list: noPid }) })).ok, false);
 });
