@@ -433,3 +433,20 @@ test("signInHold in real Chromium: a closed-root password inside a CROSS-SITE if
     assert.strictEqual(h.kind, "closed-root");
   } finally { await browser.close(); srv.close(); }
 });
+
+test("main(): the closed-root CDP read is cached for the idle period and read again after a tool call (review r2 LOW-2)", T, async () => {
+  const r = await relayWith({ pages: ["https://app.example/"], ps: otherRelayLine });
+  const reads = () => { try { return fs.readFileSync(path.join(r.dir, "cdp-reads"), "utf8").trim().split("\n").filter(Boolean).length; } catch { return 0; } };
+  const keepalive = () => fs.writeFileSync(path.join(r.profileDir, ".mcp-relay-keepalive"), ""); // holds the reap, not the checks
+  try {
+    await r.call();
+    keepalive();
+    await waitFor(() => reads() >= 1, 2500, "first closed-root read");
+    await sleep(1300); // two more overlap ticks
+    assert.strictEqual(reads(), 1, "cached within the idle period");
+    assert.strictEqual(closed(r), 0);
+    await r.call();
+    keepalive();
+    await waitFor(() => reads() === 2, 2500, "read again after a tool call");
+  } finally { await r.stop(); }
+});

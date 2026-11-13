@@ -108,7 +108,11 @@ function fakeBrave(port, attached, wsEndpoint) {
   } catch { /* none */ }
   context.pages = () => pages;
   context.newCDPSession = async (page) => ({
-    send: async (m) => { if (m !== "DOM.getDocument") throw new Error(`harness: unexpected ${m}`); return { root: page.__domRoot }; },
+    send: async (m) => {
+      if (m !== "DOM.getDocument") throw new Error(`harness: unexpected ${m}`);
+      fs.appendFileSync(path.join(dir, "cdp-reads"), "1\n"); // one line per closed-root read
+      return { root: page.__domRoot };
+    },
     detach: async () => {},
   });
   const handle = { context, cdpConnectUrl: `http://127.0.0.1:${port}`, port, wsEndpoint, id };
