@@ -46,7 +46,7 @@ const { loadVaultFromEnv } = require("./vault.js");
 const { attachAutofill } = require("./autofill-injector.js");
 const { listExternalCdpClients } = require("./cdp-clients.js");
 const { freshKeepaliveAgeMs, ReapLog, REAP_LOG_NAME, KEEPALIVE_NAME } = require("./reap-hold.js");
-const { otherRelayBraves, signInHold } = require("./overlap-reap.js");
+const { otherRelayBraves, frontmostPid, presenceVerdict, signInHold } = require("./overlap-reap.js");
 // Spec v8 §5.6 (phase 1c): the plain-flags launch profile.
 const plainflagsMode = require("./plainflags-mode.js");
 const { createSigninLoader, SIGNIN_FILE } = require("./plainflags-signin.js");
@@ -904,9 +904,7 @@ async function main() {
   // reason, and a failed lsof once, per idle period — activity starts a new one.
   let lastOverlapHold = null;
   let overlapLsofFailLogged = false;
-  // Closed-shadow-root results per page URL for this idle period (review r2 LOW-2: the full-DOM CDP read).
-  const overlapClosedCache = new Map();
-  function bumpActivity() { lastActivityAt = Date.now(); lastOverlapHold = null; overlapLsofFailLogged = false; overlapClosedCache.clear(); }
+  function bumpActivity() { lastActivityAt = Date.now(); lastOverlapHold = null; overlapLsofFailLogged = false; }
 
   let reapLogFile = null;
   try { reapLogFile = path.join(pool.userCacheRoot(), REAP_LOG_NAME); } catch { /* no log */ }
@@ -989,14 +987,15 @@ async function main() {
     : parseFloat(idleMinutesRaw);
   if (Number.isFinite(idleMinutes) && idleMinutes > 0) {
     const idleMs = idleMinutes * 60_000;
-    // Overlap window (2026-11-12, asks as-ops/ask-fr3yfn + ask-ocrmvy; see
-    // src/overlap-reap.js): a SHORTER idle window that applies only while
-    // another relay Brave is alive (replayd's one-connection-per-bundle-id
-    // loop) and no tab shows a sign-in page or a visible password /
-    // one-time-code field. Every full-window hold still applies (keep-alive
-    // within the FULL window, external CDP clients, in-flight calls), and any
-    // check that cannot answer holds. 0 / unparseable / >= the full window
-    // disables it.
+    // Overlap window (2026-11-12, asks as-ops/ask-fr3yfn, ask-ocrmvy and
+    // ask-b7xcc7; see src/overlap-reap.js): a SHORTER idle window that applies
+    // only while another relay Brave is alive (replayd's one-connection-per-
+    // bundle-id loop), held while this Brave was the frontmost process at any
+    // sample in the last overlap window (someone is using it), or a tab shows
+    // a known sign-in page or an unambiguous password / one-time-code field.
+    // Every full-window hold still applies (keep-alive within the FULL window,
+    // external CDP clients, in-flight calls), and any check that cannot answer
+    // holds. 0 / unparseable / >= the full window disables it.
     const overlapMinutesRaw = RELAY_ENV.BROWSER_RELAY_OVERLAP_IDLE_MINUTES;
     const overlapMinutes = (overlapMinutesRaw === undefined || overlapMinutesRaw === "")
       ? 10
@@ -1004,23 +1003,48 @@ async function main() {
     const overlapMs = (Number.isFinite(overlapMinutes) && overlapMinutes > 0 && overlapMinutes * 60_000 < idleMs)
       ? overlapMinutes * 60_000
       : null;
+    // Presence samples: the frontmost process every FRONT_SAMPLE_MS while this
+    // relay has a Brave ({t, pid}; pid null = lsappinfo could not say). Kept
+    // for one overlap window; a check needs them to cover the whole window.
+    const FRONT_SAMPLE_MS = overlapMs ? Math.min(15_000, Math.max(100, Math.floor(overlapMs / 4))) : null;
+    const frontSamples = [];
+    if (overlapMs) {
+      let sampling = false;
+      const sampler = setInterval(async () => {
+        if (sampling || !bridge) return;
+        sampling = true;
+        try {
+          const f = await frontmostPid({ timeoutMs: 2000 });
+          const now = Date.now();
+          frontSamples.push({ t: now, pid: f.ok ? f.pid : null, reason: f.ok ? null : f.reason });
+          while (frontSamples.length && frontSamples[0].t < now - overlapMs - 2 * FRONT_SAMPLE_MS) frontSamples.shift();
+        } catch { /* frontmostPid never throws */ } finally { sampling = false; }
+      }, FRONT_SAMPLE_MS);
+      sampler.unref();
+    }
     /** null = no early reap; else { others } — another relay Brave is alive and nothing holds. */
     async function overlapReapAllowed() {
       if (!bridge) return null; // an upstream-only relay waits for the full window
       const o = await otherRelayBraves({ cacheRoot, ownDir: dir, ownPid: sidecar.data.bravePid, timeoutMs: 2000 });
-      // `key` = what makes a hold "the same" for once-per-idle-period logging (reason, plus kind for a field).
-      const held = (key, fields) => {
-        if (lastOverlapHold === key) return null;
-        lastOverlapHold = key;
-        reapLog.write("overlap-held", { reason: key, ...fields, idleS: idleSeconds() });
+      // An overlap hold is logged once per reason per idle period.
+      const held = (reason, fields) => {
+        if (lastOverlapHold === reason) return null;
+        lastOverlapHold = reason;
+        reapLog.write("overlap-held", { reason, ...fields, idleS: idleSeconds() });
         return null;
       };
       if (!o.ok) return held("ps-failed", { detail: o.reason });
       if (o.pids.length === 0) { lastOverlapHold = null; return null; }
+      // Presence: was THIS Brave frontmost at any sample in the last overlap window?
+      const self = sidecar.data.bravePid || o.selfPid;
+      if (!self) return held("self-unknown", { others: o.pids.length });
+      const p = presenceVerdict(frontSamples, { now: Date.now(), windowMs: overlapMs, intervalMs: FRONT_SAMPLE_MS, self });
+      if (p.verdict === "unknown") return held("presence-unknown", { detail: p.detail, others: o.pids.length });
+      if (p.verdict === "frontmost") return held("frontmost", { others: o.pids.length });
       const b = bridge;
       if (!b) return null;
-      const h = await signInHold(b.context, { timeoutMs: 4000, closedCache: overlapClosedCache });
-      if (h.hold) return held(h.kind ? `${h.reason}:${h.kind}` : h.reason, { reason: h.reason, kind: h.kind || null, host: h.host || null, others: o.pids.length });
+      const h = await signInHold(b.context, { timeoutMs: 4000 });
+      if (h.hold) return held(h.reason, { host: h.host || null, others: o.pids.length });
       lastOverlapHold = null;
       if (await reapHeld(idleMs, { failClosed: true })) return null;
       return { others: o.pids.length };

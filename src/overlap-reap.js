@@ -10,17 +10,18 @@
 // does not loop. So an idle relay Brave closes sooner only while ANOTHER
 // relay Brave is alive.
 //
-// What must never be closed early: a page someone is signing in on by hand
-// (a flat 10-minute close was tried and reverted for exactly that). The
-// first design kept any window whose pages were not all blank; measured
-// 2026-11-12 3:45 PM MT that would have closed 1 of 3 idle Braves and left
-// the loop running, so Trevor ruled the narrower hold: a known sign-in page
-// (known-accounts matchSignInPage) or a secret field someone may be typing
-// into — filled or empty — in any frame of any tab, open or closed shadow
-// roots included (SECRET_FIELD_PROBE, closedRootSecret; review r1 M1/M2).
-// A frame that cannot be read in time holds too. A page that fakes such a field only keeps its own
-// window open, which is the pre-overlap behaviour, so the main-world read is
-// enough here (unlike the secret lock, which must not be fooled the other way).
+// What must never be closed early: a window someone is using by hand — above
+// all a sign-in in progress (a flat 10-minute close was tried and reverted for
+// exactly that). Guessing secret fields from page markup did not converge (two
+// review rounds traded false holds for missed 2FA boxes), so Trevor ruled a
+// PRESENCE hold (ask as-ops/ask-b7xcc7 rev 2, "Hold while you're using it"):
+//   1. this relay's Brave was the FRONTMOST process at any sample in the last
+//      overlap window (frontmostPid(): `lsappinfo list`, sampled by the caller);
+//   2. a known account's sign-in page is open (known-accounts matchSignInPage);
+//   3. an unambiguous secret field is on a tab: an <input type=password>, or an
+//      input whose autocomplete says current-password / new-password /
+//      one-time-code (open shadow roots walked; any input with layout boxes).
+// Anything that cannot be determined holds.
 //
 // Every other hold of the full reaper (keep-alive file within the FULL idle
 // window, external CDP clients, in-flight calls) is applied by the caller.
@@ -71,8 +72,9 @@ function executableOf(args) {
  * executable as it: replayd's loop is per app bundle id, so a Brave Beta, a
  * Chrome for Testing or a script's Chromium on a dir under the cache root is
  * not counted (review r1 L3). Excludes `ownPid` and any process using `ownDir`.
- * @returns {Promise<{ok: true, pids: number[]} | {ok: false, reason: string}>}
+ * @returns {Promise<{ok: true, pids: number[], selfPid: number|null} | {ok: false, reason: string}>}
  *   never throws; ok:false means "unknown" — the caller must NOT reap early.
+ *   selfPid: this relay's own Brave main process (by ownPid or ownDir), null if not listed.
  */
 function otherRelayBraves({ cacheRoot, ownDir, ownPid, timeoutMs = 2000, _execFile = execFile } = {}) {
   if (!cacheRoot) return Promise.resolve({ ok: false, reason: "no-cache-root" });
@@ -94,148 +96,96 @@ function otherRelayBraves({ cacheRoot, ownDir, ownPid, timeoutMs = 2000, _execFi
           if (!udd) continue;
           mains.push({ pid: Number(m[1]), exe: executableOf(args), abs: path.resolve(udd) });
         }
-        const self = mains.find((p) => p.pid === ownPid) || mains.find((p) => isOwnDir(p.abs));
+        const self = mains.find((p) => p.pid === ownPid) || mains.find((p) => isOwnDir(p.abs)) || null;
         const pids = mains
           .filter((p) => p.pid !== ownPid && !isOwnDir(p.abs))
           .filter((p) => roots.some((r) => p.abs.startsWith(r)))
           .filter((p) => !self || p.exe === self.exe)
           .map((p) => p.pid);
-        finish({ ok: true, pids });
+        finish({ ok: true, pids, selfPid: self ? self.pid : null });
       });
   }, timeoutMs, { ok: false, reason: "ps-timeout" });
 }
 
-// Runs in each frame's main world. Returns the KIND of field someone may be
-// typing a secret into ("password" | "code" | "email-first"), or "" for none.
-// Review r2 (MEDIUM-1 false holds vs MEDIUM-2 missed 2FA boxes): strong signals
-// hold at any length, weak ones only on a short (maxlength 1..8) box that does
-// not read like an ordinary field:
-//   - password: a VISIBLE password input;
-//   - code: autocomplete one-time-code; a name / id / aria-label / placeholder /
-//     <label> text (camelCase split) with a strong word (otp, totp, mfa, 2fa,
-//     2sv, one time, passcode, two factor, 2 step, verification, verify,
-//     security / auth / authentication / sms / login / access code); a weak word
-//     (code, token, pin) on a short box with no ordinary-field word (zip,
-//     postal, country, currency, area, promo, discount, coupon, gift, voucher,
-//     referral, invite, hex, color, product, sku); or a run of 4+ visible
-//     maxlength=1 inputs under one parent (digit-per-box entry);
-//   - email-first: a visible email / username input in the same <form> (or the
-//     same shadow root) as any password input, visible or not.
-// Open shadow roots are walked; CLOSED roots are covered by closedRootSecret()
-// over CDP. Visible = layout boxes, > 1x1 px, checkVisibility (opacity /
-// visibility), and not placed entirely off the top/left of the page (the
-// left:-9999px anti-autofill trap).
+/**
+ * The frontmost process's pid, from one `lsappinfo list` (macOS; ~10 ms): the
+ * app line marked "(in front)", then its "pid = N" line. (`lsappinfo info
+ * <ASN>` returned nothing for some front apps when measured 2026-11-12.)
+ * @returns {Promise<{ok: true, pid: number} | {ok: false, reason: string}>} never throws.
+ */
+function frontmostPid({ timeoutMs = 2000, _execFile = execFile } = {}) {
+  return capped((finish) => {
+    _execFile("/usr/bin/lsappinfo", ["list"],
+      { encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: 16 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) return finish({ ok: false, reason: `lsappinfo: ${err.code || err.message}` });
+        const lines = String(stdout || "").split("\n");
+        const i = lines.findIndex((l) => l.includes("(in front)"));
+        if (i === -1) return finish({ ok: false, reason: "lsappinfo: no front app" });
+        for (let j = i + 1; j < lines.length && j <= i + 3; j++) {
+          const m = /\bpid = (\d+)/.exec(lines[j]);
+          if (m) return finish({ ok: true, pid: Number(m[1]) });
+        }
+        finish({ ok: false, reason: "lsappinfo: front app has no pid" });
+      });
+  }, timeoutMs, { ok: false, reason: "lsappinfo-timeout" });
+}
+
+/**
+ * The presence verdict from frontmost samples ({t, pid}, pid null = unknown), for
+ * the window [now - windowMs, now] sampled every intervalMs, against this relay's
+ * own Brave pid `self`:
+ *   "unknown"   — no own pid, the samples do not cover the window (first one later
+ *                 than two intervals after its start), or a sample in it failed;
+ *   "frontmost" — this Brave was in front at a sample in the window;
+ *   "away"      — covered, every sample known, never in front.
+ */
+function presenceVerdict(samples, { now, windowMs, intervalMs, self }) {
+  if (!self) return { verdict: "unknown", detail: "own Brave pid unknown" };
+  const since = now - windowMs;
+  const win = samples.filter((x) => x.t >= since - intervalMs && x.t <= now);
+  if (win.length === 0 || win[0].t > since + 2 * intervalMs) return { verdict: "unknown", detail: "samples do not cover the window" };
+  const failed = win.find((x) => x.pid === null);
+  if (failed) return { verdict: "unknown", detail: failed.reason || "a sample failed" };
+  return win.some((x) => x.pid === self) ? { verdict: "frontmost" } : { verdict: "away" };
+}
+
+// Runs in each frame's main world: true when an UNAMBIGUOUS secret field is
+// on the page — <input type=password>, or autocomplete current-password /
+// new-password / one-time-code (so a password shown with an "eye" toggle,
+// which turns it into type=text, still counts when the site marks it) — in
+// the document or any OPEN shadow root, with layout boxes (display:none and
+// detached inputs do not count; an opacity:0 code overlay does).
 const SECRET_FIELD_PROBE = `(() => {
-  const STRONG = /(^| )(otp|totp|mfa|2fa|2sv|one ?time|passcode|two ?factor|2 ?step|verification|verify|(security|auth|authentication|sms|login|access|sign ?in) (code|pin))( |$)/;
-  const WEAK = /(^| )(code|token|pin)( |$)/;
-  const ORDINARY = /(^| )(zip|postal|post|country|currency|area|promo|promotion|discount|coupon|gift|voucher|referral|invite|invitation|hex|color|colour|product|sku|tracking|reference|ref)( |$)/;
-  const words = (t) => String(t || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-  const inputs = [];
+  const AC = /(^|\\s)(current-password|new-password|one-time-code)(\\s|$)/;
   const walk = (root) => {
     for (const el of root.querySelectorAll("*")) {
-      if (el.tagName === "INPUT") inputs.push(el);
-      if (el.shadowRoot) walk(el.shadowRoot);
+      if (el.tagName === "INPUT") {
+        const t = String(el.type || "").toLowerCase();
+        const ac = String(el.getAttribute("autocomplete") || "").toLowerCase();
+        if ((t === "password" || AC.test(ac)) && el.getClientRects().length > 0) return true;
+      }
+      if (el.shadowRoot && walk(el.shadowRoot)) return true;
     }
+    return false;
   };
-  walk(document);
-  const visible = (el) => {
-    if (el.getClientRects().length === 0) return false;
-    if (typeof el.checkVisibility === "function" && !el.checkVisibility({ opacityProperty: true, visibilityProperty: true })) return false;
-    const r = el.getBoundingClientRect();
-    return r.width > 1 && r.height > 1 && r.right > 0 && r.bottom > 0;
-  };
-  const attr = (el, n) => String(el.getAttribute(n) || "").toLowerCase();
-  const textOf = (el) => {
-    const parts = [el.name, el.id, el.getAttribute("aria-label"), el.placeholder];
-    try { for (const l of el.labels || []) parts.push(l.textContent); } catch (e) {}
-    return words(parts.join(" "));
-  };
-  const TEXTY = ["text", "tel", "number", ""];
-  const isCode = (el, t) => {
-    if (/(^|\\s)one-time-code(\\s|$)/.test(attr(el, "autocomplete"))) return true;
-    if (!TEXTY.includes(t)) return false;
-    const w = textOf(el);
-    if (STRONG.test(w)) return true;
-    const ml = Number(el.maxLength);
-    return ml >= 1 && ml <= 8 && WEAK.test(w) && !ORDINARY.test(w);
-  };
-  const groupOf = (el) => el.form || (el.getRootNode() !== document ? el.getRootNode() : null);
-  const isUser = (el, t) => t === "email" || /(^|\\s)(username|email)(\\s|$)/.test(attr(el, "autocomplete"))
-    || (TEXTY.includes(t) && /(^| )(email|e mail|username|user name|login)( |$)/.test(words([el.name, el.id].join(" "))));
-  const passwordGroups = new Set();
-  for (const el of inputs) if (String(el.type).toLowerCase() === "password") { const g = groupOf(el); if (g) passwordGroups.add(g); }
-  const singleRuns = new Map();
-  for (const el of inputs) {
-    const t = String(el.type || "").toLowerCase();
-    if (!visible(el)) continue;
-    if (t === "password") return "password";
-    if (isCode(el, t)) return "code";
-    if (isUser(el, t) && passwordGroups.has(groupOf(el))) return "email-first";
-    if (Number(el.maxLength) === 1 && TEXTY.includes(t)) {
-      const k = el.parentElement && el.parentElement.parentElement ? el.parentElement.parentElement : el.parentNode;
-      singleRuns.set(k, (singleRuns.get(k) || 0) + 1);
-      if (singleRuns.get(k) >= 4) return "code";
-    }
-  }
-  return "";
+  return walk(document);
 })()`;
-
-const SECRET_TYPES = new Set(["password"]);
-/** Over CDP (DOM.getDocument pierce): an <input> inside a CLOSED shadow root that is a password field or a
- *  one-time-code / short code box. Visibility cannot be judged there, so any such input holds (the safe way). */
-function closedRootSecret(node, inClosed = false) {
-  if (!node || typeof node !== "object") return false;
-  if (inClosed && String(node.nodeName).toUpperCase() === "INPUT") {
-    const a = {};
-    const list = Array.isArray(node.attributes) ? node.attributes : [];
-    for (let i = 0; i + 1 < list.length; i += 2) a[String(list[i]).toLowerCase()] = String(list[i + 1]).toLowerCase();
-    const ml = Number(a.maxlength);
-    if (SECRET_TYPES.has(a.type) || /(^|\s)one-time-code(\s|$)/.test(a.autocomplete || "")
-      || (ml >= 1 && ml <= 8 && ["text", "tel", "number", undefined].includes(a.type))) return true;
-  }
-  for (const c of node.children || []) if (closedRootSecret(c, inClosed)) return true;
-  for (const r of node.shadowRoots || []) if (closedRootSecret(r, inClosed || r.shadowRootType === "closed")) return true;
-  if (node.contentDocument && closedRootSecret(node.contentDocument, inClosed)) return true;
-  return false;
-}
 
 function hostOf(url) {
   try { return new URL(url).hostname || null; } catch { return null; }
 }
 
-// Playwright's error for a frame that shares its parent's process (no CDP session of its own).
-const SAME_PROCESS_FRAME = /separate CDP session|part of the parent frame/i;
-
-/** Closed-root read of one target (a page, or an out-of-process frame) over its own CDP session.
- *  true / false; "same-process" for a frame without its own session; throws when unreadable. */
-async function closedRootRead(context, target) {
-  let session = null;
-  try {
-    try { session = await context.newCDPSession(target); } catch (e) {
-      if (SAME_PROCESS_FRAME.test(String(e && e.message))) return "same-process";
-      throw e;
-    }
-    const { root } = await session.send("DOM.getDocument", { depth: -1, pierce: true });
-    return closedRootSecret(root);
-  } finally {
-    if (session) { try { await session.detach(); } catch { /* gone */ } }
-  }
-}
-
 /**
- * Must this Brave stay open through the overlap window because someone may be
- * signing in on it? Reads every frame of every tab of `context` (a Playwright
- * BrowserContext), plus each non-blank tab's — and each out-of-process frame's
- * — closed shadow roots over CDP. Never throws; anything it cannot read holds.
- * `closedCache` (a Map the caller clears on activity): the closed-root result
- * per target URL, so the full-DOM CDP read runs once per page per idle period
- * (review r2 LOW-2: 34 MB per tick on a 100k-node page).
- * @returns {Promise<{hold: boolean, reason: string, kind?: string, host?: string|null}>}
+ * Must this Brave stay open through the overlap window because of what its
+ * tabs show? A known sign-in page, or an unambiguous secret field in any frame
+ * (SECRET_FIELD_PROBE). Never throws; a frame that cannot be read holds.
+ * (The presence hold — frontmost — is the caller's.)
+ * @returns {Promise<{hold: boolean, reason: string, host?: string|null}>}
  *   reason: "sign-in-page" | "secret-field" | "unreadable" | "none"
  */
-async function signInHold(context, { timeoutMs = 4000, closedCache = null } = {}) {
+async function signInHold(context, { timeoutMs = 4000 } = {}) {
   const unreadable = (host = null) => ({ hold: true, reason: "unreadable", host });
-  const secret = (kind, host) => ({ hold: true, reason: "secret-field", kind, host });
   const run = async () => {
     let pages;
     try { pages = context.pages(); } catch { return unreadable(); }
@@ -251,22 +201,7 @@ async function signInHold(context, { timeoutMs = 4000, closedCache = null } = {}
       for (const f of frames) {
         let has;
         try { has = await f.evaluate(SECRET_FIELD_PROBE); } catch { return unreadable(host); }
-        if (has === true) return secret("password", host);
-        if (typeof has === "string" && has) return secret(has, host);
-      }
-      // Closed shadow roots: the page target, then each child frame that has its own process.
-      const targets = [[page, pageUrl], ...frames.slice(1).map((f) => [f, (() => { try { return f.url(); } catch { return ""; } })()])];
-      for (const [target, url] of targets) {
-        const key = target === page ? `page ${url}` : `frame ${url}`;
-        if (closedCache && closedCache.has(key)) {
-          if (closedCache.get(key)) return secret("closed-root", host);
-          continue;
-        }
-        let r;
-        try { r = await closedRootRead(context, target); } catch { return unreadable(host); }
-        if (r === "same-process") continue;
-        if (closedCache) closedCache.set(key, r);
-        if (r) return secret("closed-root", host);
+        if (has === true) return { hold: true, reason: "secret-field", host };
       }
     }
     return { hold: false, reason: "none" };
@@ -275,4 +210,4 @@ async function signInHold(context, { timeoutMs = 4000, closedCache = null } = {}
     Math.max(0, timeoutMs - 1000), unreadable());
 }
 
-module.exports = { otherRelayBraves, signInHold, userDataDirOf, executableOf, closedRootSecret, SECRET_FIELD_PROBE, BLANK_URLS };
+module.exports = { otherRelayBraves, frontmostPid, presenceVerdict, signInHold, userDataDirOf, executableOf, SECRET_FIELD_PROBE, BLANK_URLS };
