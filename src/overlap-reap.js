@@ -16,7 +16,8 @@
 // review rounds traded false holds for missed 2FA boxes), so Trevor ruled a
 // PRESENCE hold (ask as-ops/ask-b7xcc7 rev 2, "Hold while you're using it"):
 //   1. this relay's Brave was the FRONTMOST process at any sample in the last
-//      overlap window (frontmostPid(): `lsappinfo list`, sampled by the caller);
+//      overlap window (frontmostPid(): `lsappinfo front` + `info -only pid`,
+//      `lsappinfo list` only as a fallback; sampled by the caller);
 //   2. a known account's sign-in page is open (known-accounts matchSignInPage);
 //   3. an unambiguous secret field is on a tab: an <input type=password>, or an
 //      input whose autocomplete says current-password / new-password /
