@@ -198,6 +198,16 @@ tracked active page.
 
 ---
 
+
+**Recurrence 2026-11-16, ~21:55Z (AS-VIDEO-ADS-11, reported to CLAUDE-SKILLS-OPTIMIZATION-55):** on the **base profile**
+`as-video-ads` (not a clone), three tries at an Adobe Stock licensed download (Download button → 302 to a presigned S3
+URL) all failed with `download.saveAs: ENOENT … copyfile '/var/folders/…/T/playwright-artifacts-<X>/<uuid>' -> <savePath>`,
+with and without `savePath`. The artifacts dir existed but the file never appeared, and nothing reached `~/Downloads`.
+**Cost:** each retry re-licensed the asset, and one retry picked 4K and spent a free Adobe credit — so a retry of a
+paid download is not harmless; raise this item's priority and consider refusing a retry when the click is a purchase.
+Workaround used: Playwright `page.waitForResponse` on the 302 inside relay `execute`, then `curl` the presigned Location.
+Related DX ask from the same report: `o11y_get-http-requests` with `includeResponseHeaders` returns the full CSP header
+(~6 KB per request) and overflows quickly — a URL filter (or header allow-list) would help.
 ### Re-attaching to a still-alive Brave restarts the upstream child (accepted, 2026-10-07)
 
 Since the upstream-restart fix, every new Brave handle bumps a generation and replaces the upstream child, because
