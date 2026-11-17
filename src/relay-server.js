@@ -27,7 +27,11 @@ const { EventEmitter } = require("node:events");
 const metaGuard = require("./meta-guard.js");
 const sync = require("./own-tools/_upstream-sync.js");
 const { pinUpstreamToActivePage } = require("./own-tools/_propagate-active-page.js");
+const pinLock = require("./own-tools/_pin-lock.js");
 const requestBodyFilter = require("./request-body-filter.js");
+
+// The own tools that move upstream's pin (_pin-lock.js: they run exclusive).
+const PIN_MOVERS = new Set(["tabs_new", "tabs_select"]);
 
 // Cap each emitted event's response body at this size (in JSON-stringified
 // chars). capture_xhr / lighthouse_audit can return MB-scale responses;
@@ -194,14 +198,29 @@ class RelayServer {
 
     let status = "ok";
     let response;
+    let pinHold = null;
     try {
       // Meta guard layer 1 (spec v4 §1d): refuse Meta URLs and Meta cookies
       // before any browser work — the agent gets the route, not a 403 page.
       const blocked = metaGuard.checkToolArgs(name, args);
+      // Review r1 L2: a forwarded call holds the pin (shared) from its re-pin to
+      // the end of its upstream call, so a tabs_new / tabs_select (exclusive)
+      // cannot move it between the policy's check of upstream's page and the
+      // call that check allowed.
+      if (!blocked && !isOwn) pinHold = await pinLock.shared();
       let pre = null;
       if (!blocked && this.policy) {
         pre = await this.policy.beforeCall(name, args || {}, {
-          ensureBrave: async () => { if (this.ensureBrave && (!isOwn || own.needsBrave)) await this.ensureBrave(); },
+          ensureBrave: async () => {
+            if (this.ensureBrave && (!isOwn || own.needsBrave)) await this.ensureBrave();
+            // Review r1 L2: the policy checks upstream's page next (plain-flags'
+            // field check): pin it to the selected tab first — a restarted
+            // upstream is on a fresh blank of its own.
+            if (!isOwn) {
+              await this.getUpstream();
+              if (!requestBodyFilter.refuseUnpatched(name)) await pinUpstreamToActivePage();
+            }
+          },
         });
         if (!pre.refusal) args = pre.args;
       }
@@ -214,6 +233,7 @@ class RelayServer {
         // populates that — except for tools that never touch the browser
         // (needsBrave: false, e.g. relay_status), which must not launch one.
         if (this.ensureBrave && own.needsBrave) await this.ensureBrave();
+        const moverHold = PIN_MOVERS.has(name) ? await pinLock.exclusive() : null;
         try {
           response = await own.handler(args || {});
         } catch (e) {
@@ -221,6 +241,8 @@ class RelayServer {
             content: [{ type: "text", text: `[mcp-relay] tool "${name}" failed: ${e.message}` }],
             isError: true,
           };
+        } finally {
+          if (moverHold) moverHold();
         }
       } else {
         // Forwarded — upstream lazily attaches via CDP. Brave must be up first.
@@ -238,6 +260,8 @@ class RelayServer {
         // Upstream acts on the tab tabs_new / tabs_select made active: re-pin
         // it there when it is pinned elsewhere (a restarted upstream, or one
         // that re-created its page). A failed pin is a desync (rules A, B).
+        // Again after a policy's pre-check pin: ensureBrave()/getUpstream()
+        // above may have respawned upstream (one read when it is in place).
         if (!unpatched) await pinUpstreamToActivePage();
         if (unpatched) {
           response = unpatched;
@@ -289,6 +313,8 @@ class RelayServer {
       } catch { /* stderr itself is gone */ }
     }
       throw e;
+    } finally {
+      if (pinHold) pinHold();
     }
 
     const durationMs = Number(process.hrtime.bigint() - startHr) / 1_000_000;

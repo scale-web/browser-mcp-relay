@@ -61,7 +61,9 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 page it pins. `tabs_new` and `tabs_select` move that pin to the relay's tab by CDP target id (a startup patch of
 upstream's bundle, `scripts/patch-bdmcp-repin.js`); nothing is navigated to follow, so a URL loads in one tab and
 selecting an earlier tab gives upstream that tab with its page and typed input intact. Before each upstream call the
-relay re-pins upstream to the tab `tabs_new` / `tabs_select` last selected, if it is elsewhere (a restarted upstream).
+relay re-pins upstream to the tab `tabs_new` / `tabs_select` last selected, if it is elsewhere (a restarted upstream),
+before any check the relay makes of upstream's page; a `tabs_new` / `tabs_select` waits for running upstream calls to
+finish, and upstream calls made meanwhile wait for it, so a check and the call it allows act on one tab.
 Upstream's own first tab, opened when it starts, is closed by the first pin while it is still blank. `tabs_new` navigates
 a leftover blank only when it is the relay's (Brave's launch tab, or one `tabs_new` made), never an attached Brave's or
 the user's. **Console and network capture** (`o11y_*`) follow the pin: a tab records into upstream's buffers only while
