@@ -53,7 +53,7 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
 | `tabs_list` | List open tabs by index + URL | — | "Where did I leave that page?" |
-| `tabs_new` | Open a new tab | `url` | Spawn a side-panel comparison |
+| `tabs_new` | Open a tab on `url` (reuses a same-host tab; with none, the tab upstream tools act on, when the relay put its page there) | `url` | Spawn a side-panel comparison |
 | `tabs_select` | Bring a tab to front | `index` | Switch to a specific tab before interacting |
 | `tabs_close` | Close a tab by index | `index` | Tear down workflow tabs |
 
@@ -90,7 +90,20 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
-| `download_capture` | Wait for a download, save to disk | `clickSelector` | Trigger + save a CSV export |
+| `download_capture` | Wait for a download, save to disk | `clickSelector`, `allowRepeatClick` | Trigger + save a CSV export |
+
+**Where the file lands.** Every Playwright client on the browser sets Chrome's download directory when it attaches, and the
+last one wins — in the relay that is always upstream. So `download_capture` points the browser at a directory of its own
+(`$TMPDIR/relay-download-*`, made for the call) immediately before its click, keeps that CDP session open until the
+download has finished, copies the file to `savePath`, and removes the directory. Once the call ends, downloads that
+nothing captures are back in Chrome's default handling. The download may follow a redirect to another origin (a presigned
+S3 URL, say).
+
+**Repeat clicks are refused.** A second `clickSelector` click on the same page URL + selector within **10 minutes** is
+refused unless the call passes `allowRepeatClick: true` — a retry of a paid download can buy it again (2026-11-16: each
+retry re-licensed an Adobe Stock asset). A click that timed out before Playwright dispatched it does not count. Every
+failure after a click (no download, a failed download, a failed save) says the server may already have served or charged
+for the file: check before clicking again.
 
 #### 🗄️ Storage (added in v0.3.0)
 
