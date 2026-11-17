@@ -26,31 +26,49 @@
 // One call at a time: Browser.setDownloadBehavior is browser-wide, so with two
 // calls in flight the last one's dir wins and the first one's detach cancels the
 // other's download (review r1 M2, measured). Calls queue on a module-level
-// chain; nothing is refused for that. The own dir is removed after the session
-// detaches, and once more a second later in case Chrome recreated it.
+// chain. A queued call waits at most QUEUE_WAIT_MS (2 min) for its turn, or
+// until its caller's abort signal fires (the handler's second argument,
+// { signal }: relay-server.js does not pass it yet — see docs/BACKLOG.md); then
+// it is refused without clicking and its reservation is released (review r2
+// M3). Every CDP step (newCDPSession, setDownloadBehavior, cancel, detach, the
+// download's path) is bounded by CDP_STEP_MS (10 s), so one hung CDP call can no
+// longer hold the queue forever. The own dir is removed after the session
+// detaches, and always once more a second later in case Chrome recreated it; a
+// failed removal is logged and never changes the call's result (review r2 M1).
 //
-// Bounded wait: once a download has started, the tool waits at most
-// DOWNLOAD_FINISH_MS (10 min) for it to finish; then it cancels it, detaches and
-// removes its dir, and says so — a stalled download no longer holds the CDP
-// session and the dir forever.
+// Bounded wait: once a download has started, the tool cancels it after
+// STALL_MS (2 min) without progress, read from Chrome's Browser.downloadProgress
+// events on the tool's own CDP session (measured 2026-11-17 on Chrome for
+// Testing: they arrive there, receivedBytes rising). A download that keeps
+// progressing is not cancelled unless the caller passes maxDownloadMs, an
+// overall limit from the download's start. With no progress events at all (no
+// own session, or the events went elsewhere), the old fixed bound applies:
+// FALLBACK_FINISH_MS (10 min).
 //
 // Repeat-click guard: on 2026-11-16 each retry of a failed download re-licensed
 // a paid Adobe Stock asset. A clickSelector click on the same page (origin +
-// path of its URL when the call starts: another query string or fragment is the
-// same page) + the same selector within REPEAT_CLICK_WINDOW_MS (10 min: longer
-// than a retry loop, shorter than a deliberate second purchase usually takes) is
-// refused unless the caller passes allowRepeatClick: true. The click is
-// RESERVED at call start, before any await, in one locked read-modify-write of
-// <userCacheRoot>/.download-clicks.json (reap-hold.js withFileLock, the
-// challenge-clicks pattern; a hash of the key, never the URL), so a concurrent
-// call, a restarted relay, a /resume and another relay on the same machine all
-// see it. The reservation is kept once the click is attempted, whatever the
-// click's outcome (a click Playwright dispatched can still time out waiting
-// for the navigation it scheduled — review r1 H1); it is released only when
-// the call ends before the click is attempted. An unreadable reservation file
-// refuses (fail closed). NOT covered: a different selector for the same
-// button, and an interaction_click (or execute) followed by download_capture
-// without clickSelector — the guard sees only its own clickSelector clicks.
+// path of its URL: another query string or fragment is the same page) + the
+// same selector within REPEAT_CLICK_WINDOW_MS (10 min from the click attempt:
+// longer than a retry loop, shorter than a deliberate second purchase usually
+// takes) is refused unless the caller passes allowRepeatClick: true, which
+// overrides that one key only. The click is RESERVED at call start, before any
+// await, in one locked read-modify-write of <userCacheRoot>/.download-clicks.json
+// (reap-hold.js withFileLock, the challenge-clicks pattern; a hash of the key,
+// never the URL), so a concurrent call, a restarted relay, a /resume and
+// another relay on the same machine all see it. When the call's turn comes,
+// immediately before the click and with no await in between, the page's
+// origin + path is checked against the reserved key (a page that moved is
+// refused) and the reservation's time is rewritten to the click attempt under
+// the lock, so the 10 minutes run from the click (review r2 M2). The
+// reservation is kept once the click is attempted, whatever the click's outcome
+// (a click Playwright dispatched can still time out waiting for the navigation
+// it scheduled — review r1 H1); it is released only when the call ends before
+// the click is attempted. An unreadable reservation file refuses every
+// clickSelector call, allowRepeatClick included (fail closed); removing the file
+// resets it and clears every relay's reservations. NOT covered: a different
+// selector for the same button, and an interaction_click (or execute) followed
+// by download_capture without clickSelector — the guard sees only its own
+// clickSelector clicks.
 
 const path = require("node:path");
 const os = require("node:os");
@@ -60,12 +78,16 @@ const { withActivePage } = require("./_active-page.js");
 const { withFileLock } = require("../reap-hold.js");
 
 const REPEAT_CLICK_WINDOW_MS = 10 * 60 * 1000;
-let DOWNLOAD_FINISH_MS = 10 * 60 * 1000;
+const DEFAULTS = { stall: 2 * 60 * 1000, cdpStep: 10 * 1000, queueWait: 2 * 60 * 1000 };
+const FALLBACK_FINISH_MS = 10 * 60 * 1000;
+let STALL_MS = DEFAULTS.stall;
+let CDP_STEP_MS = DEFAULTS.cdpStep;
+let QUEUE_WAIT_MS = DEFAULTS.queueWait;
 const STATE_FILE = ".download-clicks.json";
 const STATE_LOCK = ".download-clicks.flock";
 const CHARGE_WARNING = "The server may already have served (or charged for) this file: check whether it "
   + "was delivered or billed before clicking again, and do not retry blindly. A repeat click on this page + "
-  + "selector is refused for 10 min unless you pass allowRepeatClick: true.";
+  + "selector is refused for 10 min from the click unless you pass allowRepeatClick: true.";
 
 let stateDirOverride = null;
 /** Where the reservations live: the relay's cache root (shared by every relay
@@ -82,9 +104,10 @@ function clickKeyOf(pageUrl, selector) {
 }
 
 /** Run `fn(entries)` on the live reservations under the file's lock; `fn` may
- *  change them, and they are written back when it returns true. Returns fn's
- *  result, or { error } (lock busy or unopenable, file unreadable: fail closed). */
-function withReservations(fn, { resetUnreadable = false } = {}) {
+ *  change them, and they are written back when it returns { write: true }.
+ *  Returns fn's result, or { error } (lock busy or unopenable, file unreadable
+ *  or unwritable: fail closed). An unreadable file is never overwritten. */
+function withReservations(fn) {
   const root = stateDir();
   try { fs.mkdirSync(root, { recursive: true, mode: 0o700 }); } catch { /* exists */ }
   const file = path.join(root, STATE_FILE);
@@ -96,7 +119,10 @@ function withReservations(fn, { resetUnreadable = false } = {}) {
       if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("not an object");
       entries = v;
     } catch (e) {
-      if (e.code !== "ENOENT" && !resetUnreadable) { out = { error: `reservation file ${file} is unreadable (${e.message}); remove it to reset` }; return; }
+      if (e.code !== "ENOENT") {
+        out = { error: `reservation file ${file} is unreadable (${e.message}); removing it resets it, which also clears every other relay's reservations` };
+        return;
+      }
     }
     const now = Date.now();
     for (const [k, v] of Object.entries(entries)) {
@@ -116,14 +142,29 @@ function withReservations(fn, { resetUnreadable = false } = {}) {
   return out;
 }
 
-/** Reserve the click for `key`, synchronously: { at } or { prevAt } or { error }. */
+/** Reserve the click for `key`, synchronously: { at } or { prevAt, prevPid } or
+ *  { error }. allowRepeat overrides this key only. */
 function reserveClick(key, allowRepeat) {
   return withReservations((entries, now) => {
     const prev = entries[key];
-    if (prev && !allowRepeat) return { write: false, result: { prevAt: Number(prev.at) } };
+    if (prev && !allowRepeat) return { write: false, result: { prevAt: Number(prev.at), prevPid: prev.pid } };
     entries[key] = { at: now, pid: process.pid };
     return { write: true, result: { at: now } };
-  }, { resetUnreadable: allowRepeat });
+  });
+}
+
+/** At the click attempt: rewrite OUR reservation's time to now, so the window
+ *  runs from the click. Another call's reservation in its place (ours expired
+ *  and was taken, or an allowRepeatClick call replaced it) refuses, unless
+ *  allowRepeat. Returns { at } or { prevAt, prevPid } or { error }. */
+function confirmClick(reservation, allowRepeat) {
+  return withReservations((entries, now) => {
+    const e = entries[reservation.key];
+    const ours = e && Number(e.at) === reservation.at && e.pid === process.pid;
+    if (e && !ours && !allowRepeat) return { write: false, result: { prevAt: Number(e.at), prevPid: e.pid } };
+    entries[reservation.key] = { at: now, pid: process.pid };
+    return { write: true, result: { at: now } };
+  });
 }
 
 /** Undo OUR reservation (the call ended before the click was attempted). */
@@ -136,25 +177,95 @@ function releaseClick(key, at) {
   });
 }
 
-// One download_capture at a time (see the header): a queue, never a refusal.
+/** `fn()`'s promise, or a rejection after `ms` (the step is abandoned, not
+ *  undone). A synchronous throw from `fn` is a rejection too. */
+function bounded(fn, ms, what) {
+  let timer;
+  return Promise.race([
+    new Promise((resolve) => resolve(fn())),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} did not answer in ${ms} ms`)), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+// One download_capture at a time (see the header). A waiting call gives up
+// after QUEUE_WAIT_MS or when `signal` aborts: it then resolves { gaveUp }, and
+// its fn never runs. A call that has started is never abandoned (its own steps
+// are bounded).
 let chain = Promise.resolve();
-function serialized(fn) {
-  const run = chain.then(fn);
-  chain = run.then(() => {}, () => {});
-  return run;
+function serialized(fn, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    let state = "waiting"; // -> "running" | "gave-up"
+    let timer = null;
+    const onAbort = () => giveUp("aborted");
+    const settle = () => { clearTimeout(timer); if (signal) signal.removeEventListener("abort", onAbort); };
+    function giveUp(why) {
+      if (state !== "waiting") return;
+      state = "gave-up";
+      settle();
+      resolve({ gaveUp: why });
+    }
+    timer = setTimeout(() => giveUp("wait"), QUEUE_WAIT_MS);
+    if (signal) {
+      if (signal.aborted) giveUp("aborted");
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
+    const run = chain.then(() => {
+      if (state !== "waiting") return undefined;
+      state = "running";
+      settle();
+      return fn();
+    });
+    chain = run.then(() => {}, () => {});
+    run.then((v) => { if (state === "running") resolve(v); }, (e) => { if (state === "running") reject(e); });
+  });
 }
 
 /** Point the browser's downloads at `dir` (the last setDownloadBehavior wins).
- *  Returns the CDP session: detaching it resets the override (see the header). */
+ *  Returns the CDP session: detaching it resets the override (see the header).
+ *  Each step is bounded; a session that arrives after its bound is detached. */
 async function pointDownloadsAt(page, dir) {
-  const session = await page.context().newCDPSession(page);
+  let pending = null;
+  let session;
   try {
-    await session.send("Browser.setDownloadBehavior", { behavior: "allowAndName", downloadPath: dir, eventsEnabled: true });
+    session = await bounded(() => (pending = page.context().newCDPSession(page)), CDP_STEP_MS, "newCDPSession");
   } catch (e) {
-    session.detach().catch(() => { /* page closing */ });
+    if (pending) Promise.resolve(pending).then((s) => { bounded(() => s.detach(), CDP_STEP_MS, "detach").catch(() => {}); }, () => {});
+    throw e;
+  }
+  try {
+    await bounded(() => session.send("Browser.setDownloadBehavior", { behavior: "allowAndName", downloadPath: dir, eventsEnabled: true }), CDP_STEP_MS, "Browser.setDownloadBehavior");
+  } catch (e) {
+    bounded(() => session.detach(), CDP_STEP_MS, "detach").catch(() => { /* page closing */ });
     throw e;
   }
   return session;
+}
+
+/** Remove an own dir; a failure (Chrome still writing: ENOTEMPTY) is logged and
+ *  never thrown. Always once more a second later. */
+function removeOwnDir(d) {
+  try {
+    fs.rmSync(d, { recursive: true, force: true });
+  } catch (e) {
+    process.stderr.write(`[mcp-relay] download_capture: own dir ${d} not removed yet (${e.code || e.message}); retrying in 1 s\n`);
+  }
+  setTimeout(() => { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* left: $TMPDIR/relay-download-* */ } }, 1000).unref();
+}
+
+/** The repeat-click refusal: who made the earlier click, and how long ago. */
+function repeatRefusal(clickSelector, prevAt, prevPid) {
+  const who = prevPid === process.pid
+    ? "by this relay"
+    : `by another relay on this machine (another session or browser profile${Number.isInteger(prevPid) ? `, pid ${prevPid}` : ""})`;
+  return refused(`a click on ${JSON.stringify(clickSelector)} at this page's address (origin + path) was made ${who} `
+    + `${Math.max(0, Math.round((Date.now() - prevAt) / 1000))}s ago. `
+    + "A repeat click may download the file again, and the server may already have served or charged for it "
+    + "(a paid asset is licensed per click). Check whether the first download was delivered or billed; "
+    + "to click again anyway, pass allowRepeatClick: true.");
+}
+
+function refused(why) {
+  return { content: [{ type: "text", text: `download_capture REFUSED: ${why}` }], isError: true };
 }
 
 // F1-14 (2026-05-10): control-char range built from char codes so the source
@@ -207,8 +318,9 @@ module.exports = {
     "disk. Returns the saved file path. Call AFTER triggering the action that " +
     "starts the download (or use clickSelector to trigger inside this tool). " +
     "Default save location is OS temp dir with the suggested filename. " +
-    "A second clickSelector click on the same page + selector within 10 min is refused " +
-    "(a retry can re-buy a paid download) unless allowRepeatClick is true.",
+    "A second clickSelector click on the same page + selector within 10 min of the first is refused " +
+    "(a retry can re-buy a paid download) unless allowRepeatClick is true. A started download is " +
+    "cancelled after 2 min without progress, or at maxDownloadMs if given.",
   inputSchema: {
     type: "object",
     properties: {
@@ -230,38 +342,36 @@ module.exports = {
         default: false,
         description: "Click clickSelector even though it was clicked on this page in the last 10 min. Only after checking the first click's download was not delivered or billed.",
       },
+      maxDownloadMs: {
+        type: "integer",
+        description: "Optional overall limit for a started download, from its start. Without it, a download is cancelled only after 2 min without progress.",
+      },
     },
   },
-  handler: async ({ clickSelector, savePath, timeoutMs = 30000, allowRepeatClick = false }) => withActivePage(({ page }) => {
+  handler: async ({ clickSelector, savePath, timeoutMs = 30000, allowRepeatClick = false, maxDownloadMs }, extra) => withActivePage(({ page }) => {
+    const signal = extra && extra.signal;
+    const allowRepeat = allowRepeatClick === true;
     // Reserve the click NOW, before any await (see the header).
     let reservation = null;
     if (clickSelector) {
       const key = clickKeyOf(page.url(), clickSelector);
-      const r = reserveClick(key, allowRepeatClick === true);
-      if (r.error) {
-        return { content: [{ type: "text", text: `download_capture REFUSED: ${r.error}. A click could not be checked against recent clicks, so it was not made.` }], isError: true };
-      }
-      if (r.prevAt !== undefined) {
-        return {
-          content: [{
-            type: "text",
-            text: `download_capture REFUSED: ${JSON.stringify(clickSelector)} on this page was clicked ${Math.max(0, Math.round((Date.now() - r.prevAt) / 1000))}s ago. `
-              + "A repeat click may download the file again, and the server may already have served or charged for it "
-              + "(a paid asset is licensed per click). Check whether the first download was delivered or billed; "
-              + "to click again anyway, pass allowRepeatClick: true.",
-          }],
-          isError: true,
-        };
-      }
+      const r = reserveClick(key, allowRepeat);
+      if (r.error) return refused(`${r.error}. A click could not be checked against recent clicks, so it was not made.`);
+      if (r.prevAt !== undefined) return repeatRefusal(clickSelector, r.prevAt, r.prevPid);
       reservation = { key, at: r.at };
     }
     const st = { clickAttempted: false, download: null, finished: false };
-    return serialized(async () => {
-      try {
-        return await setUpAndCapture({ page, clickSelector, savePath, timeoutMs, st });
-      } finally {
-        if (reservation && !st.clickAttempted) releaseClick(reservation.key, reservation.at);
-      }
+    const maxMs = Number.isFinite(maxDownloadMs) && maxDownloadMs > 0 ? maxDownloadMs : null;
+    return serialized(
+      () => setUpAndCapture({ page, clickSelector, savePath, timeoutMs, maxDownloadMs: maxMs, st, reservation, allowRepeat, signal }),
+      { signal },
+    ).then((r) => {
+      if (!r || !r.gaveUp) return r;
+      return refused(r.gaveUp === "aborted"
+        ? "the caller cancelled the request while it waited for its turn — not clicked, nothing captured."
+        : `waited ${Math.round(QUEUE_WAIT_MS / 1000)} s behind another download_capture call — not clicked, nothing captured. Calling again is not a repeat click.`);
+    }).finally(() => {
+      if (reservation && !st.clickAttempted) releaseClick(reservation.key, reservation.at);
     });
   }),
   // F1-14: exported as a test seam.
@@ -269,12 +379,15 @@ module.exports = {
   REPEAT_CLICK_WINDOW_MS,
   /** Test seam: the reservations' dir (null = the relay's cache root). */
   _setStateDir(dir) { stateDirOverride = dir; },
-  /** Test seam: the finish bound (null = 10 min). */
-  _setDownloadFinishMs(ms) { DOWNLOAD_FINISH_MS = ms == null ? 10 * 60 * 1000 : ms; },
+  /** Test seams (null = the default). */
+  _setStallMs(ms) { STALL_MS = ms == null ? DEFAULTS.stall : ms; },
+  _setCdpStepMs(ms) { CDP_STEP_MS = ms == null ? DEFAULTS.cdpStep : ms; },
+  _setQueueWaitMs(ms) { QUEUE_WAIT_MS = ms == null ? DEFAULTS.queueWait : ms; },
+  _reserveClick: reserveClick,
 };
 
 /** Inside the queue: the download wait, the own dir and its session, then capture(). */
-async function setUpAndCapture({ page, clickSelector, savePath, timeoutMs, st }) {
+async function setUpAndCapture({ page, clickSelector, savePath, timeoutMs, maxDownloadMs, st, reservation, allowRepeat, signal }) {
   if (typeof page.isClosed === "function" && page.isClosed()) {
     return { content: [{ type: "text", text: "download_capture: the page closed before this call's turn" }], isError: true };
   }
@@ -309,28 +422,81 @@ async function setUpAndCapture({ page, clickSelector, savePath, timeoutMs, st })
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-download-"));
     session = await pointDownloadsAt(page, dir);
   } catch (e) {
-    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+    if (dir) removeOwnDir(dir);
     dir = null;
     process.stderr.write(`[mcp-relay] download_capture: own download dir not set (${e.message}) — falling back to saveAs\n`);
   }
+  // Progress of downloads, from Chrome's events on our own session (see the header).
+  const progress = { seen: false, last: Date.now(), bytes: new Map() };
+  const onProgress = (e) => {
+    progress.seen = true;
+    const got = Number(e && e.receivedBytes) || 0;
+    const key = e && e.guid;
+    if (!progress.bytes.has(key) || got > progress.bytes.get(key) || (e && e.state !== "inProgress")) {
+      progress.bytes.set(key, got);
+      progress.last = Date.now();
+    }
+  };
+  if (session && typeof session.on === "function") session.on("Browser.downloadProgress", onProgress);
   try {
-    return await capture({ page, clickSelector, savePath, timeoutMs, downloadPromise, closePromise, onClose, dir, st });
+    return await capture({ page, clickSelector, savePath, timeoutMs, maxDownloadMs, downloadPromise, closePromise, onClose, dir, st, reservation, allowRepeat, signal, progress });
   } finally {
     // A download that did not finish is cancelled first, so nothing writes into the dir after it goes.
-    if (st.download && !st.finished) await st.download.cancel().catch(() => { /* gone */ });
-    if (session) await session.detach().catch(() => { /* page closed */ });
-    if (dir) {
-      const d = dir;
-      fs.rmSync(d, { recursive: true, force: true });
-      // Chrome can recreate the dir for a write already under way: once more, later.
-      setTimeout(() => { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } }, 1000).unref();
+    // Each step is bounded, and none of them can change the result.
+    if (st.download && !st.finished) await bounded(() => st.download.cancel(), CDP_STEP_MS, "download.cancel").catch(() => { /* gone or hung */ });
+    if (session) {
+      if (typeof session.off === "function") session.off("Browser.downloadProgress", onProgress);
+      await bounded(() => session.detach(), CDP_STEP_MS, "detach").catch(() => { /* page closed or hung */ });
     }
+    if (dir) removeOwnDir(dir);
   }
 }
 
+/** Resolves when the download finishes (its failure string, or null); rejects
+ *  when it stalls, passes maxDownloadMs, or (no progress events) the fallback bound. */
+function finishOrGiveUp(download, progress, maxDownloadMs) {
+  const started = Date.now();
+  progress.last = started; // the start is progress
+  let timer;
+  const watchdog = new Promise((_, reject) => {
+    const tick = () => {
+      const now = Date.now();
+      if (maxDownloadMs && now - started >= maxDownloadMs) {
+        return reject(new Error(`the download did not finish within maxDownloadMs (${maxDownloadMs} ms); cancelled`));
+      }
+      if (progress.seen && now - progress.last >= STALL_MS) {
+        return reject(new Error(`the download did not finish: no progress for ${Math.round(STALL_MS / 1000)} s; cancelled`));
+      }
+      if (!progress.seen && now - started >= FALLBACK_FINISH_MS) {
+        return reject(new Error(`the download did not finish in ${Math.round(FALLBACK_FINISH_MS / 1000)} s (no progress reported); cancelled`));
+      }
+      timer = setTimeout(tick, 200);
+    };
+    timer = setTimeout(tick, 200);
+  });
+  return Promise.race([download.failure(), watchdog]).finally(() => clearTimeout(timer));
+}
+
 /** The click, the wait and the copy; the caller owns `dir` and its CDP session. */
-async function capture({ page, clickSelector, savePath, timeoutMs, downloadPromise, closePromise, onClose, dir, st }) {
+async function capture({ page, clickSelector, savePath, timeoutMs, maxDownloadMs, downloadPromise, closePromise, onClose, dir, st, reservation, allowRepeat, signal, progress }) {
   if (clickSelector) {
+    // At the click, with no await from here to page.click (see the header).
+    let refusal = null;
+    if (signal && signal.aborted) {
+      refusal = refused("the caller cancelled the request before its turn — not clicked, nothing captured.");
+    } else if (reservation && clickKeyOf(page.url(), clickSelector) !== reservation.key) {
+      refusal = refused("the page's address (origin + path) changed while this call waited for its turn — not clicked. "
+        + "Go back to the page and call again if that click is still wanted; it is not a repeat click.");
+    } else if (reservation) {
+      const c = confirmClick(reservation, allowRepeat);
+      if (c.error) refusal = refused(`${c.error}. A click could not be checked against recent clicks, so it was not made.`);
+      else if (c.prevAt !== undefined) refusal = repeatRefusal(clickSelector, c.prevAt, c.prevPid);
+      else reservation.at = c.at;
+    }
+    if (refusal) {
+      if (onClose) page.off("close", onClose);
+      return refusal;
+    }
     st.clickAttempted = true; // from here on the reservation stands, whatever happens
     try {
       await page.click(clickSelector, { timeout: timeoutMs });
@@ -377,17 +543,13 @@ async function capture({ page, clickSelector, savePath, timeoutMs, downloadPromi
   const dst = savePath || path.join(os.tmpdir(), `download-${Date.now()}-${suggested}`);
   let own = null; // <own dir>/<guid>: where Chrome wrote it when our dir won
   try {
-    // Waits for the download to finish — at most DOWNLOAD_FINISH_MS.
-    let timer;
-    const failure = await Promise.race([
-      download.failure(),
-      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`the download did not finish in ${Math.round(DOWNLOAD_FINISH_MS / 1000)} s; cancelled`)), DOWNLOAD_FINISH_MS); }),
-    ]).finally(() => clearTimeout(timer));
+    // Waits for the download to finish: until it stalls or passes maxDownloadMs.
+    const failure = await finishOrGiveUp(download, progress, maxDownloadMs);
     st.finished = true;
     if (failure) throw new Error(`download failed: ${failure}`);
     if (dir) {
       try {
-        const p = path.join(dir, path.basename(await download.path()));
+        const p = path.join(dir, path.basename(await bounded(() => download.path(), CDP_STEP_MS, "download.path")));
         if (fs.existsSync(p)) own = p;
       } catch { /* no local path: saveAs below */ }
     }
@@ -396,7 +558,7 @@ async function capture({ page, clickSelector, savePath, timeoutMs, downloadPromi
     // matters for explicit savePath values.
     fs.mkdirSync(path.dirname(dst), { recursive: true });
     if (own) fs.copyFileSync(own, dst);
-    else await download.saveAs(dst);
+    else await bounded(() => download.saveAs(dst), FALLBACK_FINISH_MS, "download.saveAs");
   } catch (e) {
     return {
       content: [{ type: "text", text: `saveAs failed: ${e.message} ${CHARGE_WARNING}` }],
