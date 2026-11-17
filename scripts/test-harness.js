@@ -36,6 +36,13 @@ const REAL_HOME = os.userInfo().homedir;
 const REAL_CACHE_ROOT = path.join(REAL_HOME, "Library", "Caches", "browser-mcp-relay");
 const REAL_LEGACY_POOL = path.join(REAL_HOME, "Library", "Application Support", "BraveSoftware", "Brave-Browser-Relay-Pool");
 const LOCK_NAMES = [".mcp-wrapper-lock", ".mcp-relay.flock", ".mcp-relay-status.json"];
+// Playwright's browser cache (Chrome for Testing), resolved from the REAL home
+// before HOME is swapped: under the temp HOME Playwright would look in an empty
+// cache and the real-Chromium tests would skip silently. Read only by tests.
+const REAL_PLAYWRIGHT_BROWSERS = process.env.PLAYWRIGHT_BROWSERS_PATH
+  || (process.platform === "darwin" ? path.join(REAL_HOME, "Library", "Caches", "ms-playwright")
+    : process.platform === "win32" ? path.join(process.env.LOCALAPPDATA || path.join(REAL_HOME, "AppData", "Local"), "ms-playwright")
+      : path.join(REAL_HOME, ".cache", "ms-playwright"));
 
 function isUnder(child, parent) {
   const rel = path.relative(parent, child);
@@ -119,6 +126,7 @@ function harnessEnv(home) {
   // Default pool dir for anything that loads pool-shared.js without its own
   // override; the standalone default would be <repo>/.browser-data.
   env.BROWSER_RELAY_POOL_DIR = path.join(home, "default-pool-dir");
+  if (fs.existsSync(REAL_PLAYWRIGHT_BROWSERS)) env.PLAYWRIGHT_BROWSERS_PATH = REAL_PLAYWRIGHT_BROWSERS;
   return env;
 }
 

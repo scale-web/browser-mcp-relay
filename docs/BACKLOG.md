@@ -178,7 +178,10 @@ Hit on an ephemeral clone session (`launch-project-isolated.js`). The reporter w
    each Playwright client sends `Browser.setDownloadBehavior` with its own artifacts dir on attach, the last (upstream)
    wins. `download_capture` now points the browser at a dir of its own right before its click, keeps that CDP session
    open until the download finishes, and copies the file from there; a repeat click on the same page + selector within
-   10 min is refused without `allowRepeatClick: true` (docs/REFERENCE.md). Original report:
+   10 min is refused without `allowRepeatClick: true` (docs/REFERENCE.md). Review round 1 (same branch): calls are
+   queued (the download dir is browser-wide), a download that never finishes is given up after 10 min, and the click is
+   reserved at call start in `<cache root>/.download-clicks.json` (origin + path + selector, kept once the click is
+   attempted, seen across restarts and relays). Item 4 below is still open. Original report:
    **`saveAs` fails with ENOENT.** With `clickSelector`, the download started, then
    `download.saveAs: ENOENT … copyfile …/T/playwright-artifacts-<A>/<guid> -> <savePath>` — while a file with the SAME guid
    existed under a different `playwright-artifacts-<B>/`. *Hypothesis:* two Playwright CDP clients on one browser (the

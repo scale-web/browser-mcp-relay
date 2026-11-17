@@ -37,3 +37,12 @@ test("test-harness: a failed isolation self-check exits non-zero (2), and a pass
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("test-harness: tests under the temp HOME still find Playwright's browsers (the real cache, resolved before the swap)", () => {
+  const { harnessEnv } = require("../scripts/test-harness.js");
+  const real = process.env.PLAYWRIGHT_BROWSERS_PATH || require("node:path").join(require("node:os").userInfo().homedir, "Library", "Caches", "ms-playwright");
+  const env = harnessEnv(path.join(os.tmpdir(), "fake-home"));
+  if (!fs.existsSync(real)) return; // no browsers here: nothing to pass on
+  assert.strictEqual(env.PLAYWRIGHT_BROWSERS_PATH, real);
+  assert.ok(!env.PLAYWRIGHT_BROWSERS_PATH.startsWith(env.HOME));
+});
