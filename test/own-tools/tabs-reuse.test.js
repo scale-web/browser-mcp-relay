@@ -388,3 +388,53 @@ test("MED-3 log: a prune whose close fails is not logged", async (t) => {
   await tabsNew.handler({ url: "https://new.example/", forceNew: true });
   assert.strictEqual(events.filter((e) => e.event === "tab-prune").length, 0);
 });
+
+// ───── upstream's own tab, by CDP target id (2026-11-17, ask as-ops/ask-bnyrbp) ─────
+
+/** A fake context whose CDP sessions report each page's `tid` as its target id. */
+function cdpContext(pages) {
+  return {
+    pages: () => pages,
+    newPage: async () => { throw new Error("should not create"); },
+    newCDPSession: async (p) => ({ send: async () => ({ targetInfo: { targetId: p.tid } }), detach: async () => {} }),
+  };
+}
+
+test("no same-host tab: upstream's pinned tab is used; a blank upstream once pinned is closed, a page the relay can't name is not", async (t) => {
+  const { clearActivePage } = require("../../src/own-tools/_active-page.js");
+  clearActivePage();
+  const events = collectEvents(t);
+  const up = fakeUpstream({ url: "about:blank", targetId: "T-old" });
+  const restore = up.install();
+  await sync.readUpstreamUrl(); // an earlier upstream child pinned T-old
+  up.targetId = "T-cur";
+  const oldUp = navPage("about:blank"); oldUp.tid = "T-old";
+  const cur = navPage("about:blank"); cur.tid = "T-cur";
+  cur.goto = async function (u) { this.gotoUrls.push(u); this._url = u; up.url = u; }; // it IS upstream's tab
+  const usersBlank = navPage("about:blank"); usersBlank.tid = "T-user";
+  const pages = [oldUp, cur, usersBlank];
+  globalThis.__relayBridge = { context: cdpContext(pages) };
+  t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
+
+  const res = await tabsNew.handler({ url: "https://site.example/a" });
+  const payload = JSON.parse(res.content[res.content.length - 1].text);
+  assert.strictEqual(payload.upstreamTab, true);
+  assert.strictEqual(payload.adoptedBlank, false);
+  assert.deepStrictEqual(cur.gotoUrls, ["https://site.example/a"]);
+  assert.strictEqual(oldUp.closedByTest, true, "upstream's old blank is closed");
+  assert.strictEqual(usersBlank.closedByTest, false);
+  assert.deepStrictEqual(usersBlank.gotoUrls, []);
+  assert.strictEqual(up.navs().length, 0, "propagation found it already showing");
+  assert.strictEqual(sync.state().relayUrl, "https://site.example/a");
+  assert.deepStrictEqual(events.filter((e) => e.event === "tab-blank-close").map((e) => [e.host, e.why]), [["about:blank", "upstream"]]);
+
+  // Rule C: once upstream's tab shows a page the relay did not put there, it is not used.
+  up.url = "https://user.example/signed-in"; cur._url = up.url;
+  const fresh = navPage("about:blank"); fresh.tid = "T-fresh";
+  globalThis.__relayBridge.context.newPage = async () => { pages.push(fresh); return fresh; };
+  const res2 = await tabsNew.handler({ url: "https://other.example/" });
+  const p2 = JSON.parse(res2.content[res2.content.length - 1].text);
+  assert.strictEqual(p2.upstreamTab, false);
+  assert.deepStrictEqual(cur.gotoUrls, ["https://site.example/a"], "the user's page in upstream's tab is not navigated");
+  assert.deepStrictEqual(usersBlank.gotoUrls, ["https://other.example/"], "the old blank-adoption path still applies");
+});

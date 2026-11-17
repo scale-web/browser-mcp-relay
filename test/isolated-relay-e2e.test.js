@@ -303,3 +303,32 @@ test("e2e (review r1 H1): after the user signs in inside upstream's tab, tabs_ne
     await r.stop();
   }
 });
+
+test("e2e (ask as-ops/ask-bnyrbp): the session's first tabs_new({url}) leaves the URL in ONE tab and no launch blank", ISO, async () => {
+  await startServer();
+  const home = homeTmp("home-");
+  const proj = path.join(home, "proj-first-tab");
+  const base = profileOf(home, proj);
+  const r = await startRelay({ env: { HOME: home, CLAUDE_PROJECT_DIR: proj, ...RELAY_ENV() }, realUpstream: true });
+  let browser = null;
+  try {
+    const opened = await r.call("tabs_new", { url: U("first.test", "/one") }, 90000);
+    assert.ok(!opened.isError, opened.text);
+    const payload = JSON.parse(opened.rest[opened.rest.length - 1].text);
+    assert.strictEqual(payload.upstreamTab, true, opened.text);
+    assert.strictEqual(payload.upstreamPropagated, true, opened.text);
+    const { chromium } = require("playwright-core");
+    browser = await chromium.connectOverCDP(`http://127.0.0.1:${sidecar(base).cdpPort}`);
+    const urls = browser.contexts().flatMap((c) => c.pages()).map((p) => p.url());
+    assert.strictEqual(urls.filter((u) => u === U("first.test", "/one")).length, 1, JSON.stringify(urls));
+    assert.strictEqual(urls.filter((u) => u === "about:blank").length, 0, JSON.stringify(urls));
+    assert.strictEqual(hits.filter((h) => h.path === "/one").length, 1, "loaded once");
+    // Upstream's tools act on that same tab.
+    const ex = await r.call("execute", { code: "return page.url();" }, 60000);
+    assert.ok(!ex.isError, ex.text);
+    assert.ok(ex.text.includes(U("first.test", "/one")), ex.text);
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    await r.stop();
+  }
+});

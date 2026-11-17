@@ -41,6 +41,7 @@ const { installMetaGuard, installWatchdog } = require("./meta-guard.js");
 const { StatusSidecar, buildRelayStatus, modeAnnouncement, readSidecar, SIDECAR_NAME } = require("./status-sidecar.js");
 const { tools: ownTools } = require("./own-tools/index.js");
 const { reset: resetUpstreamSync } = require("./own-tools/_upstream-sync.js");
+const { noteLaunchedPages } = require("./own-tools/tabs-new.js");
 const { applyLocalConfigToEnv } = require("./local-config.js");
 const { loadVaultFromEnv } = require("./vault.js");
 const { attachAutofill } = require("./autofill-injector.js");
@@ -776,6 +777,8 @@ async function main() {
           // handlers (lighthouse_audit: port; tabs_*: bravePid, to raise a tab
           // only when THIS Brave is the front app) read globalThis.__relayBridge.
           const bravePid = attachedPid || pool.findBraveMainPid(dir);
+          // tabs_new may close a launch blank it would otherwise leave next to upstream's tab.
+          noteLaunchedPages(l);
           globalThis.__relayBridge = { ...l, port: l.port, bravePid };
           bridge = l;
           port = l.port;

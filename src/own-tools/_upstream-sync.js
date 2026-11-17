@@ -35,6 +35,18 @@ const OPT_IN = "allowPinnedPage";
 const GUARDED_NAMES = new Set(["execute", "scenario-run"]);
 const GUARDED_PREFIXES = ["navigation_", "interaction_"];
 const READ_TIMEOUT_MS = 5000;
+// The probe readUpstreamUrl runs in upstream's `execute`: the pinned page's URL
+// and its CDP target id (2026-11-17). The id lets tabs_new tell upstream's tab
+// apart from another tab showing the same URL (two about:blank tabs, say); a
+// failed id read still returns the URL (targetId null).
+const URL_PROBE = "const url = page.url(); let targetId = null; "
+  + "try { const s = await page.context().newCDPSession(page); "
+  + "try { targetId = (await s.send('Target.getTargetInfo')).targetInfo.targetId; } "
+  + "finally { s.detach().catch(() => {}); } } catch { /* the URL alone */ } "
+  + "return { url, targetId };";
+// Every target id upstream's pinned page has had in this process: a tab
+// upstream created. Not cleared by reset(): an old child's page outlives it.
+const upstreamTargets = new Set();
 
 let desync = null; // null = synced or unknown; else { activeUrl, upstreamUrl, reason }
 let relayUrl = null;
@@ -50,7 +62,8 @@ function stripOptIn(args) {
   return { args: rest, optIn: v === true };
 }
 
-/** The URL upstream's pinned page shows: { url } or { error }. */
+/** The URL upstream's pinned page shows: { url, targetId } (targetId null when
+ *  unknown) or { error }. */
 async function readUpstreamUrl() {
   const getUpstream = globalThis.__relayUpstream;
   if (typeof getUpstream !== "function") return { error: "__relayUpstream not exposed" };
@@ -58,7 +71,7 @@ async function readUpstreamUrl() {
     const upstream = await getUpstream();
     const res = await upstream.request("tools/call", {
       name: "execute",
-      arguments: { code: "return page.url();", timeoutMs: READ_TIMEOUT_MS },
+      arguments: { code: URL_PROBE, timeoutMs: READ_TIMEOUT_MS },
     });
     const text = res && Array.isArray(res.content)
       ? res.content.filter((c) => c && c.type === "text").map((c) => c.text).join(" ").trim()
@@ -69,8 +82,13 @@ async function readUpstreamUrl() {
       try { out = JSON.parse(text); } catch { out = null; }
     }
     if (out && typeof out.error === "string" && out.error) return { error: out.error };
-    if (!out || typeof out.result !== "string") return { error: "execute returned no URL" };
-    return { url: out.result };
+    // A bare string: an upstream (or test double) that answers the URL alone.
+    const r = out && out.result;
+    const url = typeof r === "string" ? r : (r && typeof r.url === "string" ? r.url : null);
+    if (url === null) return { error: "execute returned no URL" };
+    const targetId = r && typeof r.targetId === "string" && r.targetId ? r.targetId : null;
+    if (targetId) upstreamTargets.add(targetId);
+    return { url, targetId };
   } catch (e) {
     return { error: e.message };
   }
@@ -145,6 +163,11 @@ function claim(url) {
   if (url) relayUrl = url;
 }
 
+/** Was CDP target `id` ever upstream's pinned page in this process? */
+function wasUpstreamTarget(id) {
+  return typeof id === "string" && upstreamTargets.has(id);
+}
+
 /** A new upstream child pins a fresh page: forget everything. Also a test seam. */
 function reset() {
   desync = null;
@@ -152,6 +175,6 @@ function reset() {
 }
 
 module.exports = {
-  OPT_IN, isGuarded, stripOptIn, readUpstreamUrl, mayNavigate, markSynced, markDesynced,
-  isDesynced, state, warning, refusal, afterGuardedCall, claim, reset,
+  OPT_IN, URL_PROBE, isGuarded, stripOptIn, readUpstreamUrl, mayNavigate, markSynced, markDesynced,
+  isDesynced, state, warning, refusal, afterGuardedCall, claim, reset, wasUpstreamTarget,
 };

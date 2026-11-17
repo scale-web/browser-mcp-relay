@@ -102,4 +102,4 @@ async function newQuietPage(bridge, { timeoutMs = 10000 } = {}) {
   }
 }
 
-module.exports = { braveIsFront, raiseIfFront, newQuietPage, _pidOfAsn: pidOfAsn, _cdpCall, _run: run };
+module.exports = { braveIsFront, raiseIfFront, newQuietPage, targetIdOf, pageForTarget, _pidOfAsn: pidOfAsn, _cdpCall, _run: run };

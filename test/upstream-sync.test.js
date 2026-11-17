@@ -26,7 +26,7 @@ function setup(url = "about:blank") {
   const relay = new RelayServer({ getUpstream: async () => up.client });
   return { up, relay, restore };
 }
-const forwarded = (up, name) => up.calls.filter((c) => c.params && c.params.name === name && !(name === "execute" && c.params.arguments.code === "return page.url();"));
+const forwarded = (up, name) => up.calls.filter((c) => c.params && c.params.name === name && !(name === "execute" && c.params.arguments.code === sync.URL_PROBE));
 
 test("isGuarded: execute, scenario-run, navigation_*, interaction_* only", () => {
   for (const n of ["execute", "scenario-run", "navigation_go-to", "navigation_reload", "navigation_go-back-or-forward", "interaction_click", "interaction_fill"]) {

@@ -174,7 +174,9 @@ test("T0-7: tabs_new with bad URL returns isError + navError + does NOT propagat
     const payload = JSON.parse(result.content[result.content.length - 1].text);
     assert.match(payload.navError, /ERR_NAME_NOT_RESOLVED|invalid/i);
     assert.strictEqual(payload.upstreamPropagated, false);
-    assert.strictEqual(up.calls.length, 0, "upstream must NOT be called when goto fails");
+    // Its URL is read before the goto (to find upstream's own tab), but it is
+    // never navigated after a failed one.
+    assert.strictEqual(up.navs().length, 0, "upstream must NOT be navigated when goto fails");
     assert.strictEqual(sync.isDesynced(), true, "upstream still shows another tab");
   } finally {
     globalThis.__relayBridge = prevBridge;
