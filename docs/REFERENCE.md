@@ -95,8 +95,10 @@ Both layers are merged into a single `tools/list` response, so to your MCP clien
 **Where the file lands.** Every Playwright client on the browser sets Chrome's download directory when it attaches, and the
 last one wins — in the relay that is always upstream. So `download_capture` points the browser at a directory of its own
 (`$TMPDIR/relay-download-*`, made for the call) immediately before its click, keeps that CDP session open until the
-download has finished, copies the file to `savePath`, and removes the directory (and once more a second later, in case
-Chrome recreated it). Once the call ends, downloads that nothing captures are back in Chrome's default handling. The
+download has finished, copies the file to `savePath`, and removes the directory (and again 1 s and 5 s later, in case
+Chrome recreated it). A download that began on that session but was never captured — it started just as the call gave
+up — is cancelled before the session closes, and Chrome cancels one that starts after it closes, so a late download
+never lands in a removed directory. Once the call ends, downloads that nothing captures are back in Chrome's default handling. The
 download may follow a redirect to another origin (a presigned S3 URL, say).
 
 **One call at a time.** The download directory is browser-wide, so concurrent `download_capture` calls queue and run one
@@ -107,7 +109,7 @@ the page's origin + path is checked again right before the click: if the page ha
 clicked. A queued call is also dropped when its caller cancels the request — **not yet wired:** the handler accepts the
 MCP request's abort signal, but `relay-server.js` does not pass it on (`docs/BACKLOG.md`), so today the 2-minute wait and
 the page check are what stop a call whose caller has gone. Removing the tool's directory never changes the call's
-result: a failed removal is logged, and the removal is always tried again a second later.
+result: a failed removal is logged, and the removal is always tried again 1 s and 5 s later.
 
 **A stalled download is given up.** Once a download has started, the tool cancels it after **2 minutes without
 progress** (Chrome's download-progress events on the tool's own CDP session), removes its directory and returns an error.

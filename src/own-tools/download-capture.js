@@ -32,9 +32,13 @@
 // it is refused without clicking and its reservation is released (review r2
 // M3). Every CDP step (newCDPSession, setDownloadBehavior, cancel, detach, the
 // download's path) is bounded by CDP_STEP_MS (10 s), so one hung CDP call can no
-// longer hold the queue forever. The own dir is removed after the session
-// detaches, and always once more a second later in case Chrome recreated it; a
-// failed removal is logged and never changes the call's result (review r2 M1).
+// longer hold the queue forever. Before the session detaches, a download that
+// began on it but was never captured (it began as the wait gave up) is
+// cancelled (Browser.cancelDownload), so it cannot recreate the dir; one that
+// begins after the detach is cancelled by Chrome (measured 2026-11-17, with and
+// without a second client attached). The own dir is removed after the detach,
+// and always again 1 s and 5 s later in case Chrome recreated it; a failed
+// removal is logged and never changes the call's result (review r2 M1).
 //
 // Bounded wait: once a download has started, the tool cancels it after
 // STALL_MS (2 min) without progress, read from Chrome's Browser.downloadProgress
@@ -242,14 +246,16 @@ async function pointDownloadsAt(page, dir) {
 }
 
 /** Remove an own dir; a failure (Chrome still writing: ENOTEMPTY) is logged and
- *  never thrown. Always once more a second later. */
+ *  never thrown. Always again 1 s and 5 s later. */
 function removeOwnDir(d) {
   try {
     fs.rmSync(d, { recursive: true, force: true });
   } catch (e) {
     process.stderr.write(`[mcp-relay] download_capture: own dir ${d} not removed yet (${e.code || e.message}); retrying in 1 s\n`);
   }
-  setTimeout(() => { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* left: $TMPDIR/relay-download-* */ } }, 1000).unref();
+  for (const ms of [1000, 5000]) {
+    setTimeout(() => { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* left: $TMPDIR/relay-download-* */ } }, ms).unref();
+  }
 }
 
 /** The repeat-click refusal: who made the earlier click, and how long ago. */
@@ -428,7 +434,11 @@ async function setUpAndCapture({ page, clickSelector, savePath, timeoutMs, maxDo
   }
   // Progress of downloads, from Chrome's events on our own session (see the header).
   const progress = { seen: false, last: Date.now(), bytes: new Map() };
+  const begun = new Set(); // guids of downloads that began on our session
+  const ended = new Set(); // ...and of those that completed or were cancelled
+  const onWillBegin = (e) => { if (e && e.guid) begun.add(e.guid); };
   const onProgress = (e) => {
+    if (e && e.guid && e.state !== "inProgress") ended.add(e.guid);
     progress.seen = true;
     const got = Number(e && e.receivedBytes) || 0;
     const key = e && e.guid;
@@ -437,7 +447,10 @@ async function setUpAndCapture({ page, clickSelector, savePath, timeoutMs, maxDo
       progress.last = Date.now();
     }
   };
-  if (session && typeof session.on === "function") session.on("Browser.downloadProgress", onProgress);
+  if (session && typeof session.on === "function") {
+    session.on("Browser.downloadProgress", onProgress);
+    session.on("Browser.downloadWillBegin", onWillBegin);
+  }
   try {
     return await capture({ page, clickSelector, savePath, timeoutMs, maxDownloadMs, downloadPromise, closePromise, onClose, dir, st, reservation, allowRepeat, signal, progress });
   } finally {
@@ -445,7 +458,16 @@ async function setUpAndCapture({ page, clickSelector, savePath, timeoutMs, maxDo
     // Each step is bounded, and none of them can change the result.
     if (st.download && !st.finished) await bounded(() => st.download.cancel(), CDP_STEP_MS, "download.cancel").catch(() => { /* gone or hung */ });
     if (session) {
-      if (typeof session.off === "function") session.off("Browser.downloadProgress", onProgress);
+      // A download that began on our session but was never captured (it began
+      // as the wait gave up) would write into the dir after it is removed and
+      // recreate it: cancel it before detaching.
+      for (const guid of begun) {
+        if (!ended.has(guid)) await bounded(() => session.send("Browser.cancelDownload", { guid }), CDP_STEP_MS, "Browser.cancelDownload").catch(() => { /* finished or gone */ });
+      }
+      if (typeof session.off === "function") {
+        session.off("Browser.downloadProgress", onProgress);
+        session.off("Browser.downloadWillBegin", onWillBegin);
+      }
       await bounded(() => session.detach(), CDP_STEP_MS, "detach").catch(() => { /* page closed or hung */ });
     }
     if (dir) removeOwnDir(dir);

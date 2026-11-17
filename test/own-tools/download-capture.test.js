@@ -384,3 +384,28 @@ test("R2-4: with no progress events at all, the stall limit does not cancel a do
   assert.notStrictEqual(r.isError, true, textOf(r));
   assert.strictEqual(fs.statSync(savePath).size, 321);
 });
+
+test("R2-1: a download that began on the tool's session but was never captured is cancelled before the session detaches", { timeout: 20000 }, async (t) => {
+  stateFor(t);
+  const calls = [];
+  const handlers = {};
+  const session = {
+    send: async (m, p) => { calls.push([m, p && p.guid]); },
+    detach: async () => { calls.push(["detach"]); },
+    on(ev, fn) { handlers[ev] = fn; },
+    off() {},
+  };
+  const page = fakePage(t, {
+    session,
+    // The click is dispatched, a download begins on the session, then the wait gives up.
+    click: async () => { setTimeout(() => handlers["Browser.downloadWillBegin"] && handlers["Browser.downloadWillBegin"]({ guid: "late-1" }), 50); },
+    waitForEvent: () => sleep(300).then(() => { throw new Error("Timeout 300ms exceeded"); }),
+  });
+  const r = await within(tool.handler({ clickSelector: "#buy", timeoutMs: 300 }), 5000, "the call");
+  assert.strictEqual(r.isError, true);
+  assert.match(textOf(r), /served \(or charged for\)/);
+  assert.strictEqual(page.clicks, 1);
+  const cancel = calls.findIndex(([m, g]) => m === "Browser.cancelDownload" && g === "late-1");
+  assert.ok(cancel >= 0, `cancelDownload sent (${JSON.stringify(calls)})`);
+  assert.ok(cancel < calls.findIndex(([m]) => m === "detach"), "before the detach");
+});

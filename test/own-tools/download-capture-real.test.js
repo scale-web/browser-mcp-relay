@@ -374,3 +374,15 @@ test("R2-4: maxDownloadMs bounds a progressing download overall; it is cancelled
   await sleep(1500);
   assert.deepStrictEqual(ownDirs().filter((n) => !before.has(n)), [], "no relay-download-* dir left");
 });
+
+test("R2-1: a given-up call leaves no relay-download-* dir, even after its download would have started and finished", REAL, async (t) => {
+  const { page, base, out, hits } = await setup(t);
+  await page.goto(`${base}/`);
+  const before = new Set(ownDirs());
+  const res = await tool.handler({ clickSelector: "#slow", savePath: path.join(out, "late.bin"), timeoutMs: 1000 });
+  assert.strictEqual(res.isError, true);
+  await sleep(6000); // the server answers at 3 s; the retries run at 1 s and 5 s
+  assert.strictEqual(hits.slow, 1);
+  assert.deepStrictEqual(ownDirs().filter((n) => !before.has(n)), [], "no relay-download-* dir left");
+  assert.strictEqual(fs.existsSync(path.join(out, "late.bin")), false);
+});
