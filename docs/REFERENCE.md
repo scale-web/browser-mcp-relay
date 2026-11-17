@@ -64,9 +64,11 @@ selecting an earlier tab gives upstream that tab with its page and typed input i
 relay re-pins upstream to the tab `tabs_new` / `tabs_select` last selected, if it is elsewhere (a restarted upstream).
 Upstream's own first tab, opened when it starts, is closed by the first pin while it is still blank. `tabs_new` navigates
 a leftover blank only when it is the relay's (Brave's launch tab, or one `tabs_new` made), never an attached Brave's or
-the user's. **Console and network capture** (`o11y_*`, `sync_wait-for-network-idle`) follow the pin: a tab records into
-upstream's buffers only while it is the pinned one, entries recorded earlier stay, and `tabs_new` pins before it loads
-the URL, so the page load is captured. **Not moved:** `debug_*` probes stay on the tab where debugging was first
+the user's. **Console and network capture** (`o11y_*`) follow the pin: a tab records into upstream's buffers only while
+it is the pinned one, entries recorded earlier stay, and `tabs_new` pins before it loads the URL, so the page load is
+captured. **`sync_wait-for-network-idle`** waits for the selected tab's own in-flight requests: each tab's are counted
+whatever the pin, so requests a tab started while another was pinned are still waited for after `tabs_select` (only
+requests already in flight before upstream first saw the tab are not). **Not moved:** `debug_*` probes stay on the tab where debugging was first
 enabled; a screen recording stops at a re-pin. If the re-pin fails (upstream unreachable, or its bundle could not be
 patched), results say `UPSTREAM DESYNC` and upstream tools that change a page are refused unless `allowPinnedPage: true`.
 

@@ -11,7 +11,9 @@ const patcher = require("../scripts/patch-bdmcp-repin.js");
 // Every site, in the bundle's own spelling.
 const SHAPE = "function createToolSessionContext(){}" +
   "class S{_attachPageListeners(page){let me=this;page.on(\"console\",msg=>{a()}),page.on(\"pageerror\",err=>{b()})," +
-  "page.on(\"request\",async req=>{c()}),page.on(\"requestfinished\",async req=>{d()}),page.on(\"requestfailed\",async req=>{e()})}" +
+  "page.on(\"request\",async req=>{me.otelController.isOTELRequest(req)||(me._numOfInFlightRequests++,c())})," +
+  "page.on(\"requestfinished\",async req=>{me.otelController.isOTELRequest(req)||(me._numOfInFlightRequests--,d())})," +
+  "page.on(\"requestfailed\",async req=>{me.otelController.isOTELRequest(req)||(me._numOfInFlightRequests--,e())})}" +
   "executionContext(){return{page:this.page}}" +
   "async close(){this.options.dontCloseBrowserContext?(x(),await this.page.close({runBeforeUnload:!1}).catch(()=>{})):y()}}";
 
@@ -85,6 +87,7 @@ test("R1: the patched class — close() never closes an adopted page; capture ha
   const S = new Function(`${fns}${src}; return { S, calls };`)();
   const mkPage = () => { const on = {}; return { on: (ev, fn) => { (on[ev] ||= []).push(fn); }, fire: (ev) => (on[ev] || []).forEach((f) => f({})), on_: on, closed: 0, close() { this.closed++; return Promise.resolve(); } }; };
   const ctx = new S.S();
+  ctx.otelController = { isOTELRequest: () => false };
   const p1 = mkPage(); const p2 = mkPage();
   ctx._page = p1;
   ctx._attachPageListeners(p1);
@@ -105,4 +108,39 @@ test("R1: the patched class — close() never closes an adopted page; capture ha
     await ctx.close();
     assert.strictEqual(p2.closed, 1, "the session's own page still is");
   });
+});
+
+test("R1: in-flight requests are counted per page whatever the pin; a re-pin takes the target's count; never negative", async () => {
+  const src = patcher.patchSource(SHAPE).replace(patcher.MARKER, "");
+  const fns = "const c=()=>{},d=()=>{},e=()=>{},a=()=>{},b=()=>{},x=()=>{},y=()=>{};";
+  const { S, pin } = new Function(`${fns}${src}; return { S, pin: ${patcher.HELPER_NAME} };`)();
+  const mkPage = (tid) => {
+    const on = {};
+    return { tid, on: (ev, fn) => { (on[ev] ||= []).push(fn); }, fire: (ev, req) => (on[ev] || []).forEach((f) => f(req)), url: () => `https://x.example/${tid}`, isClosed: () => false };
+  };
+  const p1 = mkPage("T1"); const p2 = mkPage("T2");
+  const ctx = new S();
+  ctx.otelController = { isOTELRequest: (r) => !!r.otel };
+  ctx.browserContext = { pages: () => [p1, p2], newCDPSession: async (p) => ({ send: async () => ({ targetInfo: { targetId: p.tid } }), detach: async () => {} }) };
+  ctx._numOfInFlightRequests = 0;
+  ctx._page = p1;
+  ctx._attachPageListeners(p1);
+  await pin(ctx, "T2"); // B's listeners are attached once it has been pinned
+  await pin(ctx, "T1");
+  const [r1, r2, r3, otel, early] = [{}, {}, {}, { otel: true }, {}];
+  p2.fire("request", r1); p2.fire("request", r2); p2.fire("request", r3); p2.fire("request", otel);
+  assert.strictEqual(ctx._numOfInFlightRequests, 0, "B's requests do not move A's count");
+  p2.fire("requestfinished", early); // started before B's listeners existed: never counted
+  await pin(ctx, "T2");
+  assert.strictEqual(ctx._numOfInFlightRequests, 3, "pinned to B: B's 3 counted requests are in flight (OTEL's is not one)");
+  p2.fire("requestfinished", otel);
+  assert.strictEqual(ctx._numOfInFlightRequests, 3, "an OTEL request's end moves nothing");
+  assert.ok(ctx._lastNetworkActivityTimestamp > 0, "…and B's last activity time comes with them");
+  p2.fire("requestfinished", r1); p2.fire("requestfailed", r2);
+  assert.strictEqual(ctx._numOfInFlightRequests, 1);
+  p2.fire("requestfinished", r3); p2.fire("requestfinished", r3); p2.fire("requestfailed", r1);
+  assert.strictEqual(ctx._numOfInFlightRequests, 0, "never below zero: an end decrements only once, and only a counted start");
+  p1.fire("request", {});
+  await pin(ctx, "T1");
+  assert.strictEqual(ctx._numOfInFlightRequests, 1, "A's own request, started while B was pinned, is A's when A is pinned again");
 });

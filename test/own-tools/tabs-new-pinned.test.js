@@ -45,7 +45,12 @@ async function launch(t, { attached = false } = {}) {
   assert.ok(port, "DevToolsActivePort was written");
   const wsEndpoint = JSON.parse(await (await fetch(`http://127.0.0.1:${port}/json/version`)).text()).webSocketDebuggerUrl;
   const hits = [];
+  const slowDone = []; // when each /slow response was sent
   const srv = http.createServer((req, res) => {
+    if (req.url.startsWith("/slow")) {
+      setTimeout(() => { res.end("slow"); slowDone.push(Date.now()); }, 2500);
+      return;
+    }
     hits.push(`${req.headers.host}${req.url}`);
     res.setHeader("content-type", "text/html");
     res.end(`<title>${req.url}</title><p>PAGE ${req.url}</p><input id=d><script>console.log("loaded ${req.url}")</script>`);
@@ -78,7 +83,7 @@ async function launch(t, { attached = false } = {}) {
     fs.rmSync(dir, { recursive: true, force: true });
   });
   const port2 = srv.address().port;
-  return { context, relay, up, hits, userHits, A: `http://127.0.0.1:${port2}/a`, B: `http://localhost:${port2}/b`, USER: `http://127.0.0.1:${usersSrv.address().port}/users-own` };
+  return { context, relay, up, hits, userHits, slowDone, A: `http://127.0.0.1:${port2}/a`, B: `http://localhost:${port2}/b`, USER: `http://127.0.0.1:${usersSrv.address().port}/users-own` };
 }
 
 const open = (context) => context.pages().filter((p) => !p.isClosed());
@@ -177,4 +182,34 @@ test("upstream's tool list is unchanged: no hidden re-pin tool reaches the model
   const { tools } = await relay.handleToolsList();
   assert.ok(!JSON.stringify(tools).includes("__relay"));
   assert.ok(tools.some((x) => x.name === "execute"));
+});
+
+test("in-flight requests are counted per tab: after tabs_select, the idle wait waits for that tab's requests and never errors", REAL, async (t) => {
+  const { context, relay, A, B, slowDone } = await launch(t);
+  await tabsNew.handler({ url: A });
+  const tabA = open(context).find((p) => p.url() === A);
+  await tabsNew.handler({ url: B });
+  const tabB = open(context).find((p) => p.url() === B);
+  await tabsSelect.handler({ index: context.pages().indexOf(tabA) });
+  // B starts 3 slow fetches while A is pinned (review r1 M: their `request` events were dropped).
+  await tabB.evaluate(() => { for (let i = 0; i < 3; i++) fetch(`/slow?n=${i}`).catch(() => {}); });
+  await new Promise((r) => setTimeout(r, 400));
+  assert.strictEqual(slowDone.length, 0, "B's requests are still in flight");
+  await tabsSelect.handler({ index: context.pages().indexOf(tabB) });
+  const wait = async () => {
+    const r = await relay.handleToolsCall({ name: "sync_wait-for-network-idle", arguments: { idleTimeMs: 300, timeoutMs: 15000 } });
+    assert.notStrictEqual(r.isError, true, JSON.stringify(r));
+    return { at: Date.now(), out: r.structuredContent || JSON.parse(r.content[r.content.length - 1].text) };
+  };
+  const first = await wait();
+  assert.strictEqual(slowDone.length, 3, `the wait returned before B's 3 requests finished (${slowDone.length} done)`);
+  assert.ok(slowDone.every((d) => d <= first.at), "…it waited for every one");
+  assert.strictEqual(first.out.finalInFlightRequests, 0, JSON.stringify(first.out));
+  // Once they are done, the count is 0, never negative: a second wait is idle at once.
+  const second = await wait();
+  assert.strictEqual(second.out.finalInFlightRequests, 0, JSON.stringify(second.out));
+  // Back on A and onto B again: still never negative.
+  await tabsSelect.handler({ index: context.pages().indexOf(tabA) });
+  await tabsSelect.handler({ index: context.pages().indexOf(tabB) });
+  assert.strictEqual((await wait()).out.finalInFlightRequests, 0);
 });

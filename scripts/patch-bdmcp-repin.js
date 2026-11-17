@@ -26,8 +26,17 @@
 //                                handler records only while its page is the
 //                                pinned one, so capture follows the pin and
 //                                earlier entries stay in the buffers
-//   _numOfInFlightRequests, _lastNetworkActivityTimestamp → reset (as
-//                                ensureSessionPageOpen does on a new page)
+//   in-flight requests         → counted PER PAGE whatever the pin
+//                                (__relayReqCount: a WeakSet of counted
+//                                requests, a count and a last-activity time
+//                                per page); a finished or failed request
+//                                decrements only if its start was counted
+//   _numOfInFlightRequests, _lastNetworkActivityTimestamp → set from the
+//                                target page's own count and time, so an idle
+//                                wait after a re-pin waits for that tab's
+//                                requests and the count never goes negative
+//                                (review r1 M1: B's 3 requests, started while
+//                                A was pinned, took a reset 0 to -3)
 //   _refMap (ARIA snapshot refs) → reset (refs name the old page's elements)
 //   _screenRecorder            → stopped if recording (as ensureSessionPageOpen does)
 //   debug_* store (V8Api bound to the page it was first enabled on, keyed by
@@ -40,6 +49,9 @@
 // The session's OWN page (made by its first call or by ensureSessionPageOpen)
 // is closed when a re-pin leaves it while it is still about:blank: it is the
 // transient tab upstream opens when it starts, never one anybody used.
+//
+// v1 was revised in place before it shipped (review r1 M1: the per-page
+// in-flight count); no bundle carries the earlier v1.
 //
 // Same rules as the other patch scripts: on-disk, applied at every relay
 // startup before upstream spawns, idempotent, atomic, all-or-nothing (every
@@ -57,6 +69,7 @@ const MARKER = `/*R1: upstream re-pinned to the relay's tab v${HELPER_VERSION}*/
 const MARKER_RE = /\/\*R1: upstream re-pinned to the relay's tab(?: v(\d+))?\*\//;
 const HELPER_NAME = "__relayPinPage";
 const SANDBOX_NAME = "__relayPin";
+const COUNT_NAME = "__relayReqCount";
 
 // [pattern, replacement] — each must match EXACTLY once.
 const SITES = [
@@ -66,15 +79,28 @@ const SITES = [
     "_attachPageListeners(page){let me=this;if((me.__relayListened||=new WeakSet).has(page))return;me.__relayListened.add(page);"],
   ['page.on("console",msg=>{', 'page.on("console",msg=>{if(me._page!==page)return;'],
   ['page.on("pageerror",err=>{', 'page.on("pageerror",err=>{if(me._page!==page)return;'],
-  ['page.on("request",async req=>{', 'page.on("request",async req=>{if(me._page!==page)return;'],
-  ['page.on("requestfinished",async req=>{', 'page.on("requestfinished",async req=>{if(me._page!==page)return;'],
-  ['page.on("requestfailed",async req=>{', 'page.on("requestfailed",async req=>{if(me._page!==page)return;'],
+  // In-flight: counted per page before the pin check; the global count moves
+  // only for the pinned page, and down only for a request whose start counted.
+  ['page.on("request",async req=>{me.otelController.isOTELRequest(req)||(me._numOfInFlightRequests++,',
+    `page.on("request",async req=>{if(me.otelController.isOTELRequest(req))return;${COUNT_NAME}(me,page,req,1);if(me._page!==page)return;(me._numOfInFlightRequests++,`],
+  ['page.on("requestfinished",async req=>{me.otelController.isOTELRequest(req)||(me._numOfInFlightRequests--,',
+    `page.on("requestfinished",async req=>{let __relayCounted=${COUNT_NAME}(me,page,req,-1);if(me._page!==page)return;me.otelController.isOTELRequest(req)||(__relayCounted&&me._numOfInFlightRequests--,`],
+  ['page.on("requestfailed",async req=>{me.otelController.isOTELRequest(req)||(me._numOfInFlightRequests--,',
+    `page.on("requestfailed",async req=>{let __relayCounted=${COUNT_NAME}(me,page,req,-1);if(me._page!==page)return;me.otelController.isOTELRequest(req)||(__relayCounted&&me._numOfInFlightRequests--,`],
   ["await this.page.close({runBeforeUnload:!1}).catch(()=>{})",
     "await(this.__relayAdopted&&this.__relayAdopted.has(this.page)?Promise.resolve():this.page.close({runBeforeUnload:!1}).catch(()=>{}))"],
 ];
 
-// Plain ES2020, a top-level function declaration (upstream's ESM bundle).
-const HELPER_SOURCE = `async function ${HELPER_NAME}(ctx,targetId,timeoutMs=5000){` +
+// Plain ES2020, top-level function declarations (upstream's ESM bundle), on
+// ONE line (applyPatch's update replaces the line after the marker).
+// __relayReqCount(ctx, page, req, +1 | -1): count a request's start on its page
+// (true), or its end (true only when its start was counted).
+const COUNT_SOURCE = `function ${COUNT_NAME}(ctx,page,req,d){` +
+  `let reqs=(ctx.__relayReqs||=new WeakSet),n=(ctx.__relayInFlight||=new WeakMap),at=(ctx.__relayNetAt||=new WeakMap);` +
+  `if(d>0)reqs.add(req);else if(!reqs.delete(req))return!1;` +
+  `n.set(page,(n.get(page)||0)+(d>0?1:-1));at.set(page,Date.now());return!0` +
+`}`;
+const HELPER_SOURCE = COUNT_SOURCE + `async function ${HELPER_NAME}(ctx,targetId,timeoutMs=5000){` +
   `if(typeof targetId!=="string"||!targetId)throw new Error("__relayPin: a CDP target id is required");` +
   `if(ctx.closed)throw new Error("__relayPin: the session is closed");` +
   `if(ctx._ensurePagePromise)await ctx._ensurePagePromise.catch(()=>{});` +
@@ -94,7 +120,7 @@ const HELPER_SOURCE = `async function ${HELPER_NAME}(ctx,targetId,timeoutMs=5000
   `adopted.add(found);` +
   `if(old!==found){` +
     `try{if(ctx._screenRecorder&&ctx._screenRecorder.isRecording())await ctx._screenRecorder.stop()}catch{}` +
-    `ctx._refMap={};ctx._numOfInFlightRequests=0;ctx._lastNetworkActivityTimestamp=0;` +
+    `ctx._refMap={};ctx._numOfInFlightRequests=(ctx.__relayInFlight&&ctx.__relayInFlight.get(found))||0;ctx._lastNetworkActivityTimestamp=(ctx.__relayNetAt&&ctx.__relayNetAt.get(found))||0;` +
     `ctx._page=found;ctx._attachPageListeners(found);` +
     `if(old&&!old.isClosed()&&!adopted.has(old)&&old.url()==="about:blank"){await old.close({runBeforeUnload:!1}).catch(()=>{});closedOwnBlank=!0}` +
   `}` +
@@ -172,7 +198,7 @@ function applyPatch(opts = {}) {
   return { patched: true, file, action };
 }
 
-module.exports = { HELPER_VERSION, MARKER, MARKER_RE, HELPER_NAME, SANDBOX_NAME, HELPER_SOURCE, SITES, patchSource, findSessionFile, applyPatch };
+module.exports = { HELPER_VERSION, MARKER, MARKER_RE, HELPER_NAME, SANDBOX_NAME, COUNT_NAME, HELPER_SOURCE, SITES, patchSource, findSessionFile, applyPatch };
 
 if (require.main === module) {
   const result = applyPatch();
