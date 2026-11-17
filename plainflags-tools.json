@@ -1527,7 +1527,7 @@
             },
             "allowPinnedPage": {
               "type": "boolean",
-              "description": "Accepted for compatibility; selecting a tab always points upstream's tools at it (no navigation)."
+              "description": "Selecting a tab points upstream's tools at it (no navigation). Only when relay_status shows upstreamRepin.available false is upstream's own tab NAVIGATED to this one instead; then, only when the relay reported UPSTREAM DESYNC and the page in upstream's tab is one YOU put there, this lets it navigate that tab anyway. Never when the user may be using it."
             }
           },
           "required": [
