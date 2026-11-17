@@ -21,12 +21,12 @@ module.exports = {
       index: { type: "integer", minimum: 0 },
       allowPinnedPage: {
         type: "boolean",
-        description: "Accepted for compatibility; selecting a tab always points upstream's tools at it (no navigation).",
+        description: "Selecting a tab points upstream's tools at it (no navigation). Only when relay_status shows upstreamRepin.available false is upstream's own tab NAVIGATED to this one instead; then, only when the relay reported UPSTREAM DESYNC and the page in upstream's tab is one YOU put there, this lets it navigate that tab anyway. Never when the user may be using it.",
       },
     },
     required: ["index"],
   },
-  handler: async ({ index }) => {
+  handler: async ({ index, allowPinnedPage }) => {
     const bridge = globalThis.__relayBridge;
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
     const pages = bridge.context.pages();
@@ -57,7 +57,8 @@ module.exports = {
       process.stderr.write(`[tabs_select] bringToFront failed (continuing): ${e.message}\n`);
     }
     // Upstream's tools act on this tab from now on (best-effort).
-    const propagation = await pinUpstreamToPage(pages[index], { claim: true });
+    // force: only used when R1 is not applied (upstream's own tab is navigated then).
+    const propagation = await pinUpstreamToPage(pages[index], { claim: true, force: allowPinnedPage === true });
     const content = [{ type: "text", text: JSON.stringify({
       selected: index,
       url,

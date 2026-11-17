@@ -1,7 +1,12 @@
 // relay_status — which browser profile this session is driving, and who holds
 // the base (spec v4 §1c). needsBrave: false — asking must never launch a
 // 0.6–1.2 GB Brave or claim anything (RelayServer skips ensureBrave() for it).
-// The payload comes from index.js via globalThis.__relayStatus.
+// The payload comes from index.js via globalThis.__relayStatus, plus
+// upstreamRepin: whether upstream can be re-pinned to the selected tab (R1,
+// scripts/patch-bdmcp-repin.js); false = tabs_new / tabs_select navigate
+// upstream's own tab instead (review r1 L3: not only on stderr).
+
+const sync = require("./_upstream-sync.js");
 
 module.exports = {
   name: "relay_status",
@@ -16,6 +21,6 @@ module.exports = {
     if (typeof get !== "function") {
       return { content: [{ type: "text", text: "relay_status unavailable (relay not initialised)" }], isError: true };
     }
-    return { content: [{ type: "text", text: JSON.stringify(await get(), null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify({ ...(await get()), upstreamRepin: sync.repinState() }, null, 2) }] };
   },
 };

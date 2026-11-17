@@ -33,7 +33,7 @@ function setup(url = "about:blank", upOpts = {}) {
   const relay = new RelayServer({ getUpstream: async () => up.client });
   return { up, relay, restore, tab: tabs[0], tabs };
 }
-/** A failed pin: upstream not patched, still on the user's page. */
+/** A failed pin (a generic re-pin error; R1 missing is the fallback: propagate-active-page.test.js): upstream still on its page. */
 async function desyncByFailedPin(tab) {
   await pinUpstreamToPage(tab);
   assert.strictEqual(sync.isDesynced(), true);
@@ -58,7 +58,7 @@ test("stripOptIn: removes the key; only `true` opts in", () => {
 });
 
 test("B: while desynced, guarded tools are refused and never reach upstream", async () => {
-  const { up, relay, restore, tab } = setup("https://user-signed-in.example/dashboard", { pinFail: "__relayPin is not defined" });
+  const { up, relay, restore, tab } = setup("https://user-signed-in.example/dashboard", { pinFail: "__relayPin: no page for target T0 in upstream's browser context" });
   try {
     await desyncByFailedPin(tab);
     for (const [name, args] of [["execute", { code: "await page.goto('https://x.example/')" }], ["navigation_go-to", { url: "https://x.example/" }], ["interaction_click", { ref: "e1" }], ["scenario-run", { name: "s" }]]) {
@@ -73,7 +73,7 @@ test("B: while desynced, guarded tools are refused and never reach upstream", as
 });
 
 test("A: while desynced, a read-only upstream tool runs and its result leads with the warning", async () => {
-  const { up, relay, restore, tab } = setup("https://user-signed-in.example/dashboard", { pinFail: "__relayPin is not defined" });
+  const { up, relay, restore, tab } = setup("https://user-signed-in.example/dashboard", { pinFail: "__relayPin: no page for target T0 in upstream's browser context" });
   try {
     await desyncByFailedPin(tab);
     const r = await relay.handleToolsCall({ name: "content_take-screenshot", arguments: {} });
@@ -85,7 +85,7 @@ test("A: while desynced, a read-only upstream tool runs and its result leads wit
 });
 
 test("B: allowPinnedPage: true forwards (key stripped), still warns, and does not hand the user's tab to the relay", async () => {
-  const { up, relay, restore, tab } = setup("https://user-signed-in.example/dashboard", { pinFail: "__relayPin is not defined" });
+  const { up, relay, restore, tab } = setup("https://user-signed-in.example/dashboard", { pinFail: "__relayPin: no page for target T0 in upstream's browser context" });
   try {
     await desyncByFailedPin(tab);
     const r = await relay.handleToolsCall({ name: "execute", arguments: { code: "return 1", allowPinnedPage: true } });
@@ -113,7 +113,7 @@ test("synced: guarded tools forward with no warning; a page the relay drove stay
 });
 
 test("a sync clears the desync: guarded tools run again", async () => {
-  const { up, relay, restore, tab } = setup("about:blank", { pinFail: "__relayPin is not defined" });
+  const { up, relay, restore, tab } = setup("about:blank", { pinFail: "__relayPin: no page for target T0 in upstream's browser context" });
   try {
     await desyncByFailedPin(tab);
     assert.strictEqual((await relay.handleToolsCall({ name: "execute", arguments: { code: "1" } })).isError, true);

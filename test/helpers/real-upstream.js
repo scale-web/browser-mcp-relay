@@ -12,10 +12,11 @@ const { spawn } = require("node:child_process");
 const { UpstreamClient } = require("../../src/upstream-client.js");
 const repin = require("../../scripts/patch-bdmcp-repin.js");
 
-let shared = null; // one patched copy per test process
+const shared = {}; // one copy per test process and kind (patched / unpatched)
 
-function patchedCopy() {
-  if (shared) return shared;
+function patchedCopy({ patched = true } = {}) {
+  const kind = patched ? "patched" : "unpatched";
+  if (shared[kind]) return shared[kind];
   const pkg = path.dirname(require.resolve("browser-devtools-mcp/package.json"));
   const realPkg = fs.realpathSync(pkg);
   const srcModules = path.dirname(realPkg);
@@ -28,16 +29,19 @@ function patchedCopy() {
   }
   fs.cpSync(realPkg, path.join(nm, "browser-devtools-mcp"), { recursive: true });
   const dist = path.join(nm, "browser-devtools-mcp", "dist");
-  const r = repin.applyPatch({ distDir: dist, log: () => {} });
-  if (!r.patched) throw new Error(`re-pin patch did not apply to the copy: ${r.reason}`);
+  // unpatched: what a relay runs when an upstream upgrade changed the bundle shape (R1 not applied).
+  if (patched) {
+    const r = repin.applyPatch({ distDir: dist, log: () => {} });
+    if (!r.patched) throw new Error(`re-pin patch did not apply to the copy: ${r.reason}`);
+  }
   process.once("exit", () => { try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* best effort */ } });
-  shared = { root, entry: path.join(dist, "index.js") };
-  return shared;
+  shared[kind] = { root, entry: path.join(dist, "index.js") };
+  return shared[kind];
 }
 
-/** Spawn patched upstream on `wsEndpoint`: { client, stderr(), stop() }. */
-function startRealUpstream(wsEndpoint) {
-  const { entry } = patchedCopy();
+/** Spawn upstream (patched unless `patched: false`) on `wsEndpoint`: { client, stderr(), stop() }. */
+function startRealUpstream(wsEndpoint, { patched = true } = {}) {
+  const { entry } = patchedCopy({ patched });
   const child = spawn(process.execPath, [entry, "--cursor-mcp-server"], {
     stdio: ["pipe", "pipe", "pipe"],
     env: {

@@ -33,7 +33,7 @@
 //     `{ navError, isError: true }` response.
 //   • accept `waitUntil` parameter — SPA-heavy sites need 'networkidle'.
 
-const { pinUpstreamToPage } = require("./_propagate-active-page.js");
+const { pinUpstreamToPage, propagateActivePageToUpstream } = require("./_propagate-active-page.js");
 const { applyLocalConfigToEnv } = require("../local-config.js");
 const { setActivePage, getActivePageRaw } = require("./_active-page.js");
 const sync = require("./_upstream-sync.js");
@@ -257,7 +257,7 @@ module.exports = {
     // Upstream acts on this tab from now on (best-effort; a failure is a
     // desync, rules A and B). BEFORE the goto, so upstream's console and
     // network capture (attached to the pinned page) sees this page load.
-    const propagation = await pinUpstreamToPage(page, { claim: false });
+    let propagation = await pinUpstreamToPage(page, { claim: false, onUnpatched: "none" });
 
     let navError = null;
     if (url) {
@@ -271,6 +271,16 @@ module.exports = {
     // The relay put this page there (rule C) — even after a failed goto: the
     // tab exists, is the active one, and shows what the relay's goto left.
     if (propagation.propagated) { try { sync.claim(page.url()); } catch { /* closed mid-call */ } }
+    // R1 not applied (review r1 L3): as before the re-pin, navigate upstream's
+    // own tab to the URL once this tab has loaded it (it claims what it lands on).
+    if (propagation.unpatched) {
+      if (navError) {
+        propagation = { propagated: false, reason: "skipped: this tab's navigation failed" };
+        sync.markDesynced(page.url(), null, propagation.reason);
+      } else {
+        propagation = { ...(await propagateActivePageToUpstream(url, { force })), via: "navigation" };
+      }
+    }
 
     // Cap backstop — only a CREATE can push the count over the cap. Runs
     // after the re-pin, so a pruned old tab is never the one upstream acts on.

@@ -32,7 +32,7 @@ let chromium = null;
 try { ({ chromium } = require("playwright")); if (!fs.existsSync(chromium.executablePath())) chromium = null; } catch { chromium = null; }
 const REAL = { timeout: 120000, skip: chromium ? false : "Chrome for Testing not installed" };
 
-async function launch(t, { attached = false } = {}) {
+async function launch(t, { attached = false, unpatched = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-repin-"));
   const context = await chromium.launchPersistentContext(dir, {
     headless: true, args: ["--remote-debugging-port=0"], handleSIGINT: false, handleSIGTERM: false,
@@ -62,7 +62,7 @@ async function launch(t, { attached = false } = {}) {
   const usersSrv = http.createServer((req, res) => { userHits.push(req.url); res.setHeader("content-type", "text/html"); res.end("<p>USER</p>"); });
   const userHits = [];
   await new Promise((r) => usersSrv.listen(0, "127.0.0.1", r));
-  const up = startRealUpstream(wsEndpoint);
+  const up = startRealUpstream(wsEndpoint, { patched: !unpatched });
   const prevUp = globalThis.__relayUpstream;
   globalThis.__relayUpstream = async () => up.client;
   sync.reset();
@@ -75,6 +75,7 @@ async function launch(t, { attached = false } = {}) {
     globalThis.__relayBridge = undefined;
     globalThis.__relayUpstream = prevUp;
     sync.reset();
+    sync.noteRepin(null, null);
     clearActivePage();
     await up.stop();
     await context.close().catch(() => {});
@@ -212,4 +213,33 @@ test("in-flight requests are counted per tab: after tabs_select, the idle wait w
   await tabsSelect.handler({ index: context.pages().indexOf(tabA) });
   await tabsSelect.handler({ index: context.pages().indexOf(tabB) });
   assert.strictEqual((await wait()).out.finalInFlightRequests, 0);
+});
+
+test("R1 not applied (upstream's bundle changed shape): tabs_new / tabs_select fall back to navigating upstream's own tab; relay_status says so", REAL, async (t) => {
+  const { context, relay, A, B } = await launch(t, { unpatched: true });
+  const ra = await tabsNew.handler({ url: A });
+  assert.strictEqual(last(ra).upstreamPropagated, true, JSON.stringify(ra));
+  assert.strictEqual(await upstreamEval(relay, "return page.url();"), A, "upstream's own tab was navigated to A");
+  assert.strictEqual(sync.isDesynced(), false);
+  const tabA = open(context).find((p) => p.url() === A);
+  const rb = await tabsNew.handler({ url: B });
+  assert.strictEqual(last(rb).upstreamPropagated, true, JSON.stringify(rb));
+  assert.strictEqual(await upstreamEval(relay, "return page.url();"), B);
+  // No re-pin before each call in this mode: upstream's own navigation is not undone by the next call.
+  const nav = await relay.handleToolsCall({ name: "navigation_go-to", arguments: { url: `${A}?moved`, includeSnapshot: false, includeScreenshot: false } });
+  assert.notStrictEqual(nav.isError, true, JSON.stringify(nav));
+  assert.strictEqual(await upstreamEval(relay, "return page.url();"), `${A}?moved`);
+  const rs = await tabsSelect.handler({ index: context.pages().indexOf(tabA) });
+  assert.strictEqual(last(rs).upstreamPropagated, true, JSON.stringify(rs));
+  assert.strictEqual(await upstreamEval(relay, "return page.url();"), A, "tabs_select navigated upstream's tab back to A");
+  assert.strictEqual(sync.isDesynced(), false);
+  // relay_status names the state, not only stderr.
+  const prev = globalThis.__relayStatus;
+  globalThis.__relayStatus = async () => ({ mode: "BASE" });
+  try {
+    const st = JSON.parse((await require("../../src/own-tools/relay-status.js").handler({})).content[0].text);
+    assert.strictEqual(st.mode, "BASE");
+    assert.strictEqual(st.upstreamRepin.available, false, JSON.stringify(st));
+    assert.match(st.upstreamRepin.reason, /not (patched|applied)/);
+  } finally { globalThis.__relayStatus = prev; }
 });

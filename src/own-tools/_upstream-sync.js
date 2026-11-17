@@ -45,9 +45,15 @@ const URL_PROBE = "const url = page.url(); let targetId = null; "
   + "finally { s.detach().catch(() => {}); } } catch { /* the URL alone */ } "
   + "return { url, targetId };";
 const PIN_TIMEOUT_MS = 8000;
+const NOT_PATCHED = "upstream is not patched for re-pinning (scripts/patch-bdmcp-repin.js did not apply)";
 
 let desync = null; // null = synced or unknown; else { activeUrl, upstreamUrl, reason }
 let relayUrl = null;
+// R1 (scripts/patch-bdmcp-repin.js) in the running upstream: true (a pin
+// worked, or the patch applied), false (not applied, or upstream said
+// __relayPin is not defined), null (unknown). Kept across reset(): index.js
+// sets it from the patch just before the new child that reset() is for.
+let repin = { available: null, reason: null };
 
 function isGuarded(name) {
   return typeof name === "string" && (GUARDED_NAMES.has(name) || GUARDED_PREFIXES.some((p) => name.startsWith(p)));
@@ -99,10 +105,20 @@ async function readUpstreamUrl() {
 async function pinUpstream(targetId) {
   const { result: r, error } = await runInUpstream(`return await __relayPin(${JSON.stringify(targetId)});`, PIN_TIMEOUT_MS);
   if (error) {
-    return { error: /__relayPin is not defined/.test(error) ? "upstream is not patched for re-pinning (scripts/patch-bdmcp-repin.js did not apply)" : error };
+    if (/__relayPin is not defined/.test(error)) return { error: NOT_PATCHED, notPatched: true };
+    return { error };
   }
   if (!r || typeof r !== "object" || r.targetId !== targetId) return { error: "upstream's re-pin returned no page" };
   return { url: r.url, targetId: r.targetId, changed: !!r.changed, closedOwnBlank: !!r.closedOwnBlank };
+}
+
+/** Record whether upstream can be re-pinned (relay_status shows it). */
+function noteRepin(available, reason) {
+  repin = { available: available === null ? null : !!available, reason: reason || null };
+}
+
+function repinState() {
+  return { ...repin };
 }
 
 /** C: may tabs_new reuse (navigate) or prune a pinned tab that shows `current`? */
@@ -175,5 +191,5 @@ function reset() {
 
 module.exports = {
   OPT_IN, URL_PROBE, isGuarded, stripOptIn, readUpstreamUrl, pinUpstream, mayNavigate, markSynced, markDesynced,
-  isDesynced, state, warning, refusal, afterGuardedCall, claim, reset,
+  isDesynced, state, warning, refusal, afterGuardedCall, claim, reset, noteRepin, repinState, NOT_PATCHED,
 };

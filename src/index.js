@@ -365,15 +365,21 @@ async function main() {
     }
     // R1 (2026-11-17, ask as-ops/ask-5ojuum rev 3): upstream's pin can be
     // moved to the relay's tab (own-tools/_propagate-active-page.js). Not
-    // applied → every pin fails and is reported as UPSTREAM DESYNC (rules A, B).
+    // applied → tabs_new / tabs_select navigate upstream's own tab instead, as
+    // before the re-pin (review r1 L3); relay_status shows upstreamRepin.
+    const repinSync = require("./own-tools/_upstream-sync.js");
     try {
       const { applyPatch } = require("../scripts/patch-bdmcp-repin.js");
       const result = applyPatch({ distDir: bdmcpDist });
       if (!result.patched) {
-        process.stderr.write(`[mcp-relay] WARNING R1 re-pin patch NOT applied: ${result.reason} — upstream tools will report UPSTREAM DESYNC after tabs_new / tabs_select\n`);
+        process.stderr.write(`[mcp-relay] WARNING R1 re-pin patch NOT applied: ${result.reason} — tabs_new / tabs_select will navigate upstream's own tab instead\n`);
+        repinSync.noteRepin(false, `R1 re-pin patch not applied: ${result.reason}`);
+      } else {
+        repinSync.noteRepin(null, null); // confirmed by the first pin
       }
     } catch (e) {
       process.stderr.write(`[mcp-relay] WARNING R1 re-pin patch threw: ${e.message}\n`);
+      repinSync.noteRepin(false, `R1 re-pin patch threw: ${e.message}`);
     }
     process.stderr.write(`[mcp-relay] spawning upstream child (no Brave yet, entry=${bdmcpEntry})...\n`);
     // CDP env points at the exact ws endpoint of OUR Brave (pinned to its

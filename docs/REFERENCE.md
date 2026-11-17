@@ -71,8 +71,12 @@ it is the pinned one, entries recorded earlier stay, and `tabs_new` pins before 
 captured. **`sync_wait-for-network-idle`** waits for the selected tab's own in-flight requests: each tab's are counted
 whatever the pin, so requests a tab started while another was pinned are still waited for after `tabs_select` (only
 requests already in flight before upstream first saw the tab are not). **Not moved:** `debug_*` probes stay on the tab where debugging was first
-enabled; a screen recording stops at a re-pin. If the re-pin fails (upstream unreachable, or its bundle could not be
-patched), results say `UPSTREAM DESYNC` and upstream tools that change a page are refused unless `allowPinnedPage: true`.
+enabled; a screen recording stops at a re-pin. If the re-pin fails (upstream unreachable, or the tab is not in its
+context), results say `UPSTREAM DESYNC` and upstream tools that change a page are refused unless `allowPinnedPage: true`.
+If upstream's bundle could not be patched (an upgrade changed its shape), `relay_status` shows
+`upstreamRepin.available: false` and `tabs_new` / `tabs_select` fall back to the pre-re-pin behaviour: they navigate
+upstream's own tab to the selected tab's URL (only when it shows a page the relay put there, or with
+`allowPinnedPage: true`), and nothing is re-pinned before each upstream call.
 
 #### 📤 Forms, dialogs, files
 

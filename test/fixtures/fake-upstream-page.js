@@ -62,7 +62,8 @@ function fakeUpstream({ url = "about:blank", fail = null, navFail = null, target
     const prev = globalThis.__relayUpstream;
     globalThis.__relayUpstream = async () => client;
     sync.reset();
-    return () => { globalThis.__relayUpstream = prev; sync.reset(); };
+    sync.noteRepin(null, null); // kept across reset() in the relay (index.js sets it per upstream child)
+    return () => { globalThis.__relayUpstream = prev; sync.reset(); sync.noteRepin(null, null); };
   };
   return st;
 }
