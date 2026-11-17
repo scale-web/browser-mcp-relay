@@ -14,25 +14,17 @@
 // a backstop for multi-site sprawl that reuse alone can't bound. Brave's
 // residual about:blank (pages[0]) is deliberately prunable.
 //
-// Active-page propagation: when `url` is given, we ALSO navigate
-// upstream's tracked page (via its `navigation_go-to`) so upstream's
-// screenshot / snapshot tools target this URL. See
-// _propagate-active-page.js for the why; upstream pins `_page` to a
-// specific Playwright Page reference and never re-evaluates it from
-// CDP, so creating a Playwright page on our side alone leaves
-// upstream targeting its original page.
+// Upstream follows by re-pin (2026-11-17, ask as-ops/ask-5ojuum rev 3): the
+// resulting tab becomes the page upstream's tools act on — its pin is MOVED
+// here by CDP target id (_propagate-active-page.js, scripts/patch-bdmcp-repin.js).
+// Nothing is navigated to follow, so a URL loads in one tab, and the tab the
+// previous call used keeps its page and state. Before this, upstream's own page
+// was navigated to the same URL: every session's first URL was open twice.
 //
-// Upstream's own tab (2026-11-17, ask as-ops/ask-bnyrbp): the first
-// tabs_new({url}) of every session used to leave the URL in TWO tabs — it
-// adopted Brave's launch about:blank, its upstream URL read started upstream
-// (which attaches over CDP and opens a page of its own), and propagation then
-// navigated that page to the same URL. Now, with no same-host tab, tabs_new
-// uses upstream's pinned page itself when the relay may navigate it (rule C,
-// or allowPinnedPage), matched across the two Playwright connections by CDP
-// target id; propagation then finds it "already showing". The residual
-// about:blank it would have adopted is closed only when the relay or upstream
-// created it (a launch blank of a Brave this relay launched, a tabs_new page,
-// or a page upstream once pinned) — never a tab of the user's.
+// Blank adoption: with no same-host tab, a residual about:blank is navigated
+// instead of opening a new tab only when it is the relay's — one tabs_new made,
+// or one a Brave this relay LAUNCHED opened at launch (noteLaunchedPages, from
+// index.js). Any other blank (an attached Brave's, the user's) is left alone.
 //
 // T0-7 / T1-10 fixes (2026-05-09):
 //   • try/catch around page.goto so a bad URL doesn't leave an orphan tab
@@ -41,7 +33,7 @@
 //     `{ navError, isError: true }` response.
 //   • accept `waitUntil` parameter — SPA-heavy sites need 'networkidle'.
 
-const { propagateActivePageToUpstream } = require("./_propagate-active-page.js");
+const { pinUpstreamToPage } = require("./_propagate-active-page.js");
 const { applyLocalConfigToEnv } = require("../local-config.js");
 const { setActivePage, getActivePageRaw } = require("./_active-page.js");
 const sync = require("./_upstream-sync.js");
@@ -69,12 +61,6 @@ function noteLaunchedPages(handle) {
     if (!handle || handle.attached) return;
     for (const p of handle.context.pages()) if (!p.isClosed() && p.url() === "about:blank") launchBlanks.add(p);
   } catch { /* a fake or closing context: nothing to note */ }
-}
-
-/** CDP target id of `page`, or null (no CDP on this context, or it closed). */
-async function targetIdOrNull(context, page) {
-  if (!context || typeof context.newCDPSession !== "function") return null;
-  try { return await quiet.targetIdOf(context, page); } catch { return null; }
 }
 
 /**
@@ -228,8 +214,6 @@ module.exports = {
     let page = null;
     let reused = false;
     let adoptedBlank = false;
-    let upstreamTab = false; // the page is upstream's pinned page, found by target id
-    let closedBlank = false;
     if (url && !_args.forceNew) {
       let candidates = bridge.context.pages();
       if (findReusablePage(candidates, url, getActivePageRaw())) {
@@ -240,38 +224,12 @@ module.exports = {
       reused = !!page;
       if (reused) logTab("tab-reuse", page, read && read.url);
       if (!page) {
-        // No same-host tab — use upstream's pinned page when the relay may
-        // navigate it: propagation would navigate it to this URL anyway, so
-        // any other tab would be a duplicate. Reading starts upstream, which
-        // is when it opens that page. Not for about:blank: propagation skips
-        // it, and starting upstream would only add upstream's tab.
-        if (url !== "about:blank" && read === null) read = await sync.readUpstreamUrl();
-        if (read !== null && typeof read.url === "string" && typeof read.targetId === "string"
-          && (force || sync.mayNavigate(read.url)) && typeof bridge.context.newCDPSession === "function") {
-          try { page = await quiet.pageForTarget(bridge.context, read.targetId, 2000); } catch { page = null; }
-          upstreamTab = !!page;
-        }
-        const blank = bridge.context.pages().find((p) => p !== page && !p.isClosed() && p.url() === "about:blank") || null;
-        if (upstreamTab) {
-          logTab("tab-upstream", page, read.url);
-          // The blank the relay would otherwise have adopted: close it only when it is ours.
-          if (blank) {
-            const why = created.has(blank) ? "relay" : launchBlanks.has(blank) ? "launch"
-              : sync.wasUpstreamTarget(await targetIdOrNull(bridge.context, blank)) ? "upstream" : null;
-            if (why) {
-              try {
-                await blank.close();
-                closedBlank = true;
-                logTab("tab-blank-close", blank, read.url, { why }, "about:blank");
-              } catch { /* mid-close race */ }
-            }
-          }
-        } else {
-          // Adopt a residual about:blank (Brave always opens one at launch)
-          // instead of leaving it around forever next to a freshly created tab.
-          page = blank;
-          adoptedBlank = !!page;
-        }
+        // No same-host tab — adopt a residual about:blank of the relay's
+        // (Brave's launch tab, or one tabs_new made) instead of leaving it
+        // around forever next to a freshly created tab. Never another blank.
+        page = bridge.context.pages().find((p) => !p.isClosed() && p.url() === "about:blank"
+          && (created.has(p) || launchBlanks.has(p))) || null;
+        adoptedBlank = !!page;
       }
     }
     if (!page) {
@@ -280,17 +238,6 @@ module.exports = {
       created.add(page);
       relayLeft.set(page, "about:blank");
     }
-    // Reusing the relay's own pinned tab (same host): the relay's goto moves
-    // upstream's page too, so it stays the relay's (review r2). The SAME tab
-    // by CDP target id: two tabs can show one URL (two about:blank tabs); by
-    // URL only when an id is unknown (an upstream that does not report one).
-    const preUrl = reused || adoptedBlank ? page.url() : null;
-    let wasUpstreams = upstreamTab;
-    if (!wasUpstreams && preUrl !== null && read !== null && typeof read.url === "string" && sync.mayNavigate(preUrl)) {
-      const id = typeof read.targetId === "string" ? await targetIdOrNull(bridge.context, page) : null;
-      wasUpstreams = id !== null ? id === read.targetId : read.url === preUrl;
-    }
-    let sameTab = false; // the page is upstream's own tab (it moved with our goto)
     // T0-7: track the page as active BEFORE goto so a goto failure still
     // leaves us in a usable state — subsequent own-tools target this new
     // tab, not the previous active page or pages[0]'s about:blank.
@@ -298,6 +245,19 @@ module.exports = {
     // Raise the tab only when this relay's Brave is already in front (the
     // user is watching it) — a new tab is created in the background.
     try { await quiet.raiseIfFront(page, bridge.bravePid); } catch { /* headless / already front */ }
+
+    // A create over the cap will prune: read which tab upstream is on BEFORE
+    // the re-pin moves it, so rule C still spares it (review r1 L6).
+    const cap = maxTabsFromEnv();
+    let overCap = false;
+    try { overCap = !reused && !adoptedBlank && cap > 0 && bridge.context.pages().filter((p) => !p.isClosed()).length > cap; } catch { /* best-effort */ }
+    let pruneSpare = () => false;
+    if (overCap) { try { pruneSpare = spareFilter(await sparedUrl()); } catch { /* best-effort */ } }
+
+    // Upstream acts on this tab from now on (best-effort; a failure is a
+    // desync, rules A and B). BEFORE the goto, so upstream's console and
+    // network capture (attached to the pinned page) sees this page load.
+    const propagation = await pinUpstreamToPage(page, { claim: false });
 
     let navError = null;
     if (url) {
@@ -307,45 +267,19 @@ module.exports = {
         navError = e.message || String(e);
       }
       try { relayLeft.set(page, page.url()); } catch { /* closed mid-call */ }
-      if (wasUpstreams) {
-        const now = await sync.readUpstreamUrl();
-        if (now.url === page.url()) {
-          sync.claim(now.url);
-          sameTab = true;
-        }
-      }
     }
+    // The relay put this page there (rule C) — even after a failed goto: the
+    // tab exists, is the active one, and shows what the relay's goto left.
+    if (propagation.propagated) { try { sync.claim(page.url()); } catch { /* closed mid-call */ } }
 
-    // Cap backstop — only a CREATE can push the count over the cap. MUST
-    // run BEFORE upstream propagation: the prune can't identify upstream's
-    // pinned page and may close it (it's among the oldest). Pruning first
-    // lets propagation's navigation_go-to trigger upstream's
-    // ensureSessionPageOpen → page recreated AND navigated in this same
-    // call. Pruning after would leave upstream pinned to a fresh
-    // about:blank until the next navigation — screenshots would capture
-    // the wrong page.
+    // Cap backstop — only a CREATE can push the count over the cap. Runs
+    // after the re-pin, so a pruned old tab is never the one upstream acts on.
     let prunedTabs = 0;
-    if (!reused && !adoptedBlank && !upstreamTab) {
+    if (overCap) {
       try {
-        const cap = maxTabsFromEnv();
-        const open = bridge.context.pages().filter((p) => !p.isClosed()).length;
-        const spare = cap > 0 && open > cap ? spareFilter(await sparedUrl()) : () => false;
-        prunedTabs = await pruneOldestTabs(bridge.context.pages(), cap, [page], spare,
+        prunedTabs = await pruneOldestTabs(bridge.context.pages(), cap, [page], pruneSpare,
           (p, u) => logTab("tab-prune", p, read && read.url, {}, u));
       } catch { /* best-effort */ }
-    }
-
-    // Propagate to upstream (best-effort) only if navigation succeeded.
-    let propagation;
-    if (navError) {
-      propagation = { propagated: false, reason: "skipped: this tab's navigation failed" };
-      // Upstream's own tab is still the selected one, whatever it now shows [review r3 LOW].
-      if (sameTab) sync.markSynced(page.url());
-      else sync.markDesynced(page.url(), null, propagation.reason);
-    } else {
-      // Upstream's own tab moved with our goto: hand propagation where it
-      // landed (after redirects), so it sees "already showing" (no second load).
-      propagation = await propagateActivePageToUpstream(sameTab ? page.url() : url, { force });
     }
 
     const pages = bridge.context.pages();
@@ -369,8 +303,6 @@ module.exports = {
           url: page.url(),
           reused,
           adoptedBlank,
-          upstreamTab,
-          ...(closedBlank ? { closedBlank } : {}),
           prunedTabs,
           waitUntil,
           navError,

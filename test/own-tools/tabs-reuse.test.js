@@ -5,7 +5,8 @@ const test = require("node:test");
 const assert = require("node:assert");
 const tabsNew = require("../../src/own-tools/tabs-new.js");
 const sync = require("../../src/own-tools/_upstream-sync.js");
-const { fakeUpstream } = require("../fixtures/fake-upstream-page.js");
+const { fakeUpstream, fakeTab, fakeContext } = require("../fixtures/fake-upstream-page.js");
+const { pinUpstreamToPage } = require("../../src/own-tools/_propagate-active-page.js");
 
 const fakePage = (url, closed = false) => ({
   url: () => url,
@@ -88,25 +89,15 @@ test("handler reuses an existing same-host tab instead of creating (reused:true,
   const { setActivePage, clearActivePage } = require("../../src/own-tools/_active-page.js");
   clearActivePage();
   let newPageCalls = 0;
-  const existing = {
-    url: () => "https://www.ups.com/track?n=OLD",
-    isClosed: () => false,
-    gotoUrls: [],
-    async goto(u) { this.gotoUrls.push(u); },
-    async bringToFront() {},
-    once() {},
-  };
+  const existing = fakeTab("https://www.ups.com/track?n=OLD");
   globalThis.__relayBridge = {
-    context: {
-      pages: () => [existing],
-      newPage: async () => { newPageCalls++; throw new Error("should not create"); },
-    },
+    context: fakeContext([existing], { newPage: async () => { newPageCalls++; throw new Error("should not create"); } }),
   };
   const restore = fakeUpstream().install(); // upstream's own tab is blank: nothing to spare
   t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
 
   const result = await tabsNew.handler({ url: "https://www.ups.com/track?n=NEW" });
-  const payload = JSON.parse(result.content[0].text);
+  const payload = JSON.parse(result.content[result.content.length - 1].text);
   assert.strictEqual(payload.reused, true);
   assert.strictEqual(newPageCalls, 0);
   assert.deepStrictEqual(existing.gotoUrls, ["https://www.ups.com/track?n=NEW"]);
@@ -131,14 +122,7 @@ test("handler honors forceNew:true (creates despite same-host match)", async (t)
 
 // ───── rule C for the relay's own navigation (2026-10-13 review r1 H1/L6) ─────
 
-function navPage(url) {
-  return {
-    _url: url, gotoUrls: [], closedByTest: false,
-    url() { return this._url; }, isClosed() { return this.closedByTest; },
-    async goto(u) { this.gotoUrls.push(u); this._url = u; }, async bringToFront() {}, once() {},
-    async close() { this.closedByTest = true; },
-  };
-}
+const navPage = (url) => fakeTab(url);
 
 test("H1: tabs_new never reuses upstream's pinned tab while it shows the user's page", async (t) => {
   const { clearActivePage } = require("../../src/own-tools/_active-page.js");
@@ -146,28 +130,31 @@ test("H1: tabs_new never reuses upstream's pinned tab while it shows the user's 
   const users = navPage("https://site.example/dashboard");
   const fresh = navPage("about:blank");
   const pages = [users];
-  globalThis.__relayBridge = { context: { pages: () => pages, newPage: async () => { pages.push(fresh); return fresh; } } };
-  const up = fakeUpstream({ url: "https://site.example/dashboard" });
+  globalThis.__relayBridge = { context: fakeContext(pages, { newPage: async () => { pages.push(fresh); return fresh; } }) };
+  const up = fakeUpstream();
   const restore = up.install();
   t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
+  await pinUpstreamToPage(users, { claim: false }); // upstream is on the user's tab; the relay did not put /dashboard there
 
   const result = await tabsNew.handler({ url: "https://site.example/reports" });
   const payload = JSON.parse(result.content[result.content.length - 1].text);
   assert.strictEqual(payload.reused, false);
   assert.deepStrictEqual(users.gotoUrls, [], "the user's tab is not navigated");
+  assert.strictEqual(users.url(), "https://site.example/dashboard");
   assert.deepStrictEqual(fresh.gotoUrls, ["https://site.example/reports"]);
-  assert.strictEqual(up.url, "https://site.example/dashboard");
-  assert.match(result.content[0].text, /UPSTREAM DESYNC/);
+  assert.strictEqual(up.targetId, fresh.tid, "upstream moves to the new tab");
+  assert.strictEqual(up.navs().length, 0);
 });
 
 test("H1: allowPinnedPage on tabs_new reclaims the pinned tab: reused, and upstream follows", async (t) => {
   const { clearActivePage } = require("../../src/own-tools/_active-page.js");
   clearActivePage();
   const mine = navPage("https://site.example/after-redirect");
-  globalThis.__relayBridge = { context: { pages: () => [mine], newPage: async () => { throw new Error("should not create"); } } };
-  const up = fakeUpstream({ url: "https://site.example/after-redirect" });
+  globalThis.__relayBridge = { context: fakeContext([mine], { newPage: async () => { throw new Error("should not create"); } }) };
+  const up = fakeUpstream();
   const restore = up.install();
   t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
+  await pinUpstreamToPage(mine, { claim: false }); // a redirect moved it: not the relay's URL any more
 
   const result = await tabsNew.handler({ url: "https://site.example/next", allowPinnedPage: true });
   const payload = JSON.parse(result.content[result.content.length - 1].text);
@@ -183,7 +170,7 @@ test("H1: an unreadable upstream URL means no reuse (the pinned tab can't be tol
   const users = navPage("https://site.example/dashboard");
   const fresh = navPage("about:blank");
   const pages = [users];
-  globalThis.__relayBridge = { context: { pages: () => pages, newPage: async () => { pages.push(fresh); return fresh; } } };
+  globalThis.__relayBridge = { context: fakeContext(pages, { newPage: async () => { pages.push(fresh); return fresh; } }) };
   const restore = fakeUpstream({ fail: "upstream down" }).install();
   t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
   const result = await tabsNew.handler({ url: "https://site.example/reports" });
@@ -198,7 +185,7 @@ test("L6: pruning spares upstream's pinned tab while it shows the user's page", 
   const others = [navPage("https://a.example/"), navPage("https://b.example/")];
   const fresh = navPage("about:blank");
   const pages = [users, ...others];
-  globalThis.__relayBridge = { context: { pages: () => pages, newPage: async () => { pages.push(fresh); return fresh; } } };
+  globalThis.__relayBridge = { context: fakeContext(pages, { newPage: async () => { pages.push(fresh); return fresh; } }) };
   const prevMax = process.env.BROWSER_RELAY_MAX_TABS;
   process.env.BROWSER_RELAY_MAX_TABS = "2";
   const restore = fakeUpstream({ url: "https://user.example/signed-in" }).install();
@@ -216,20 +203,19 @@ test("L6: pruning spares upstream's pinned tab while it shows the user's page", 
 test("r2: reusing the relay's own pinned tab on the same host keeps it the relay's (no false 'protected')", async (t) => {
   const { clearActivePage } = require("../../src/own-tools/_active-page.js");
   clearActivePage();
-  const up = fakeUpstream({ url: "https://site.example/a" });
+  const up = fakeUpstream();
   const restore = up.install();
-  sync.markSynced("https://site.example/a"); // the relay put /a there
-  // The relay's Playwright handle on upstream's own tab: its goto moves upstream's page.
   const pinned = navPage("https://site.example/a");
-  pinned.goto = async function (u) { this.gotoUrls.push(u); this._url = u; up.url = u; };
-  globalThis.__relayBridge = { context: { pages: () => [pinned], newPage: async () => { throw new Error("should not create"); } } };
+  globalThis.__relayBridge = { context: fakeContext([pinned], { newPage: async () => { throw new Error("should not create"); } }) };
   t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
+  await pinUpstreamToPage(pinned); // the relay put /a there
 
   const first = await tabsNew.handler({ url: "https://site.example/b" });
   assert.strictEqual(JSON.parse(first.content[first.content.length - 1].text).reused, true);
   assert.strictEqual(sync.state().relayUrl, "https://site.example/b");
   assert.strictEqual(sync.isDesynced(), false);
-  assert.strictEqual((await require("../../src/own-tools/_propagate-active-page.js").propagateActivePageToUpstream("https://other.example/x")).propagated, true);
+  assert.strictEqual(up.url, "https://site.example/b", "upstream reads that same tab");
+  assert.strictEqual(up.navs().length, 0);
 });
 
 test("r2: with upstream unreadable, tabs the relay created are still reused and pruned; others are spared", async (t) => {
@@ -238,7 +224,7 @@ test("r2: with upstream unreadable, tabs the relay created are still reused and 
   const users = navPage("https://user.example/signed-in");
   const pages = [users];
   let n = 0;
-  globalThis.__relayBridge = { context: { pages: () => pages, newPage: async () => { const p = navPage("about:blank"); p.n = ++n; pages.push(p); return p; } } };
+  globalThis.__relayBridge = { context: fakeContext(pages, { newPage: async () => { const p = navPage("about:blank"); p.n = ++n; pages.push(p); return p; } }) };
   const prevMax = process.env.BROWSER_RELAY_MAX_TABS;
   process.env.BROWSER_RELAY_MAX_TABS = "2";
   const restore = fakeUpstream({ fail: "upstream wedged" }).install();
@@ -255,50 +241,64 @@ test("r2: with upstream unreadable, tabs the relay created are still reused and 
   assert.ok(pages.filter((p) => p !== users && p.closedByTest).length >= 1, "relay-created tabs are pruned");
 });
 
-test("r2: reusing a separate relay tab that merely shows the pinned URL does not move ownership off upstream's tab", async (t) => {
+test("re-pin: reusing a different same-host tab moves upstream to it; the tab upstream was on keeps its page", async (t) => {
   const { clearActivePage } = require("../../src/own-tools/_active-page.js");
   clearActivePage();
-  const up = fakeUpstream({ url: "https://site.example/a" });
+  const up = fakeUpstream();
   const restore = up.install();
-  sync.markSynced("https://site.example/a");
-  const relayTab = navPage("https://site.example/a"); // a different tab: its goto leaves upstream's page alone
-  globalThis.__relayBridge = { context: { pages: () => [relayTab], newPage: async () => { throw new Error("should not create"); } } };
+  const other = navPage("https://other.example/draft");
+  const relayTab = navPage("https://site.example/a");
+  globalThis.__relayBridge = { context: fakeContext([other, relayTab], { newPage: async () => { throw new Error("should not create"); } }) };
   t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
+  await pinUpstreamToPage(other);
 
   const res = await tabsNew.handler({ url: "https://site.example/b" });
   const payload = JSON.parse(res.content[res.content.length - 1].text);
   assert.strictEqual(payload.reused, true);
-  assert.strictEqual(payload.upstreamPropagated, true, "upstream's /a was still the relay's, so propagation moved it");
+  assert.strictEqual(payload.upstreamPropagated, true);
+  assert.strictEqual(up.targetId, relayTab.tid);
   assert.strictEqual(up.url, "https://site.example/b");
+  assert.strictEqual(other.url(), "https://other.example/draft", "never navigated to follow");
+  assert.deepStrictEqual(other.gotoUrls, []);
   assert.strictEqual(sync.isDesynced(), false);
 });
 
-test("r3: adopting upstream's own blank tab keeps it the relay's (the adopt-blank read)", async (t) => {
+test("blank adoption: only the relay's blank (a launch blank, or a tabs_new tab) — never another", async (t) => {
   const { clearActivePage } = require("../../src/own-tools/_active-page.js");
   clearActivePage();
-  const up = fakeUpstream({ url: "about:blank" });
+  const up = fakeUpstream();
   const restore = up.install();
-  const blank = navPage("about:blank");
-  blank.goto = async function (u) { this.gotoUrls.push(u); this._url = u; up.url = u; }; // it IS upstream's tab
-  globalThis.__relayBridge = { context: { pages: () => [blank], newPage: async () => { throw new Error("should not create"); } } };
+  const usersBlank = navPage("about:blank");
+  const pages = [usersBlank];
+  globalThis.__relayBridge = { context: fakeContext(pages) };
   t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
 
   const res = await tabsNew.handler({ url: "https://site.example/a" });
-  assert.strictEqual(JSON.parse(res.content[res.content.length - 1].text).adoptedBlank, true);
-  assert.strictEqual(sync.state().relayUrl, "https://site.example/a");
-  assert.strictEqual((await require("../../src/own-tools/_propagate-active-page.js").propagateActivePageToUpstream("https://other.example/x")).propagated, true);
+  assert.strictEqual(JSON.parse(res.content[res.content.length - 1].text).adoptedBlank, false);
+  assert.deepStrictEqual(usersBlank.gotoUrls, [], "a blank the relay cannot name is not navigated");
+  assert.strictEqual(pages.length, 2);
+
+  const launched = navPage("about:blank");
+  const pages2 = [launched];
+  globalThis.__relayBridge = { context: fakeContext(pages2, { newPage: async () => { throw new Error("should adopt"); } }) };
+  tabsNew.noteLaunchedPages({ context: globalThis.__relayBridge.context });
+  tabsNew.noteLaunchedPages({ context: fakeContext([usersBlank]), attached: true }); // an attached Brave: nothing noted
+  const res2 = await tabsNew.handler({ url: "https://site.example/b" });
+  assert.strictEqual(JSON.parse(res2.content[res2.content.length - 1].text).adoptedBlank, true);
+  assert.deepStrictEqual(launched.gotoUrls, ["https://site.example/b"]);
+  assert.strictEqual(up.targetId, launched.tid);
 });
 
-test("r3: a failed navigation of upstream's own reused tab is not reported as a desync", async (t) => {
+test("r3: a failed navigation of the reused pinned tab is not reported as a desync", async (t) => {
   const { clearActivePage } = require("../../src/own-tools/_active-page.js");
   clearActivePage();
-  const up = fakeUpstream({ url: "https://site.example/a" });
+  const up = fakeUpstream();
   const restore = up.install();
-  sync.markSynced("https://site.example/a");
   const pinned = navPage("https://site.example/a");
   pinned.goto = async () => { throw new Error("net::ERR_TIMED_OUT"); };
-  globalThis.__relayBridge = { context: { pages: () => [pinned], newPage: async () => { throw new Error("should not create"); } } };
+  globalThis.__relayBridge = { context: fakeContext([pinned], { newPage: async () => { throw new Error("should not create"); } }) };
   t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
+  await pinUpstreamToPage(pinned);
 
   const res = await tabsNew.handler({ url: "https://site.example/b" });
   assert.strictEqual(res.isError, true);
@@ -322,7 +322,7 @@ test("MED-3 log: reuse of the relay's own tab, of one the user changed, and of a
   const events = collectEvents(t);
   const foreign = navPage("https://b.example/theirs");
   const pages = [foreign];
-  globalThis.__relayBridge = { context: { pages: () => pages, newPage: async () => { const p = navPage("about:blank"); pages.push(p); return p; } } };
+  globalThis.__relayBridge = { context: fakeContext(pages, { newPage: async () => { const p = navPage("about:blank"); pages.push(p); return p; } }) };
   const restore = fakeUpstream().install();
   t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
 
@@ -334,12 +334,13 @@ test("MED-3 log: reuse of the relay's own tab, of one the user changed, and of a
   const reuse = events.filter((e) => e.event === "tab-reuse");
   assert.deepStrictEqual(reuse.map((e) => [e.host, e.createdHere, e.changedSinceRelay, e.sameUrlAsUpstream]), [
     ["a.example", true, false, true], // synced: upstream's tab shows the same URL
-    ["a.example", true, true, false],
+    // the tab someone else moved is upstream's (re-pinned) tab: rule C spares it, no reuse
     ["b.example", false, null, false],
   ]);
+  assert.deepStrictEqual(pages[1].gotoUrls, ["https://a.example/1", "https://a.example/2"], "not navigated after the user moved it");
   assert.ok(reuse.every((e) => !JSON.stringify(e).includes("/1") && !JSON.stringify(e).includes("theirs")), "host only, never a path");
   const open = events.filter((e) => e.event === "tabs-open").pop();
-  assert.deepStrictEqual([open.open, open.createdHere, open.other], [2, 1, 1]);
+  assert.deepStrictEqual([open.open, open.createdHere, open.other], [3, 2, 1]);
 });
 
 test("MED-3 log: each pruned tab is logged; a throwing logger never breaks tabs_new", async (t) => {
@@ -348,7 +349,7 @@ test("MED-3 log: each pruned tab is logged; a throwing logger never breaks tabs_
   const events = collectEvents(t);
   const old = [navPage("https://x.example/"), navPage("https://y.example/")];
   const pages = [...old];
-  globalThis.__relayBridge = { context: { pages: () => pages, newPage: async () => { const p = navPage("about:blank"); pages.push(p); return p; } } };
+  globalThis.__relayBridge = { context: fakeContext(pages, { newPage: async () => { const p = navPage("about:blank"); pages.push(p); return p; } }) };
   const prevMax = process.env.BROWSER_RELAY_MAX_TABS;
   process.env.BROWSER_RELAY_MAX_TABS = "1";
   const restore = fakeUpstream().install();
@@ -377,7 +378,7 @@ test("MED-3 log: a prune whose close fails is not logged", async (t) => {
   const stuck = navPage("https://stuck.example/");
   stuck.close = async () => { throw new Error("mid-close race"); };
   const pages = [stuck];
-  globalThis.__relayBridge = { context: { pages: () => pages, newPage: async () => { const p = navPage("about:blank"); pages.push(p); return p; } } };
+  globalThis.__relayBridge = { context: fakeContext(pages, { newPage: async () => { const p = navPage("about:blank"); pages.push(p); return p; } }) };
   const prevMax = process.env.BROWSER_RELAY_MAX_TABS;
   process.env.BROWSER_RELAY_MAX_TABS = "1";
   const restore = fakeUpstream().install();
@@ -387,54 +388,4 @@ test("MED-3 log: a prune whose close fails is not logged", async (t) => {
   });
   await tabsNew.handler({ url: "https://new.example/", forceNew: true });
   assert.strictEqual(events.filter((e) => e.event === "tab-prune").length, 0);
-});
-
-// ───── upstream's own tab, by CDP target id (2026-11-17, ask as-ops/ask-bnyrbp) ─────
-
-/** A fake context whose CDP sessions report each page's `tid` as its target id. */
-function cdpContext(pages) {
-  return {
-    pages: () => pages,
-    newPage: async () => { throw new Error("should not create"); },
-    newCDPSession: async (p) => ({ send: async () => ({ targetInfo: { targetId: p.tid } }), detach: async () => {} }),
-  };
-}
-
-test("no same-host tab: upstream's pinned tab is used; a blank upstream once pinned is closed, a page the relay can't name is not", async (t) => {
-  const { clearActivePage } = require("../../src/own-tools/_active-page.js");
-  clearActivePage();
-  const events = collectEvents(t);
-  const up = fakeUpstream({ url: "about:blank", targetId: "T-old" });
-  const restore = up.install();
-  await sync.readUpstreamUrl(); // an earlier upstream child pinned T-old
-  up.targetId = "T-cur";
-  const oldUp = navPage("about:blank"); oldUp.tid = "T-old";
-  const cur = navPage("about:blank"); cur.tid = "T-cur";
-  cur.goto = async function (u) { this.gotoUrls.push(u); this._url = u; up.url = u; }; // it IS upstream's tab
-  const usersBlank = navPage("about:blank"); usersBlank.tid = "T-user";
-  const pages = [oldUp, cur, usersBlank];
-  globalThis.__relayBridge = { context: cdpContext(pages) };
-  t.after(() => { globalThis.__relayBridge = undefined; clearActivePage(); restore(); });
-
-  const res = await tabsNew.handler({ url: "https://site.example/a" });
-  const payload = JSON.parse(res.content[res.content.length - 1].text);
-  assert.strictEqual(payload.upstreamTab, true);
-  assert.strictEqual(payload.adoptedBlank, false);
-  assert.deepStrictEqual(cur.gotoUrls, ["https://site.example/a"]);
-  assert.strictEqual(oldUp.closedByTest, true, "upstream's old blank is closed");
-  assert.strictEqual(usersBlank.closedByTest, false);
-  assert.deepStrictEqual(usersBlank.gotoUrls, []);
-  assert.strictEqual(up.navs().length, 0, "propagation found it already showing");
-  assert.strictEqual(sync.state().relayUrl, "https://site.example/a");
-  assert.deepStrictEqual(events.filter((e) => e.event === "tab-blank-close").map((e) => [e.host, e.why]), [["about:blank", "upstream"]]);
-
-  // Rule C: once upstream's tab shows a page the relay did not put there, it is not used.
-  up.url = "https://user.example/signed-in"; cur._url = up.url;
-  const fresh = navPage("about:blank"); fresh.tid = "T-fresh";
-  globalThis.__relayBridge.context.newPage = async () => { pages.push(fresh); return fresh; };
-  const res2 = await tabsNew.handler({ url: "https://other.example/" });
-  const p2 = JSON.parse(res2.content[res2.content.length - 1].text);
-  assert.strictEqual(p2.upstreamTab, false);
-  assert.deepStrictEqual(cur.gotoUrls, ["https://site.example/a"], "the user's page in upstream's tab is not navigated");
-  assert.deepStrictEqual(usersBlank.gotoUrls, ["https://other.example/"], "the old blank-adoption path still applies");
 });

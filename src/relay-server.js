@@ -26,6 +26,7 @@
 const { EventEmitter } = require("node:events");
 const metaGuard = require("./meta-guard.js");
 const sync = require("./own-tools/_upstream-sync.js");
+const { pinUpstreamToActivePage } = require("./own-tools/_propagate-active-page.js");
 const requestBodyFilter = require("./request-body-filter.js");
 
 // Cap each emitted event's response body at this size (in JSON-stringified
@@ -234,6 +235,10 @@ class RelayServer {
         // A76: read the patch status only now — ensureBrave()/getUpstream()
         // may just have (re)spawned upstream, which re-runs the patch.
         const unpatched = requestBodyFilter.refuseUnpatched(name);
+        // Upstream acts on the tab tabs_new / tabs_select made active: re-pin
+        // it there when it is pinned elsewhere (a restarted upstream, or one
+        // that re-created its page). A failed pin is a desync (rules A, B).
+        if (!unpatched) await pinUpstreamToActivePage();
         if (unpatched) {
           response = unpatched;
         } else if (guarded && sync.isDesynced() && !optIn) {

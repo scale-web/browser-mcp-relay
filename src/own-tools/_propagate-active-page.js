@@ -1,145 +1,91 @@
-// _propagate-active-page.js — shared helper for tabs_new / tabs_select.
+// _propagate-active-page.js — point upstream at the relay's active tab.
 //
-// Why: upstream BDMCP captures ONE specific Playwright Page reference at
-// CDP-attach time (see node_modules/browser-devtools-mcp/dist/core-*.js,
-// `createToolSessionContext` → `newPage(browserContext)` →
-// `BrowserToolSessionContext._page`). Upstream tools like
-// `content_take-screenshot`, `a11y_take-aria-snapshot`,
-// `content_get-as-text` etc. all dispatch on `context.page` (i.e. that
-// single `_page` reference). Upstream does NOT listen to CDP
-// `Target.activateTarget`, `Target.targetCreated`, or any other signal
-// that would cause it to re-evaluate which Page is "active" — verified
-// by grepping the dist bundle for those symbols (zero hits in upstream
-// code paths). `_page` only swaps when it isClosed(), and even then
-// upstream creates yet another fresh page via `browserContext.newPage()`
-// rather than picking an existing one.
+// Why: upstream BDMCP runs every tool on ONE Playwright page,
+// BrowserToolSessionContext._page, made at its first tool call and never
+// re-evaluated (it ignores Target.activateTarget and the like; `_page` is only
+// replaced when it closes). Until 2026-11-17 the relay kept it in step by
+// NAVIGATING that page to the URL of the relay's tab: every session's first URL
+// loaded in two tabs, and a second host navigated the session's working page
+// away.
 //
-// Consequence: when our `tabs_new` calls `bridge.context.newPage()` or
-// our `tabs_select` calls `pages[i].bringToFront()`, upstream's `_page`
-// stays pinned to whatever it grabbed at first tool dispatch (typically
-// pages[1] — pages[0] is Brave's auto-opened about:blank, pages[1] is
-// upstream's dedicated page from its own newPage() call). A subsequent
-// `content_take-screenshot` then captures upstream's `_page`, NOT the
-// page the user just opened/selected.
+// Now (ask as-ops/ask-5ojuum rev 3, "Re-pin upstream to relay tab") the relay
+// MOVES upstream's pin to its own tab, matched by CDP target id, through
+// __relayPin in upstream's `execute` sandbox (scripts/patch-bdmcp-repin.js).
+// No page is navigated to follow: tabs_select back to A gives upstream A again,
+// with A's state intact. Upstream's own transient tab (made when it starts) is
+// closed by the pin while it is still about:blank.
 //
-// Fix: route the URL through upstream's own `navigation_go-to` tool, so
-// upstream's tracked page navigates to the URL the user expects to be
-// "active". The relay-side Playwright page still exists (visible via
-// `tabs_list`) but upstream's screenshot/snapshot tools now target the
-// correct URL. This is the only externally observable lever — anything
-// else (closing upstream's page, monkey-patching newPage, sending CDP
-// activateTarget) is either a no-op or strictly worse.
+// Two entry points:
+//   pinUpstreamToPage(page, {claim})  tabs_new / tabs_select: pin to that tab;
+//                                     claim = the relay put its page there
+//                                     (rule C, _upstream-sync.js).
+//   pinUpstreamToActivePage()         relay-server, before each upstream call:
+//                                     re-pin when upstream's pin is not the
+//                                     tab tabs_new / tabs_select last made
+//                                     active (upstream restarted, or its page
+//                                     was re-created). Claims nothing; does
+//                                     nothing without such a tab.
 //
-// Failure mode: if upstream isn't ready or `navigation_go-to` errors
-// (e.g. blocked file://, network failure) — whether it throws or returns
-// an `isError` result — we LOG and CONTINUE rather
-// than fail the tabs_* call. The relay-side page is still created/
-// brought to front; only the upstream-propagation half failed. This
-// keeps the tabs_* tools robust for offline/file-only flows.
-//
-// Non-destructive (2026-10-13, ALA-CRO's lost tab): navigating upstream's
-// pinned page REPLACES what it shows, and that page can be one the user is
-// working in. So before navigating we read its URL (upstream `execute`,
-// `return page.url()`) and navigate only a page the relay put there — see
-// _upstream-sync.js rule C. Otherwise the pinned page is left as it is and
-// the relay records the desync, which warns on, and guards, every later
-// upstream call.
+// Failure (upstream unreadable, not patched, or the tab is not in upstream's
+// context): logged, recorded as a desync (rules A and B), and the tabs_* call
+// still succeeds. Never throws.
 
 const sync = require("./_upstream-sync.js");
+const quiet = require("./_quiet-focus.js");
+const { getActivePageRaw } = require("./_active-page.js");
 
-/**
- * Point upstream's tracked page at `url` so its tools (screenshot,
- * snapshots, execute, etc.) act on the URL the caller selected.
- * Best-effort — never throws. Records the outcome in _upstream-sync.js.
- *
- * Returns propagated: true when upstream's page now shows `url` (already
- * showing it counts — no reload). Returns propagated: false, with a reason,
- * when:
- * - url is empty / about:blank (no upstream call at all)
- * - globalThis.__relayUpstream is missing (only in unit tests; state untouched)
- * - upstream's URL can't be read (left as is: we can't tell whose page it is)
- * - upstream's page shows a page the relay did not put there (left as is)
- * - upstream's navigation_go-to fails
- *
- * `force` (the caller's allowPinnedPage on tabs_*): the caller says upstream's
- * tab is its own, so rule C does not apply.
- *
- * @param {string} url - target URL
- * @param {{force?: boolean}} [opts]
- * @returns {Promise<{propagated: boolean, reason?: string, upstreamUrl?: string}>}
- */
-async function propagateActivePageToUpstream(url, { force = false } = {}) {
-  // A blank tab is no navigation target, and asking upstream anything would
-  // start its session (it opens a page of its own on its first call). Upstream
-  // tools still act on another tab, though: the 2026-10-13 incident began with
-  // exactly this (tabs_select of a blank tab, then execute's page.goto).
-  if (!url || url === "about:blank") {
-    const reason = "skipped: the selected tab is empty or about:blank";
-    sync.markDesynced(url, null, reason);
-    return { propagated: false, reason };
-  }
-  const getUpstream = globalThis.__relayUpstream;
-  if (typeof getUpstream !== "function") {
-    return { propagated: false, reason: "skipped: __relayUpstream not exposed" };
-  }
-  const read = await sync.readUpstreamUrl();
-  if (typeof read.url !== "string") {
-    const reason = `could not read upstream's page: ${read.error}`;
-    sync.markDesynced(url, null, reason);
-    return { propagated: false, reason };
-  }
-  const current = read.url;
-  if (force) sync.claim(current);
-  if (current === url) {
-    sync.markSynced(sync.mayNavigate(current) ? url : null);
-    return { propagated: true, reason: "already showing", upstreamUrl: current };
-  }
-  if (!sync.mayNavigate(current)) {
-    const reason = "protected: upstream's tab shows a page the relay did not put there (the user's, or one that changed its own URL), so it was not navigated";
-    process.stderr.write(`[mcp-relay] tabs: upstream tab shows ${current}, not the relay's; left as is\n`);
-    sync.markDesynced(url, current, reason, true);
-    return { propagated: false, reason, upstreamUrl: current };
-  }
-  try {
-    const upstream = await getUpstream();
-    // Forward as a tools/call so upstream runs its standard navigation
-    // pipeline (CDP attach if needed, network-idle wait, etc.). Disable
-    // snapshot/screenshot — we only care about the side effect of
-    // upstream's `_page` being navigated. includeSnapshot/Screenshot
-    // default true on upstream, which would double our latency.
-    const result = await upstream.request("tools/call", {
-      name: "navigation_go-to",
-      arguments: { url, includeSnapshot: false, includeScreenshot: false },
-    });
-    // Upstream reports a failed tool as a normal result with isError: true,
-    // not by throwing — treat it exactly like a throw.
-    if (result && result.isError) {
-      const text = Array.isArray(result.content)
-        ? result.content.filter((c) => c && c.type === "text").map((c) => c.text).join(" ").trim()
-        : "";
-      throw new Error(text || "navigation_go-to returned isError");
-    }
-  } catch (e) {
-    process.stderr.write(
-      `[mcp-relay] tabs: upstream propagate to ${url} failed (continuing): ${e.message}\n`,
-    );
-    // A navigation can fail after it committed (a load-state timeout, say):
-    // if upstream's tab now shows the URL, the relay put it there.
-    const landedAnyway = await sync.readUpstreamUrl();
-    if (landedAnyway.url === url) {
-      sync.markSynced(url);
-      return { propagated: true, reason: `landed despite: ${e.message}`, upstreamUrl: url };
-    }
-    const reason = `upstream error: ${e.message}`;
-    sync.markDesynced(url, null, reason);
-    return { propagated: false, reason };
-  }
-  // The relay put this page there. Own its final URL (after redirects); if
-  // that can't be read, own the URL we asked for.
-  const after = await sync.readUpstreamUrl();
-  const landed = typeof after.url === "string" ? after.url : url;
-  sync.markSynced(landed);
-  return { propagated: true, upstreamUrl: landed };
+function safeUrl(page) {
+  try { return page.url(); } catch { return null; }
 }
 
-module.exports = { propagateActivePageToUpstream };
+/**
+ * Pin upstream's page to `page` (one of the relay's context pages).
+ * @returns {Promise<{propagated: boolean, reason?: string, upstreamUrl?: string, closedOwnBlank?: boolean}>}
+ */
+async function pinUpstreamToPage(page, { claim = true } = {}) {
+  if (typeof globalThis.__relayUpstream !== "function") {
+    return { propagated: false, reason: "skipped: __relayUpstream not exposed" };
+  }
+  const bridge = globalThis.__relayBridge;
+  const url = safeUrl(page);
+  let targetId = null;
+  try { targetId = await quiet.targetIdOf(bridge.context, page); } catch (e) {
+    const reason = `could not read this tab's CDP target id: ${e.message}`;
+    sync.markDesynced(url, null, reason);
+    return { propagated: false, reason };
+  }
+  const pinned = await sync.pinUpstream(targetId);
+  if (pinned.error) {
+    const reason = `upstream could not be pointed at this tab: ${pinned.error}`;
+    process.stderr.write(`[mcp-relay] tabs: ${reason}\n`);
+    const now = await sync.readUpstreamUrl();
+    sync.markDesynced(url, typeof now.url === "string" ? now.url : null, reason);
+    return { propagated: false, reason, upstreamUrl: typeof now.url === "string" ? now.url : undefined };
+  }
+  sync.markSynced(null);
+  if (claim) sync.claim(pinned.url);
+  return { propagated: true, upstreamUrl: pinned.url, ...(pinned.closedOwnBlank ? { closedOwnBlank: true } : {}) };
+}
+
+/**
+ * relay-server, before forwarding an upstream call: when tabs_new / tabs_select
+ * made a tab active and upstream is pinned elsewhere, pin it there (no claim).
+ * Returns upstream's read ({url, targetId} / {error}) or null when nothing was checked.
+ */
+async function pinUpstreamToActivePage() {
+  const page = getActivePageRaw();
+  const bridge = globalThis.__relayBridge;
+  if (!page || !bridge || typeof globalThis.__relayUpstream !== "function") return null;
+  try { if (page.isClosed()) return null; } catch { return null; }
+  let want = null;
+  try { want = await quiet.targetIdOf(bridge.context, page); } catch { return null; }
+  const now = await sync.readUpstreamUrl();
+  if (now.targetId === want) {
+    if (sync.isDesynced()) sync.markSynced(null); // already on it: a stale failure no longer applies
+    return now;
+  }
+  const r = await pinUpstreamToPage(page, { claim: false });
+  return r.propagated ? { url: r.upstreamUrl, targetId: want } : now;
+}
+
+module.exports = { pinUpstreamToPage, pinUpstreamToActivePage };

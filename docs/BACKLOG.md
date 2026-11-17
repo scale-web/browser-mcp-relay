@@ -231,6 +231,9 @@ when it is unchanged — and keep `test/upstream-restart.test.js` green, especia
 
 ### `tabs_new` / `tabs_select` report `propagated: true` when upstream returned an error (found 2026-10-07)
 
+**Superseded 2026-11-17 (re-pin, ask as-ops/ask-5ojuum rev 3):** propagation no longer calls `navigation_go-to`; it moves
+upstream's pin, and a failed pin is `propagated: false` with a desync. Kept for history.
+
 `src/own-tools/_propagate-active-page.js` awaits upstream's `navigation_go-to` and returns `{ propagated: true }`
 without checking `isError` — and browser-devtools-mcp reports failures as `{ isError: true }`, not by throwing. So a
 failed propagation (e.g. Brave died mid-tool) is reported as success and nothing is logged. The next call is healthy
@@ -238,6 +241,19 @@ since the upstream-restart fix; before it, every `tabs_new`/`tabs_select` after 
 a wedged child. Pre-existing; demonstrated by review round 2 of that fix.
 
 **When picked up:** treat `response.isError` like a throw (log + `propagated: false`) and add a test.
+
+### Re-pin residuals (2026-11-17, branch `fix/tabs-download`)
+
+Upstream now acts on the relay's selected tab (re-pin; docs/REFERENCE.md "Upstream tools act on the selected tab").
+Left as they were, by design or for a decision:
+- **A user's tab on the SAME host as a `tabs_new` URL can still be reused (navigated)**, and pruned past the tab cap —
+  register A55 MED-3, unchanged. Rule C now spares only the tab upstream is pinned to.
+- **`debug_*` probes stay on the tab where debugging was first enabled** (upstream keys them by browser context, bound
+  to that page) — as they already did after upstream re-created its page.
+- **Model code in `execute` can call `__relayPin`** (the channel the relay uses); it reaches nothing `execute` cannot
+  already reach. The relay re-pins to its selected tab before the next upstream call.
+- **After `tabs_close` of the selected tab**, upstream re-creates a blank page of its own on its next call (no tab is
+  selected, so the relay does not re-pin).
 
 ### A Brave relaunched during a SIGTERM shutdown is never closed (found 2026-10-07)
 

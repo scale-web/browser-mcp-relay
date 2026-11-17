@@ -1,33 +1,33 @@
-// _upstream-sync.js — does upstream's pinned page show what the relay's
-// active page shows? Shared by tabs_new / tabs_select (which set it) and
-// relay-server.js (which warns and guards on it).
+// _upstream-sync.js — is upstream's pinned page the relay's active page?
+// Shared by tabs_new / tabs_select and _propagate-active-page.js (which pin it)
+// and relay-server.js (which re-pins before each upstream call, and warns and
+// guards on a failed pin).
 //
 // Why: upstream (browser-devtools-mcp) runs every tool, `execute` included,
-// against ONE page it pinned at its first tool call (see
-// _propagate-active-page.js). The relay's own tools follow tabs_select /
-// tabs_new; upstream's follow only what propagation navigates it to. When
-// propagation does not happen, `execute`'s `page.goto` navigates whatever
-// upstream pinned — on 2026-10-13 that was a tab the user had just signed
-// into (ALA-CRO's report; kit staging 2026-10-13-relay-active-page).
+// against ONE page it pins at its first tool call. Since 2026-11-17 (ask
+// as-ops/ask-5ojuum rev 3) the relay MOVES that pin to its own active page, by
+// CDP target id (scripts/patch-bdmcp-repin.js, pinUpstream()), instead of
+// navigating upstream's page to the same URL — so both act on one tab, and no
+// page is navigated to "follow". On 2026-10-13 the old navigation let
+// `execute`'s `page.goto` land on a tab the user had just signed into
+// (ALA-CRO's report); a pin moves nothing on any page.
 //
 // Three rules live here:
-//   A  while desynced, every upstream tool result carries a warning (warning()).
+//   A  while desynced (a pin failed), every upstream tool result carries a
+//      warning (warning()).
 //   B  while desynced, upstream tools that change the page (isGuarded()) are
 //      refused unless the caller passes `allowPinnedPage: true` (refusal()).
-//   C  propagation never navigates upstream's pinned page away from a page the
-//      relay did not put there (mayNavigate()). "Put there" = the pinned page
-//      showed about:blank, or the URL the relay last left it on (relayUrl).
-//      relayUrl moves only after the relay's own navigation, or after a
-//      navigation_go-to / navigation_reload the caller chose
-//      (afterGuardedCall()); go-back / go-forward land on a history entry the
-//      user may have put there (review r3). Never after
-//      execute / scenario-run / interaction_*: each can wait (a script, an
-//      element, a navigation) while a person signs in in that tab and return
-//      the moment they finish, so neither its result nor its duration says who
-//      put the page there (reviews r2, r3). A user who navigates or signs in inside that
-//      tab changes its URL, so the relay stops owning it. A caller that knows
-//      the tab is its own reclaims it with allowPinnedPage on tabs_select /
-//      tabs_new.
+//   C  tabs_new never reuses (navigates) or prunes the pinned tab while it
+//      shows a page the relay did not put there (mayNavigate()). "Put there" =
+//      about:blank, or the URL the relay last left the pinned tab on
+//      (relayUrl). relayUrl moves when tabs_new / tabs_select pin a tab
+//      (claim), or after a navigation_go-to / navigation_reload the caller
+//      chose (afterGuardedCall()); go-back / go-forward land on a history entry
+//      the user may have put there (review r3). Never after execute /
+//      scenario-run / interaction_*: each can wait while a person signs in in
+//      that tab and return the moment they finish, so neither its result nor
+//      its duration says who put the page there (reviews r2, r3). The re-pin
+//      relay-server does before each call claims nothing.
 //
 // Every upstream read is best-effort and never throws.
 
@@ -44,9 +44,7 @@ const URL_PROBE = "const url = page.url(); let targetId = null; "
   + "try { targetId = (await s.send('Target.getTargetInfo')).targetInfo.targetId; } "
   + "finally { s.detach().catch(() => {}); } } catch { /* the URL alone */ } "
   + "return { url, targetId };";
-// Every target id upstream's pinned page has had in this process: a tab
-// upstream created. Not cleared by reset(): an old child's page outlives it.
-const upstreamTargets = new Set();
+const PIN_TIMEOUT_MS = 8000;
 
 let desync = null; // null = synced or unknown; else { activeUrl, upstreamUrl, reason }
 let relayUrl = null;
@@ -62,17 +60,13 @@ function stripOptIn(args) {
   return { args: rest, optIn: v === true };
 }
 
-/** The URL upstream's pinned page shows: { url, targetId } (targetId null when
- *  unknown) or { error }. */
-async function readUpstreamUrl() {
+/** Run `code` in upstream's `execute`: { result } or { error }. Never throws. */
+async function runInUpstream(code, timeoutMs) {
   const getUpstream = globalThis.__relayUpstream;
   if (typeof getUpstream !== "function") return { error: "__relayUpstream not exposed" };
   try {
     const upstream = await getUpstream();
-    const res = await upstream.request("tools/call", {
-      name: "execute",
-      arguments: { code: URL_PROBE, timeoutMs: READ_TIMEOUT_MS },
-    });
+    const res = await upstream.request("tools/call", { name: "execute", arguments: { code, timeoutMs } });
     const text = res && Array.isArray(res.content)
       ? res.content.filter((c) => c && c.type === "text").map((c) => c.text).join(" ").trim()
       : "";
@@ -82,19 +76,36 @@ async function readUpstreamUrl() {
       try { out = JSON.parse(text); } catch { out = null; }
     }
     if (out && typeof out.error === "string" && out.error) return { error: out.error };
-    // A bare string: an upstream (or test double) that answers the URL alone.
-    const r = out && out.result;
-    const url = typeof r === "string" ? r : (r && typeof r.url === "string" ? r.url : null);
-    if (url === null) return { error: "execute returned no URL" };
-    const targetId = r && typeof r.targetId === "string" && r.targetId ? r.targetId : null;
-    if (targetId) upstreamTargets.add(targetId);
-    return { url, targetId };
+    return { result: out ? out.result : undefined };
   } catch (e) {
     return { error: e.message };
   }
 }
 
-/** C: may propagation navigate a pinned page that shows `current`? */
+/** The URL upstream's pinned page shows: { url, targetId } (targetId null when
+ *  unknown) or { error }. */
+async function readUpstreamUrl() {
+  const { result: r, error } = await runInUpstream(URL_PROBE, READ_TIMEOUT_MS);
+  if (error) return { error };
+  // A bare string: an upstream (or test double) that answers the URL alone.
+  const url = typeof r === "string" ? r : (r && typeof r.url === "string" ? r.url : null);
+  if (url === null) return { error: "execute returned no URL" };
+  const targetId = r && typeof r.targetId === "string" && r.targetId ? r.targetId : null;
+  return { url, targetId };
+}
+
+/** Move upstream's pin to CDP target `targetId` (scripts/patch-bdmcp-repin.js):
+ *  { url, targetId, changed, closedOwnBlank } or { error }. Never throws. */
+async function pinUpstream(targetId) {
+  const { result: r, error } = await runInUpstream(`return await __relayPin(${JSON.stringify(targetId)});`, PIN_TIMEOUT_MS);
+  if (error) {
+    return { error: /__relayPin is not defined/.test(error) ? "upstream is not patched for re-pinning (scripts/patch-bdmcp-repin.js did not apply)" : error };
+  }
+  if (!r || typeof r !== "object" || r.targetId !== targetId) return { error: "upstream's re-pin returned no page" };
+  return { url: r.url, targetId: r.targetId, changed: !!r.changed, closedOwnBlank: !!r.closedOwnBlank };
+}
+
+/** C: may tabs_new reuse (navigate) or prune a pinned tab that shows `current`? */
 function mayNavigate(current) {
   return current === "about:blank" || (relayUrl !== null && current === relayUrl);
 }
@@ -104,9 +115,8 @@ function markSynced(url) {
   if (url) relayUrl = url;
 }
 
-/** `protectedPage`: upstream's tab shows a page the relay did not put there (rule C). */
-function markDesynced(activeUrl, upstreamUrl, reason, protectedPage = false) {
-  desync = { activeUrl: activeUrl || "(empty)", upstreamUrl: upstreamUrl || null, reason, protectedPage };
+function markDesynced(activeUrl, upstreamUrl, reason) {
+  desync = { activeUrl: activeUrl || "(empty)", upstreamUrl: upstreamUrl || null, reason };
 }
 
 function isDesynced() {
@@ -121,16 +131,10 @@ function state() {
 function warning() {
   if (!desync) return null;
   const where = desync.upstreamUrl ? ` (it shows ${desync.upstreamUrl})` : "";
-  const reclaim = `If you put that page there yourself (execute, a click, a redirect), reclaim the tab with tabs_select({index, ${OPT_IN}: true}) `
-    + `(no reload), or tabs_new({url, ${OPT_IN}: true}); `
-    + `if the user may be using it, ask them first.`;
   return `[mcp-relay] UPSTREAM DESYNC: the selected tab (${desync.activeUrl}) is NOT the tab upstream tools act on${where}; `
     + `${desync.reason}. Screenshots, snapshots and content_* read upstream's tab. `
     + `execute, scenario-run, navigation_* and interaction_* are refused until a tabs_select / tabs_new syncs. `
-    + (desync.protectedPage
-      // Upstream re-pins only when its page closes, so no tabs_* call can move it.
-      ? `Upstream tools stay on that tab while it is open. ${reclaim}`
-      : `To act on a URL, open it with tabs_new({url}); or pass ${OPT_IN}: true to act on upstream's tab anyway.`);
+    + `Select the tab again with tabs_select({index}); or pass ${OPT_IN}: true to act on upstream's tab anyway.`;
 }
 
 /** B: the result returned instead of forwarding a guarded tool while desynced. */
@@ -158,14 +162,9 @@ async function afterGuardedCall({ before, name, optIn = false } = {}) {
   if (typeof after.url === "string") relayUrl = after.url;
 }
 
-/** A caller reclaimed the pinned tab (allowPinnedPage on tabs_*): its page is the relay's. */
+/** tabs_new / tabs_select pinned a tab: its page is the relay's. */
 function claim(url) {
   if (url) relayUrl = url;
-}
-
-/** Was CDP target `id` ever upstream's pinned page in this process? */
-function wasUpstreamTarget(id) {
-  return typeof id === "string" && upstreamTargets.has(id);
 }
 
 /** A new upstream child pins a fresh page: forget everything. Also a test seam. */
@@ -175,6 +174,6 @@ function reset() {
 }
 
 module.exports = {
-  OPT_IN, URL_PROBE, isGuarded, stripOptIn, readUpstreamUrl, mayNavigate, markSynced, markDesynced,
-  isDesynced, state, warning, refusal, afterGuardedCall, claim, reset, wasUpstreamTarget,
+  OPT_IN, URL_PROBE, isGuarded, stripOptIn, readUpstreamUrl, pinUpstream, mayNavigate, markSynced, markDesynced,
+  isDesynced, state, warning, refusal, afterGuardedCall, claim, reset,
 };

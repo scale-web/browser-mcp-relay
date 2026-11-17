@@ -1,15 +1,13 @@
 // tabs_select — bring a specific tab to the front by index.
 //
-// Active-page propagation: after Playwright's `bringToFront()`, we
-// navigate upstream's tracked page (via its `navigation_go-to`) to the
-// selected tab's URL. Upstream pins its `_page` reference at session
-// init and never re-evaluates it from CDP `Target.activateTarget`
-// notifications, so `bringToFront` alone leaves upstream's screenshot/
-// snapshot tools targeting whatever page upstream originally grabbed —
-// usually NOT the one the caller just selected. See
-// _propagate-active-page.js for the full investigation.
+// Upstream follows by re-pin (2026-11-17, ask as-ops/ask-5ojuum rev 3): the
+// selected tab becomes the page upstream's tools act on — its pin is moved to
+// this tab by CDP target id (_propagate-active-page.js). Nothing is navigated
+// or reloaded, so selecting back to an earlier tab gives upstream that tab
+// with its state intact. Selecting a tab claims its page for the relay
+// (rule C, _upstream-sync.js), as selecting it always did.
 
-const { propagateActivePageToUpstream } = require("./_propagate-active-page.js");
+const { pinUpstreamToPage } = require("./_propagate-active-page.js");
 const { setActivePage } = require("./_active-page.js");
 const sync = require("./_upstream-sync.js");
 const quiet = require("./_quiet-focus.js");
@@ -23,12 +21,12 @@ module.exports = {
       index: { type: "integer", minimum: 0 },
       allowPinnedPage: {
         type: "boolean",
-        description: "Only when the relay reported UPSTREAM DESYNC and the page in upstream's tab is one YOU put there: lets the relay navigate that tab to this one. Never when the user may be using it.",
+        description: "Accepted for compatibility; selecting a tab always points upstream's tools at it (no navigation).",
       },
     },
     required: ["index"],
   },
-  handler: async ({ index, allowPinnedPage }) => {
+  handler: async ({ index }) => {
     const bridge = globalThis.__relayBridge;
     if (!bridge) return { content: [{ type: "text", text: "bridge missing" }], isError: true };
     const pages = bridge.context.pages();
@@ -58,9 +56,8 @@ module.exports = {
       // block the active-page tracking. Log + continue with propagation.
       process.stderr.write(`[tabs_select] bringToFront failed (continuing): ${e.message}\n`);
     }
-    // Propagate to upstream so content_take-screenshot etc. target this
-    // tab's URL. Best-effort; about:blank is skipped to avoid churn.
-    const propagation = await propagateActivePageToUpstream(url, { force: allowPinnedPage === true });
+    // Upstream's tools act on this tab from now on (best-effort).
+    const propagation = await pinUpstreamToPage(pages[index], { claim: true });
     const content = [{ type: "text", text: JSON.stringify({
       selected: index,
       url,

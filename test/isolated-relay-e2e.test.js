@@ -211,11 +211,11 @@ test("attach-first across relays: a relay killed uncleanly leaves its Brave; the
   }
 });
 
-// Kit staging 2026-10-13-relay-active-page: upstream's pinned tab, once the
-// user has changed it, is never navigated by propagation (rule C); upstream
-// tools that change a page are refused while it is not the selected tab (B);
-// every upstream result says so (A). Real upstream `execute` reads the URL.
-test("e2e: a tab the user navigated is not taken over by tabs_new; execute is refused, then allowed by opt-in or by selecting it", ISO, async () => {
+// Re-pin (ask as-ops/ask-5ojuum rev 3): upstream acts on the relay's tab,
+// matched by CDP target id; nothing is navigated to follow. A tab the user
+// navigated is never navigated by tabs_new (rule C) and is only handed to
+// upstream when it is selected.
+test("e2e: a tab the user navigated is not taken over by tabs_new; upstream moves to the new tab; selecting the user's tab hands it over without a reload", ISO, async () => {
   await startServer();
   const home = homeTmp("home-");
   const proj = path.join(home, "proj-desync");
@@ -237,23 +237,16 @@ test("e2e: a tab the user navigated is not taken over by tabs_new; execute is re
     const opened = await r.call("tabs_new", { url: U("relay.test", "/b") }, 60000);
     assert.ok(!opened.isError, opened.text);
     const payload = JSON.parse(opened.rest[opened.rest.length - 1].text);
-    assert.strictEqual(payload.upstreamPropagated, false, opened.text);
-    assert.strictEqual(payload.upstreamUrl, U("user.test", "/dashboard"));
-    assert.match(opened.text, /UPSTREAM DESYNC/);
+    assert.strictEqual(payload.upstreamPropagated, true, opened.text);
+    assert.doesNotMatch(opened.text, /UPSTREAM DESYNC/);
     assert.strictEqual(pinned.url(), U("user.test", "/dashboard"), "the user's tab was not navigated");
 
-    const refused = await r.call("execute", { code: `await page.goto(${JSON.stringify(U("relay.test", "/c"))}); return page.url();` }, 60000);
-    assert.strictEqual(refused.isError, true);
-    assert.match(refused.text, /REFUSED execute/);
-    assert.strictEqual(hits.filter((h) => h.path === "/c").length, 0);
+    const ex = await r.call("execute", { code: "return page.url();" }, 60000);
+    assert.ok(!ex.isError, ex.text);
+    assert.ok(ex.text.includes(U("relay.test", "/b")), `upstream acts on the new tab: ${ex.text}`);
     assert.strictEqual(pinned.url(), U("user.test", "/dashboard"));
 
-    const optIn = await r.call("execute", { code: "return page.url();", allowPinnedPage: true }, 60000);
-    assert.ok(!optIn.isError, optIn.text);
-    assert.ok(optIn.text.includes(U("user.test", "/dashboard")), optIn.text);
-    assert.match(optIn.text, /UPSTREAM DESYNC/);
-
-    // Selecting the user's tab is a sync with no reload.
+    // Selecting the user's tab is a re-pin with no reload.
     const listed = await r.call("tabs_list");
     const list = JSON.parse(listed.rest[listed.rest.length - 1].text);
     const idx = list.pages.findIndex((t) => t.url === U("user.test", "/dashboard"));
@@ -263,8 +256,8 @@ test("e2e: a tab the user navigated is not taken over by tabs_new; execute is re
     assert.doesNotMatch(sel.text, /UPSTREAM DESYNC/);
     assert.strictEqual(JSON.parse(sel.text).upstreamPropagated, true);
     assert.strictEqual(hits.filter((h) => h.path === "/dashboard").length, dashHits, "no reload of the user's page");
-    const ok = await r.call("execute", { code: "return 2;" }, 60000);
-    assert.ok(!ok.isError, ok.text);
+    const ok = await r.call("execute", { code: "return page.url();" }, 60000);
+    assert.ok(ok.text.includes(U("user.test", "/dashboard")), ok.text);
   } finally {
     if (browser) await browser.close().catch(() => {});
     await r.stop();
@@ -292,7 +285,7 @@ test("e2e (review r1 H1): after the user signs in inside upstream's tab, tabs_ne
     const payload = JSON.parse(opened.rest[opened.rest.length - 1].text);
     assert.strictEqual(payload.reused, false, opened.text);
     assert.strictEqual(pinned.url(), U("site.test", "/dashboard"), "the user's tab was not navigated");
-    assert.match(opened.text, /UPSTREAM DESYNC/);
+    assert.doesNotMatch(opened.text, /UPSTREAM DESYNC/);
     // MED-3 measurement reaches the relay's real event log (host only).
     const logText = fs.readFileSync(path.join(home, "Library", "Caches", "browser-mcp-relay", "reap-events.log"), "utf8");
     const opens = logText.trim().split("\n").map((l) => JSON.parse(l)).filter((e) => e.event === "tabs-open");
@@ -304,29 +297,44 @@ test("e2e (review r1 H1): after the user signs in inside upstream's tab, tabs_ne
   }
 });
 
-test("e2e (ask as-ops/ask-bnyrbp): the session's first tabs_new({url}) leaves the URL in ONE tab and no launch blank", ISO, async () => {
+test("e2e (ask as-ops/ask-5ojuum): A, then B, then select A — one tab each, upstream on the selected tab, A's draft intact, no reload", ISO, async () => {
   await startServer();
   const home = homeTmp("home-");
-  const proj = path.join(home, "proj-first-tab");
+  const proj = path.join(home, "proj-repin");
   const base = profileOf(home, proj);
   const r = await startRelay({ env: { HOME: home, CLAUDE_PROJECT_DIR: proj, ...RELAY_ENV() }, realUpstream: true });
   let browser = null;
   try {
-    const opened = await r.call("tabs_new", { url: U("first.test", "/one") }, 90000);
-    assert.ok(!opened.isError, opened.text);
-    const payload = JSON.parse(opened.rest[opened.rest.length - 1].text);
-    assert.strictEqual(payload.upstreamTab, true, opened.text);
-    assert.strictEqual(payload.upstreamPropagated, true, opened.text);
+    const A = U("first.test", "/one");
+    const B = U("second.test", "/two");
+    const openedA = await r.call("tabs_new", { url: A }, 90000);
+    assert.ok(!openedA.isError, openedA.text);
+    assert.strictEqual(JSON.parse(openedA.rest[openedA.rest.length - 1].text).upstreamPropagated, true, openedA.text);
     const { chromium } = require("playwright-core");
     browser = await chromium.connectOverCDP(`http://127.0.0.1:${sidecar(base).cdpPort}`);
-    const urls = browser.contexts().flatMap((c) => c.pages()).map((p) => p.url());
-    assert.strictEqual(urls.filter((u) => u === U("first.test", "/one")).length, 1, JSON.stringify(urls));
-    assert.strictEqual(urls.filter((u) => u === "about:blank").length, 0, JSON.stringify(urls));
-    assert.strictEqual(hits.filter((h) => h.path === "/one").length, 1, "loaded once");
-    // Upstream's tools act on that same tab.
-    const ex = await r.call("execute", { code: "return page.url();" }, 60000);
-    assert.ok(!ex.isError, ex.text);
-    assert.ok(ex.text.includes(U("first.test", "/one")), ex.text);
+    const urls = () => browser.contexts().flatMap((c) => c.pages()).map((p) => p.url());
+    assert.strictEqual(urls().filter((u) => u === A).length, 1, JSON.stringify(urls()));
+    assert.strictEqual(urls().filter((u) => u === "about:blank").length, 0, JSON.stringify(urls()));
+    const exA = await r.call("execute", { code: "return page.url();" }, 60000);
+    assert.ok(exA.text.includes(A), exA.text);
+    const draft = await r.call("execute", { code: "await page.evaluate(() => { const i = document.createElement('input'); i.id = 'd'; i.value = 'draft in A'; document.body.append(i); }); return 1;" }, 60000);
+    assert.ok(!draft.isError, draft.text);
+
+    const openedB = await r.call("tabs_new", { url: B }, 60000);
+    assert.ok(!openedB.isError, openedB.text);
+    assert.deepStrictEqual([urls().filter((u) => u === A).length, urls().filter((u) => u === B).length], [1, 1], JSON.stringify(urls()));
+    assert.strictEqual(urls().length, 2, JSON.stringify(urls()));
+    const exB = await r.call("execute", { code: "return page.url();" }, 60000);
+    assert.ok(exB.text.includes(B), exB.text);
+
+    const listed = await r.call("tabs_list");
+    const idxA = JSON.parse(listed.rest[listed.rest.length - 1].text).pages.findIndex((t) => t.url === A);
+    const sel = await r.call("tabs_select", { index: idxA }, 60000);
+    assert.strictEqual(JSON.parse(sel.text).upstreamPropagated, true, sel.text);
+    const back = await r.call("execute", { code: "return [page.url(), await page.inputValue('#d')];" }, 60000);
+    assert.ok(back.text.includes(A) && back.text.includes("draft in A"), back.text);
+    assert.strictEqual(hits.filter((h) => h.path === "/one").length, 1, "A loaded once, never reloaded");
+    assert.strictEqual(hits.filter((h) => h.path === "/two").length, 1, "B loaded once");
   } finally {
     if (browser) await browser.close().catch(() => {});
     await r.stop();

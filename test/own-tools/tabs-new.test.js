@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert");
 const tool = require("../../src/own-tools/tabs-new.js");
 const sync = require("../../src/own-tools/_upstream-sync.js");
-const { fakeUpstream } = require("../fixtures/fake-upstream-page.js");
+const { fakeUpstream, fakeTab, fakeContext } = require("../fixtures/fake-upstream-page.js");
 
 test("tabs_new has required tool shape", () => {
   assert.strictEqual(tool.name, "tabs_new");
@@ -24,27 +24,13 @@ test("tabs_new returns isError when bridge missing", async () => {
   }
 });
 
-// Mock helper: a fake bridge with a fake context that records page operations.
+// Mock helper: a fake bridge with a fake context (CDP target ids) that records page operations.
 function makeFakeBridge() {
   const pages = [];
-  const fakePage = {
-    _url: "about:blank",
-    url() { return this._url; },
-    async goto(u) { this._url = u; return null; },
-  };
-  return {
-    context: {
-      pages: () => pages,
-      newPage: async () => {
-        const p = { ...fakePage, _url: "about:blank" };
-        pages.push(p);
-        return p;
-      },
-    },
-  };
+  return { context: fakeContext(pages), _pages: pages };
 }
 
-test("tabs_new without url: does NOT call upstream, and warns that upstream tools act on another tab", async () => {
+test("tabs_new without url: the new blank tab is what upstream acts on (re-pinned, nothing navigated)", async () => {
   const prevBridge = globalThis.__relayBridge;
   const up = fakeUpstream({ url: "https://a.example/" });
   const restore = up.install();
@@ -52,18 +38,18 @@ test("tabs_new without url: does NOT call upstream, and warns that upstream tool
   try {
     const result = await tool.handler({});
     assert.strictEqual(result.isError, undefined);
-    assert.match(result.content[0].text, /UPSTREAM DESYNC/);
-    const payload = JSON.parse(result.content[1].text);
-    assert.strictEqual(payload.upstreamPropagated, false);
-    assert.match(payload.upstreamReason, /about:blank/);
-    assert.strictEqual(up.calls.length, 0, "upstream must NOT be called when no url");
+    assert.strictEqual(result.content.length, 1, "no warning");
+    const payload = JSON.parse(result.content[0].text);
+    assert.strictEqual(payload.upstreamPropagated, true);
+    assert.strictEqual(up.targetId, globalThis.__relayBridge._pages[0].tid);
+    assert.strictEqual(up.navs().length, 0);
   } finally {
     globalThis.__relayBridge = prevBridge;
     restore();
   }
 });
 
-test("tabs_new with url: calls upstream navigation_go-to with that url", async () => {
+test("tabs_new with url: upstream is re-pinned to the new tab — never navigation_go-to", async () => {
   const prevBridge = globalThis.__relayBridge;
   const up = fakeUpstream();
   const restore = up.install();
@@ -75,13 +61,12 @@ test("tabs_new with url: calls upstream navigation_go-to with that url", async (
     const payload = JSON.parse(result.content[0].text);
     assert.strictEqual(payload.upstreamPropagated, true);
     assert.strictEqual(payload.url, "https://example.com/foo");
-    const navs = up.navs();
-    assert.strictEqual(navs.length, 1, "upstream navigation_go-to must be invoked");
-    assert.strictEqual(navs[0].method, "tools/call");
-    assert.strictEqual(navs[0].params.arguments.url, "https://example.com/foo");
-    // Snapshot/screenshot must be disabled to keep the propagation cheap.
-    assert.strictEqual(navs[0].params.arguments.includeSnapshot, false);
-    assert.strictEqual(navs[0].params.arguments.includeScreenshot, false);
+    const [tab] = globalThis.__relayBridge._pages;
+    assert.strictEqual(up.targetId, tab.tid);
+    assert.strictEqual(up.url, "https://example.com/foo", "upstream reads the relay's own tab");
+    assert.strictEqual(up.navs().length, 0, "no mirror navigation");
+    assert.deepStrictEqual(tab.gotoUrls, ["https://example.com/foo"], "loaded once, by the relay");
+    assert.strictEqual(sync.state().relayUrl, "https://example.com/foo");
   } finally {
     globalThis.__relayBridge = prevBridge;
     restore();
@@ -98,13 +83,14 @@ test("tabs_new: upstream failure does NOT fail the tool call", async () => {
     const payload = JSON.parse(result.content[result.content.length - 1].text);
     assert.strictEqual(payload.upstreamPropagated, false);
     assert.match(payload.upstreamReason, /upstream blew up/);
+    assert.match(result.content[0].text, /UPSTREAM DESYNC/);
   } finally {
     globalThis.__relayBridge = prevBridge;
     restore();
   }
 });
 
-test("tabs_new: upstream's tab on the user's page is left alone; the result warns first", async () => {
+test("tabs_new: upstream's own page showing the user's page is never navigated; upstream moves to the new tab", async () => {
   const prevBridge = globalThis.__relayBridge;
   const up = fakeUpstream({ url: "https://user-signed-in.example/dashboard" });
   const restore = up.install();
@@ -112,18 +98,17 @@ test("tabs_new: upstream's tab on the user's page is left alone; the result warn
   try {
     const result = await tool.handler({ url: "https://example.com/" });
     assert.strictEqual(result.isError, undefined);
-    assert.match(result.content[0].text, /UPSTREAM DESYNC.*user-signed-in/);
-    const payload = JSON.parse(result.content[1].text);
-    assert.strictEqual(payload.upstreamPropagated, false);
-    assert.strictEqual(payload.upstreamUrl, "https://user-signed-in.example/dashboard");
+    assert.strictEqual(result.content.length, 1);
+    assert.strictEqual(JSON.parse(result.content[0].text).upstreamPropagated, true);
     assert.strictEqual(up.navs().length, 0);
+    assert.strictEqual(up.targetId, globalThis.__relayBridge._pages[0].tid);
   } finally {
     globalThis.__relayBridge = prevBridge;
     restore();
   }
 });
 
-test("tabs_new: about:blank URL skips upstream propagation", async () => {
+test("tabs_new: about:blank URL — the tab is pinned like any other", async () => {
   const prevBridge = globalThis.__relayBridge;
   const up = fakeUpstream();
   const restore = up.install();
@@ -132,8 +117,8 @@ test("tabs_new: about:blank URL skips upstream propagation", async () => {
     const result = await tool.handler({ url: "about:blank" });
     assert.strictEqual(result.isError, undefined);
     const payload = JSON.parse(result.content[result.content.length - 1].text);
-    assert.strictEqual(payload.upstreamPropagated, false);
-    assert.strictEqual(up.calls.length, 0);
+    assert.strictEqual(payload.upstreamPropagated, true);
+    assert.strictEqual(up.navs().length, 0);
   } finally {
     globalThis.__relayBridge = prevBridge;
     restore();
@@ -148,22 +133,17 @@ test("tabs_new: about:blank URL skips upstream propagation", async () => {
 function makeFakeBridgeWithFailingGoto(errMsg = "net::ERR_NAME_NOT_RESOLVED") {
   const pages = [];
   return {
-    context: {
-      pages: () => pages,
+    context: fakeContext(pages, {
       newPage: async () => {
-        const p = {
-          _url: "about:blank",
-          url() { return this._url; },
-          async goto() { throw new Error(errMsg); },
-        };
+        const p = fakeTab("about:blank", { async goto() { throw new Error(errMsg); } });
         pages.push(p);
         return p;
       },
-    },
+    }),
   };
 }
 
-test("T0-7: tabs_new with bad URL returns isError + navError + does NOT propagate", async () => {
+test("T0-7: tabs_new with bad URL returns isError + navError; upstream is on that same (failed) tab, nothing navigated", async () => {
   const prevBridge = globalThis.__relayBridge;
   const up = fakeUpstream();
   const restore = up.install();
@@ -173,11 +153,10 @@ test("T0-7: tabs_new with bad URL returns isError + navError + does NOT propagat
     assert.strictEqual(result.isError, true);
     const payload = JSON.parse(result.content[result.content.length - 1].text);
     assert.match(payload.navError, /ERR_NAME_NOT_RESOLVED|invalid/i);
-    assert.strictEqual(payload.upstreamPropagated, false);
-    // Its URL is read before the goto (to find upstream's own tab), but it is
-    // never navigated after a failed one.
-    assert.strictEqual(up.navs().length, 0, "upstream must NOT be navigated when goto fails");
-    assert.strictEqual(sync.isDesynced(), true, "upstream still shows another tab");
+    assert.strictEqual(payload.upstreamPropagated, true);
+    assert.strictEqual(up.navs().length, 0, "upstream is never navigated");
+    assert.strictEqual(up.targetId, globalThis.__relayBridge.context.pages()[0].tid);
+    assert.strictEqual(sync.isDesynced(), false, "upstream acts on the selected tab");
   } finally {
     globalThis.__relayBridge = prevBridge;
     restore();
@@ -264,9 +243,9 @@ test("tabs_new: an adopted tab is raised only when Brave is already in front", a
     const up = fakeUpstream();
     const restore = up.install();
     let raised = 0;
-    const blank = { _url: "about:blank", url() { return this._url; }, isClosed: () => false,
-      async goto(u) { this._url = u; return null; }, async bringToFront() { raised++; } };
-    globalThis.__relayBridge = { context: { pages: () => [blank], newPage: async () => { throw new Error("should adopt"); } } };
+    const blank = fakeTab("about:blank", { async bringToFront() { raised++; } });
+    globalThis.__relayBridge = { context: fakeContext([blank], { newPage: async () => { throw new Error("should adopt"); } }) };
+    tool.noteLaunchedPages({ context: globalThis.__relayBridge.context }); // Brave's launch blank: the relay's
     const origFront = quiet.braveIsFront;
     quiet.braveIsFront = async () => front;
     try {

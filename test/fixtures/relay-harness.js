@@ -8,6 +8,7 @@
 //   - scripts/patch-bdmcp-bundle.js → no-op (never write node_modules)
 //   - scripts/patch-bdmcp-request-body.js → no-op that logs "HARNESS a76-patch <distDir>"
 //   - scripts/patch-bdmcp-quiet-page.js → no-op that logs "HARNESS a1-patch <distDir>"
+//   - scripts/patch-bdmcp-repin.js → no-op that logs "HARNESS r1-patch <distDir>"
 // The upstream child is test/fixtures/mock-bdmcp-session.js via
 // BROWSER_RELAY_UPSTREAM_PATH.
 //
@@ -193,6 +194,9 @@ stubModule(path.join(SCRIPTS, "patch-bdmcp-request-body.js"), {
 stubModule(path.join(SCRIPTS, "patch-bdmcp-quiet-page.js"), {
   applyPatch: (opts = {}) => { log(`a1-patch ${opts.distDir}`); return { patched: true }; },
 });
+stubModule(path.join(SCRIPTS, "patch-bdmcp-repin.js"), {
+  applyPatch: (opts = {}) => { log(`r1-patch ${opts.distDir}`); return { patched: true }; },
+});
 
 // $HARNESS_DIR/lsof-bin = /abs/path: the relay's CDP-client check runs that
 // binary instead of lsof — everything else in cdp-clients.js stays real (the
@@ -255,7 +259,9 @@ process.on("SIGUSR2", killCurrentBrave);
 // upstream via globalThis.__relayUpstream — so the upstream child is spawned
 // while no Brave is live and its first call hits the dead one.
 const ownIndex = require(path.join(SRC, "own-tools", "index.js"));
-const { propagateActivePageToUpstream } = require(path.join(SRC, "own-tools", "_propagate-active-page.js"));
+// An own-tool reaching upstream through __relayUpstream after its browser work
+// (tabs_new / tabs_select re-pin upstream that way).
+const { pinUpstream } = require(path.join(SRC, "own-tools", "_upstream-sync.js"));
 ownIndex.tools.push({
   name: "harness_die_then_propagate",
   description: "test only",
@@ -263,7 +269,7 @@ ownIndex.tools.push({
   handler: async () => {
     killCurrentBrave();
     await new Promise((r) => setTimeout(r, 20));
-    const res = await propagateActivePageToUpstream("data:text/html,propagate");
+    const res = await pinUpstream("TARGET-OF-A-DEAD-BRAVE");
     return { content: [{ type: "text", text: JSON.stringify(res) }] };
   },
 });
