@@ -174,7 +174,12 @@ cause below is a hypothesis until it has.
 
 Hit on an ephemeral clone session (`launch-project-isolated.js`). The reporter worked around all four.
 
-1. **`saveAs` fails with ENOENT.** With `clickSelector`, the download started, then
+1. **FIXED 2026-11-17 on `fix/tabs-download` (`ce6871d`, ask as-ops/ask-bnyrbp) — reproduced first.** Cause confirmed:
+   each Playwright client sends `Browser.setDownloadBehavior` with its own artifacts dir on attach, the last (upstream)
+   wins. `download_capture` now points the browser at a dir of its own right before its click, keeps that CDP session
+   open until the download finishes, and copies the file from there; a repeat click on the same page + selector within
+   10 min is refused without `allowRepeatClick: true` (docs/REFERENCE.md). Original report:
+   **`saveAs` fails with ENOENT.** With `clickSelector`, the download started, then
    `download.saveAs: ENOENT … copyfile …/T/playwright-artifacts-<A>/<guid> -> <savePath>` — while a file with the SAME guid
    existed under a different `playwright-artifacts-<B>/`. *Hypothesis:* two Playwright CDP clients on one browser (the
    relay's own-tools connection and the upstream server's) each set Chrome's download directory, the last one wins, and
@@ -199,7 +204,8 @@ tracked active page.
 ---
 
 
-**Recurrence 2026-11-16, ~21:55Z (AS-VIDEO-ADS-11, reported to CLAUDE-SKILLS-OPTIMIZATION-55):** on the **base profile**
+**Recurrence 2026-11-16 — FIXED by `ce6871d` with item 1 (the 302 played no part; the repeat-click guard answers the
+re-licensing).** **Recurrence 2026-11-16, ~21:55Z (AS-VIDEO-ADS-11, reported to CLAUDE-SKILLS-OPTIMIZATION-55):** on the **base profile**
 `as-video-ads` (not a clone), three tries at an Adobe Stock licensed download (Download button → 302 to a presigned S3
 URL) all failed with `download.saveAs: ENOENT … copyfile '/var/folders/…/T/playwright-artifacts-<X>/<uuid>' -> <savePath>`,
 with and without `savePath`. The artifacts dir existed but the file never appeared, and nothing reached `~/Downloads`.
