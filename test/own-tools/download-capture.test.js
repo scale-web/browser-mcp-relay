@@ -2,6 +2,15 @@ const test = require("node:test");
 const assert = require("node:assert");
 const tool = require("../../src/own-tools/download-capture.js");
 
+// This file's own $TMPDIR: download_capture makes (and sweeps) relay-download-*
+// dirs there, and must never touch another process's.
+{
+  const nfs = require("node:fs"), nos = require("node:os"), npath = require("node:path");
+  const mine = nfs.mkdtempSync(npath.join(nos.tmpdir(), "relay-dl-unit-tmp-"));
+  process.env.TMPDIR = mine;
+  process.on("exit", () => { try { nfs.rmSync(mine, { recursive: true, force: true }); } catch { /* gone */ } });
+}
+
 test("download_capture has required tool shape", () => {
   assert.strictEqual(tool.name, "download_capture");
   assert.strictEqual(typeof tool.description, "string");
@@ -255,16 +264,21 @@ test("R2-5d: a refusal names who made the earlier click — this relay or anothe
 // Each CDP step on its own: a hang there must not hold the queue.
 for (const step of ["newCDPSession", "send", "detach", "cancel"]) {
   test(`R2-3a: a hung CDP ${step} is given up after the step limit, and the next call still runs`, { timeout: 20000 }, async (t) => {
-    stateFor(t);
+    const { file: f } = stateFor(t);
     tool._setCdpStepMs(200);
+    tool._setNewSessionMs(200);
     tool._setStallMs(300);
-    t.after(() => { tool._setCdpStepMs(null); tool._setStallMs(null); });
+    t.after(() => { tool._setCdpStepMs(null); tool._setNewSessionMs(null); tool._setStallMs(null); });
     const session = {
       send: step === "send" ? never : async () => {},
       detach: step === "detach" ? never : async () => {},
-      // One progress event, then none: the stall limit applies (see finishOrGiveUp).
-      on(ev, fn) { if (ev === "Browser.downloadProgress") fn({ guid: "g", receivedBytes: 1, state: "inProgress" }); },
-      off() {},
+      // The captured download began on the session, then its progress stops at
+      // 1 byte: the stall limit applies (see finishOrGiveUp).
+      on(ev, fn) {
+        if (ev === "Browser.downloadWillBegin") fn({ guid: "g", url: "https://x.test/x.bin", suggestedFilename: "x.bin" });
+        if (ev === "Browser.downloadProgress") { this.iv = setInterval(() => fn({ guid: "g", receivedBytes: 1, state: "inProgress" }), 50); this.iv.unref(); }
+      },
+      off() { clearInterval(this.iv); },
     };
     const download = {
       suggestedFilename: () => "x.bin", url: () => "https://x.test/x.bin",
@@ -279,7 +293,16 @@ for (const step of ["newCDPSession", "send", "detach", "cancel"]) {
     assert.strictEqual(first.isError, true);
     const second = await within(tool.handler({ clickSelector: "#next", timeoutMs: 100 }), 5000, "the call queued behind it");
     assert.strictEqual(second.isError, true);
-    assert.strictEqual(page.clicks, 1, "the second call got its turn and clicked");
+    if (step === "newCDPSession" || step === "send") {
+      // Its own dir cannot be set up either: refused before the click (review r3 M1).
+      assert.match(textOf(second), /REFUSED/);
+      assert.match(textOf(second), /not clicked/);
+      assert.strictEqual(page.clicks, 0, "the second call got its turn and did not click");
+      const entries = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, "utf8")) : {};
+      assert.strictEqual(entries[keyOf(page.href, "#next")], undefined, "its reservation is released");
+    } else {
+      assert.strictEqual(page.clicks, 1, "the second call got its turn and clicked");
+    }
   });
 }
 
@@ -363,6 +386,7 @@ test("R2-2: at its turn, a queued call whose reservation another relay replaced 
   await first;
   assert.match(textOf(r), /REFUSED/);
   assert.match(textOf(r), /another relay/);
+  assert.match(textOf(r), /reserved or made/, "it may not have clicked yet (review r3 L5)");
   assert.strictEqual(page.clicks, 0);
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, "utf8"))[k], theirs, "their reservation is left as it was");
 });
@@ -408,4 +432,69 @@ test("R2-1: a download that began on the tool's session but was never captured i
   const cancel = calls.findIndex(([m, g]) => m === "Browser.cancelDownload" && g === "late-1");
   assert.ok(cancel >= 0, `cancelDownload sent (${JSON.stringify(calls)})`);
   assert.ok(cancel < calls.findIndex(([m]) => m === "detach"), "before the detach");
+});
+
+// ───── review round 3 (2026-11-17) ─────
+
+for (const how of ["rejects", "throws"]) {
+  test(`R3-1: a clickSelector call whose own dir cannot be set up (CDP ${how}) is refused before the click`, { timeout: 20000 }, async (t) => {
+    const { file } = stateFor(t);
+    const page = fakePage(t, {
+      newCDPSession: how === "rejects" ? async () => { throw new Error("Target closed"); } : () => { throw new Error("no CDP"); },
+    });
+    const r = await within(tool.handler({ clickSelector: "#buy", timeoutMs: 300 }), 5000, "the call");
+    assert.strictEqual(r.isError, true);
+    assert.match(textOf(r), /REFUSED/);
+    assert.match(textOf(r), /not clicked/);
+    assert.strictEqual(page.clicks, 0);
+    const entries = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+    assert.strictEqual(entries[keyOf(page.href, "#buy")], undefined, "its reservation is released");
+    // Without clickSelector the saveAs fallback is still used (nothing is clicked).
+    const plain = await within(tool.handler({ timeoutMs: 100 }), 5000, "the plain call");
+    assert.match(textOf(plain), /no download in 100ms/);
+  });
+}
+
+test("R3-2: each call sweeps this process's earlier own dirs (a late download recreated one) and others' dirs idle > 24 h", { timeout: 20000 }, async (t) => {
+  stateFor(t);
+  const tmp = os.tmpdir();
+  const paths = [];
+  const session = { send: async (m, p) => { if (p && p.downloadPath) paths.push(p.downloadPath); }, detach: async () => {}, on() {}, off() {} };
+  fakePage(t, { session });
+  await within(tool.handler({ timeoutMs: 100 }), 5000, "call 1");
+  assert.strictEqual(paths.length, 1);
+  assert.strictEqual(fs.existsSync(paths[0]), false, "call 1 removed its dir");
+  // Chrome recreates it with a 0-byte file (an other-tab download cancelled after the call).
+  fs.mkdirSync(paths[0], { mode: 0o700 });
+  fs.writeFileSync(path.join(paths[0], "guid.crdownload"), "");
+  // Another relay's dir, idle 25 h (its relay died) — and one in use now.
+  const old = fs.mkdtempSync(path.join(tmp, "relay-download-"));
+  fs.writeFileSync(path.join(old, "x"), "1");
+  const then = new Date(Date.now() - 25 * 3600 * 1000);
+  fs.utimesSync(path.join(old, "x"), then, then);
+  fs.utimesSync(old, then, then);
+  const fresh = fs.mkdtempSync(path.join(tmp, "relay-download-"));
+  fs.writeFileSync(path.join(fresh, "y"), "2");
+  // An old dir with a fresh file inside: a long download still writing. Kept.
+  const busy = fs.mkdtempSync(path.join(tmp, "relay-download-"));
+  fs.writeFileSync(path.join(busy, "z.crdownload"), "3");
+  fs.utimesSync(busy, then, then);
+  await within(tool.handler({ timeoutMs: 100 }), 5000, "call 2");
+  assert.strictEqual(fs.existsSync(paths[0]), false, "this process's earlier dir is swept");
+  assert.strictEqual(fs.existsSync(old), false, "a dir idle > 24 h is swept");
+  assert.strictEqual(fs.statSync(path.join(fresh, "y")).size, 1, "another relay's live dir is kept");
+  assert.strictEqual(fs.statSync(path.join(busy, "z.crdownload")).size, 1, "a dir with a fresh file is kept");
+  fs.rmSync(fresh, { recursive: true, force: true });
+  fs.rmSync(busy, { recursive: true, force: true });
+});
+
+test("R3-1: newCDPSession has its own, longer limit than the other CDP steps", { timeout: 20000 }, async (t) => {
+  stateFor(t);
+  tool._setCdpStepMs(200);
+  tool._setNewSessionMs(2000);
+  t.after(() => { tool._setCdpStepMs(null); tool._setNewSessionMs(null); });
+  const page = fakePage(t, { newCDPSession: () => sleep(600).then(() => ({ send: async () => {}, detach: async () => {}, on() {}, off() {} })) });
+  const r = await within(tool.handler({ clickSelector: "#buy", timeoutMs: 200 }), 5000, "the call");
+  assert.doesNotMatch(textOf(r), /REFUSED/);
+  assert.strictEqual(page.clicks, 1, "a slow (600 ms) session is waited for");
 });

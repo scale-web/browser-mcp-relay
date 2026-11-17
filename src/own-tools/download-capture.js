@@ -30,24 +30,34 @@
 // until its caller's abort signal fires (the handler's second argument,
 // { signal }: relay-server.js does not pass it yet — see docs/BACKLOG.md); then
 // it is refused without clicking and its reservation is released (review r2
-// M3). Every CDP step (newCDPSession, setDownloadBehavior, cancel, detach, the
-// download's path) is bounded by CDP_STEP_MS (10 s), so one hung CDP call can no
-// longer hold the queue forever. Before the session detaches, a download that
+// M3). Every CDP step (setDownloadBehavior, cancel, detach, the download's path)
+// is bounded by CDP_STEP_MS (10 s), and newCDPSession by NEW_SESSION_MS (30 s),
+// so one hung CDP call can no longer hold the queue forever. If the own dir
+// cannot be set up, a clickSelector call is refused BEFORE its click and its
+// reservation released (review r3 M1): the saveAs fallback cannot work in the
+// relay, so clicking would risk a charged download with no file; a call without
+// clickSelector still falls back to saveAs. Before the session detaches, a download that
 // began on it but was never captured (it began as the wait gave up) is
 // cancelled (Browser.cancelDownload), so it cannot recreate the dir; one that
 // begins after the detach is cancelled by Chrome (measured 2026-11-17, with and
 // without a second client attached). The own dir is removed after the detach,
 // and always again 1 s and 5 s later in case Chrome recreated it; a failed
-// removal is logged and never changes the call's result (review r2 M1).
+// removal is logged and never changes the call's result (review r2 M1). The
+// session is per tab but the dir is browser-wide: a download in ANOTHER tab
+// during the call lands in the dir too (deleted with it, or cancelled later,
+// recreating it). So each call first removes this process's earlier own dirs
+// and any relay-download-* dir of this user idle for STALE_DIR_MS (24 h).
 //
 // Bounded wait: once a download has started, the tool cancels it after
-// STALL_MS (2 min) without progress, read from Chrome's Browser.downloadProgress
-// events on the tool's own CDP session (measured 2026-11-17 on Chrome for
-// Testing: they arrive there, receivedBytes rising). A download that keeps
+// STALL_MS (2 min; the caller's stallMs, 1 s to 30 min) without progress, read
+// from Chrome's Browser.downloadProgress events on the tool's own CDP session
+// (measured 2026-11-17 on Chrome for Testing: they arrive there, receivedBytes
+// rising) for the captured download's guid only, matched by url + suggested
+// filename from Browser.downloadWillBegin (review r3 L3). A download that keeps
 // progressing is not cancelled unless the caller passes maxDownloadMs, an
-// overall limit from the download's start. With no progress events at all (no
-// own session, or the events went elsewhere), the old fixed bound applies:
-// FALLBACK_FINISH_MS (10 min).
+// overall limit from the download's start. With no progress events for it (no
+// own session, or the events went elsewhere), a fixed bound applies:
+// FALLBACK_FINISH_MS (10 min), or stallMs if longer.
 //
 // Repeat-click guard: on 2026-11-16 each retry of a failed download re-licensed
 // a paid Adobe Stock asset. A clickSelector click on the same page (origin +
@@ -82,10 +92,16 @@ const { withActivePage } = require("./_active-page.js");
 const { withFileLock } = require("../reap-hold.js");
 
 const REPEAT_CLICK_WINDOW_MS = 10 * 60 * 1000;
-const DEFAULTS = { stall: 2 * 60 * 1000, cdpStep: 10 * 1000, queueWait: 2 * 60 * 1000 };
+// newSession: measured 0.3-7.7 ms on 2026-11-17 at load average ~29; 30 s is
+// for a machine far slower than that, since giving up now refuses the click.
+const DEFAULTS = { stall: 2 * 60 * 1000, cdpStep: 10 * 1000, newSession: 30 * 1000, queueWait: 2 * 60 * 1000 };
 const FALLBACK_FINISH_MS = 10 * 60 * 1000;
+const STALL_MIN_MS = 1000;
+const STALL_MAX_MS = 30 * 60 * 1000;
+const STALE_DIR_MS = 24 * 60 * 60 * 1000;
 let STALL_MS = DEFAULTS.stall;
 let CDP_STEP_MS = DEFAULTS.cdpStep;
+let NEW_SESSION_MS = DEFAULTS.newSession;
 let QUEUE_WAIT_MS = DEFAULTS.queueWait;
 const STATE_FILE = ".download-clicks.json";
 const STATE_LOCK = ".download-clicks.flock";
@@ -231,7 +247,7 @@ async function pointDownloadsAt(page, dir) {
   let pending = null;
   let session;
   try {
-    session = await bounded(() => (pending = page.context().newCDPSession(page)), CDP_STEP_MS, "newCDPSession");
+    session = await bounded(() => (pending = page.context().newCDPSession(page)), NEW_SESSION_MS, "newCDPSession");
   } catch (e) {
     if (pending) Promise.resolve(pending).then((s) => { bounded(() => s.detach(), CDP_STEP_MS, "detach").catch(() => {}); }, () => {});
     throw e;
@@ -243,6 +259,36 @@ async function pointDownloadsAt(page, dir) {
     throw e;
   }
   return session;
+}
+
+// The own dirs this process made (newest last). Calls run one at a time, so at
+// a call's start none of them is in use: each is removed again then, which
+// catches one Chrome recreated after its call ended (review r3 L2).
+const madeDirs = [];
+
+/** At a call's start: remove this process's earlier own dirs, and any other
+ *  relay-download-* dir of this user whose newest entry is older than
+ *  STALE_DIR_MS (its relay is gone). Never throws. */
+function sweepOwnDirs() {
+  for (const d of madeDirs.splice(0)) {
+    try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* next call */ }
+    if (fs.existsSync(d)) madeDirs.push(d);
+  }
+  const tmp = os.tmpdir();
+  let names = [];
+  try { names = fs.readdirSync(tmp).filter((n) => n.startsWith("relay-download-")); } catch { return; }
+  const now = Date.now();
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  for (const n of names) {
+    const d = path.join(tmp, n);
+    try {
+      const st = fs.lstatSync(d);
+      if (!st.isDirectory() || (uid !== null && st.uid !== uid)) continue;
+      let newest = st.mtimeMs;
+      for (const e of fs.readdirSync(d)) newest = Math.max(newest, fs.lstatSync(path.join(d, e)).mtimeMs);
+      if (now - newest > STALE_DIR_MS) fs.rmSync(d, { recursive: true, force: true });
+    } catch { /* raced or unreadable: leave it */ }
+  }
 }
 
 /** Remove an own dir; a failure (Chrome still writing: ENOTEMPTY) is logged and
@@ -263,7 +309,7 @@ function repeatRefusal(clickSelector, prevAt, prevPid) {
   const who = prevPid === process.pid
     ? "by this relay"
     : `by another relay on this machine (another session or browser profile${Number.isInteger(prevPid) ? `, pid ${prevPid}` : ""})`;
-  return refused(`a click on ${JSON.stringify(clickSelector)} at this page's address (origin + path) was made ${who} `
+  return refused(`a click on ${JSON.stringify(clickSelector)} at this page's address (origin + path) was reserved or made ${who} `
     + `${Math.max(0, Math.round((Date.now() - prevAt) / 1000))}s ago. `
     + "A repeat click may download the file again, and the server may already have served or charged for it "
     + "(a paid asset is licensed per click). Check whether the first download was delivered or billed; "
@@ -326,7 +372,7 @@ module.exports = {
     "Default save location is OS temp dir with the suggested filename. " +
     "A second clickSelector click on the same page + selector within 10 min of the first is refused " +
     "(a retry can re-buy a paid download) unless allowRepeatClick is true. A started download is " +
-    "cancelled after 2 min without progress, or at maxDownloadMs if given.",
+    "cancelled after 2 min without progress (stallMs), or at maxDownloadMs if given.",
   inputSchema: {
     type: "object",
     properties: {
@@ -350,11 +396,15 @@ module.exports = {
       },
       maxDownloadMs: {
         type: "integer",
-        description: "Optional overall limit for a started download, from its start. Without it, a download is cancelled only after 2 min without progress.",
+        description: "Optional overall limit for a started download, from its start. Without it, a download is cancelled after stallMs without progress (or after 10 min if Chrome reports no progress for it).",
+      },
+      stallMs: {
+        type: "integer",
+        description: "Optional: cancel a started download after this long without progress (default 120000; 1000 to 1800000).",
       },
     },
   },
-  handler: async ({ clickSelector, savePath, timeoutMs = 30000, allowRepeatClick = false, maxDownloadMs }, extra) => withActivePage(({ page }) => {
+  handler: async ({ clickSelector, savePath, timeoutMs = 30000, allowRepeatClick = false, maxDownloadMs, stallMs }, extra) => withActivePage(({ page }) => {
     const signal = extra && extra.signal;
     const allowRepeat = allowRepeatClick === true;
     // Reserve the click NOW, before any await (see the header).
@@ -368,8 +418,9 @@ module.exports = {
     }
     const st = { clickAttempted: false, download: null, finished: false };
     const maxMs = Number.isFinite(maxDownloadMs) && maxDownloadMs > 0 ? maxDownloadMs : null;
+    const stall = Number.isFinite(stallMs) ? Math.min(STALL_MAX_MS, Math.max(STALL_MIN_MS, stallMs)) : STALL_MS;
     return serialized(
-      () => setUpAndCapture({ page, clickSelector, savePath, timeoutMs, maxDownloadMs: maxMs, st, reservation, allowRepeat, signal }),
+      () => setUpAndCapture({ page, clickSelector, savePath, timeoutMs, limits: { maxDownloadMs: maxMs, stallMs: stall }, st, reservation, allowRepeat, signal }),
       { signal },
     ).then((r) => {
       if (!r || !r.gaveUp) return r;
@@ -388,12 +439,13 @@ module.exports = {
   /** Test seams (null = the default). */
   _setStallMs(ms) { STALL_MS = ms == null ? DEFAULTS.stall : ms; },
   _setCdpStepMs(ms) { CDP_STEP_MS = ms == null ? DEFAULTS.cdpStep : ms; },
+  _setNewSessionMs(ms) { NEW_SESSION_MS = ms == null ? DEFAULTS.newSession : ms; },
   _setQueueWaitMs(ms) { QUEUE_WAIT_MS = ms == null ? DEFAULTS.queueWait : ms; },
   _reserveClick: reserveClick,
 };
 
 /** Inside the queue: the download wait, the own dir and its session, then capture(). */
-async function setUpAndCapture({ page, clickSelector, savePath, timeoutMs, maxDownloadMs, st, reservation, allowRepeat, signal }) {
+async function setUpAndCapture({ page, clickSelector, savePath, timeoutMs, limits, st, reservation, allowRepeat, signal }) {
   if (typeof page.isClosed === "function" && page.isClosed()) {
     return { content: [{ type: "text", text: "download_capture: the page closed before this call's turn" }], isError: true };
   }
@@ -424,26 +476,50 @@ async function setUpAndCapture({ page, clickSelector, savePath, timeoutMs, maxDo
   // Own download dir, set immediately before the click (see the header).
   let dir = null;
   let session = null;
+  sweepOwnDirs();
   try {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-download-"));
+    madeDirs.push(dir);
+    if (madeDirs.length > 50) madeDirs.shift();
     session = await pointDownloadsAt(page, dir);
   } catch (e) {
     if (dir) removeOwnDir(dir);
     dir = null;
+    if (clickSelector) {
+      // The saveAs fallback cannot work in the relay (upstream's download dir
+      // wins): clicking now could be a charged download with no file. Refuse
+      // before the click; the reservation is released (review r3 M1).
+      if (onClose) page.off("close", onClose);
+      return refused(`its own download directory could not be set up (${e.message}) — not clicked, nothing captured. `
+        + "Without it the file would be saved where this relay cannot read it. Calling again is not a repeat click.");
+    }
     process.stderr.write(`[mcp-relay] download_capture: own download dir not set (${e.message}) — falling back to saveAs\n`);
   }
-  // Progress of downloads, from Chrome's events on our own session (see the header).
-  const progress = { seen: false, last: Date.now(), bytes: new Map() };
+  // Progress of the CAPTURED download only, from Chrome's events on our own
+  // session (see the header); it is matched by url + suggested filename
+  // (review r3 L3: another download in the tab must not keep it alive).
+  const progress = { guid: null, want: null, seen: false, last: Date.now(), bytes: -1 };
+  const begins = []; // downloadWillBegin events, in order
   const begun = new Set(); // guids of downloads that began on our session
   const ended = new Set(); // ...and of those that completed or were cancelled
-  const onWillBegin = (e) => { if (e && e.guid) begun.add(e.guid); };
+  const onWillBegin = (e) => {
+    if (!e || !e.guid) return;
+    begun.add(e.guid);
+    begins.push(e);
+    if (progress.want && !progress.guid && e.url === progress.want.url && e.suggestedFilename === progress.want.name) progress.guid = e.guid;
+  };
+  progress.match = (url, name) => {
+    progress.want = { url, name };
+    const b = begins.find((e) => e.url === url && e.suggestedFilename === name);
+    if (b) progress.guid = b.guid;
+  };
   const onProgress = (e) => {
     if (e && e.guid && e.state !== "inProgress") ended.add(e.guid);
+    if (!e || !progress.guid || e.guid !== progress.guid) return;
     progress.seen = true;
-    const got = Number(e && e.receivedBytes) || 0;
-    const key = e && e.guid;
-    if (!progress.bytes.has(key) || got > progress.bytes.get(key) || (e && e.state !== "inProgress")) {
-      progress.bytes.set(key, got);
+    const got = Number(e.receivedBytes) || 0;
+    if (got > progress.bytes || e.state !== "inProgress") {
+      progress.bytes = got;
       progress.last = Date.now();
     }
   };
@@ -452,7 +528,7 @@ async function setUpAndCapture({ page, clickSelector, savePath, timeoutMs, maxDo
     session.on("Browser.downloadWillBegin", onWillBegin);
   }
   try {
-    return await capture({ page, clickSelector, savePath, timeoutMs, maxDownloadMs, downloadPromise, closePromise, onClose, dir, st, reservation, allowRepeat, signal, progress });
+    return await capture({ page, clickSelector, savePath, timeoutMs, limits, downloadPromise, closePromise, onClose, dir, st, reservation, allowRepeat, signal, progress });
   } finally {
     // A download that did not finish is cancelled first, so nothing writes into the dir after it goes.
     // Each step is bounded, and none of them can change the result.
@@ -476,7 +552,8 @@ async function setUpAndCapture({ page, clickSelector, savePath, timeoutMs, maxDo
 
 /** Resolves when the download finishes (its failure string, or null); rejects
  *  when it stalls, passes maxDownloadMs, or (no progress events) the fallback bound. */
-function finishOrGiveUp(download, progress, maxDownloadMs) {
+function finishOrGiveUp(download, progress, { maxDownloadMs, stallMs }) {
+  const fallbackMs = Math.max(FALLBACK_FINISH_MS, stallMs);
   const started = Date.now();
   progress.last = started; // the start is progress
   let timer;
@@ -486,11 +563,11 @@ function finishOrGiveUp(download, progress, maxDownloadMs) {
       if (maxDownloadMs && now - started >= maxDownloadMs) {
         return reject(new Error(`the download did not finish within maxDownloadMs (${maxDownloadMs} ms); cancelled`));
       }
-      if (progress.seen && now - progress.last >= STALL_MS) {
-        return reject(new Error(`the download did not finish: no progress for ${Math.round(STALL_MS / 1000)} s; cancelled`));
+      if (progress.seen && now - progress.last >= stallMs) {
+        return reject(new Error(`the download did not finish: no progress for ${Math.round(stallMs / 1000)} s; cancelled`));
       }
-      if (!progress.seen && now - started >= FALLBACK_FINISH_MS) {
-        return reject(new Error(`the download did not finish in ${Math.round(FALLBACK_FINISH_MS / 1000)} s (no progress reported); cancelled`));
+      if (!progress.seen && now - started >= fallbackMs) {
+        return reject(new Error(`the download did not finish in ${Math.round(fallbackMs / 1000)} s (no progress reported); cancelled`));
       }
       timer = setTimeout(tick, 200);
     };
@@ -500,7 +577,7 @@ function finishOrGiveUp(download, progress, maxDownloadMs) {
 }
 
 /** The click, the wait and the copy; the caller owns `dir` and its CDP session. */
-async function capture({ page, clickSelector, savePath, timeoutMs, maxDownloadMs, downloadPromise, closePromise, onClose, dir, st, reservation, allowRepeat, signal, progress }) {
+async function capture({ page, clickSelector, savePath, timeoutMs, limits, downloadPromise, closePromise, onClose, dir, st, reservation, allowRepeat, signal, progress }) {
   if (clickSelector) {
     // At the click, with no await from here to page.click (see the header).
     let refusal = null;
@@ -561,12 +638,13 @@ async function capture({ page, clickSelector, savePath, timeoutMs, maxDownloadMs
   // sanitizeDownloadFilename strips any directory components on either
   // separator + control chars + leading dots + colons.
   const rawSuggested = download.suggestedFilename() || "file.bin";
+  progress.match(download.url(), download.suggestedFilename());
   const suggested = sanitizeDownloadFilename(rawSuggested);
   const dst = savePath || path.join(os.tmpdir(), `download-${Date.now()}-${suggested}`);
   let own = null; // <own dir>/<guid>: where Chrome wrote it when our dir won
   try {
     // Waits for the download to finish: until it stalls or passes maxDownloadMs.
-    const failure = await finishOrGiveUp(download, progress, maxDownloadMs);
+    const failure = await finishOrGiveUp(download, progress, limits);
     st.finished = true;
     if (failure) throw new Error(`download failed: ${failure}`);
     if (dir) {

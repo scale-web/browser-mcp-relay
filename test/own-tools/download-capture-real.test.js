@@ -386,3 +386,34 @@ test("R2-1: a given-up call leaves no relay-download-* dir, even after its downl
   assert.deepStrictEqual(ownDirs().filter((n) => !before.has(n)), [], "no relay-download-* dir left");
   assert.strictEqual(fs.existsSync(path.join(out, "late.bin")), false);
 });
+
+// ───── review round 3 (2026-11-17) ─────
+
+test("R3-3: a second download in the same tab does not keep the captured, stalled one alive", REAL, async (t) => {
+  const { page, base, out, hits } = await setup(t);
+  tool._setStallMs(1500);
+  t.after(() => tool._setStallMs(null));
+  await page.goto(`${base}/`);
+  const t0 = Date.now();
+  // While the #stall download hangs, the page starts a second, progressing one.
+  setTimeout(() => { page.evaluate(() => document.getElementById("trickle").click()).catch(() => {}); }, 700);
+  const res = await tool.handler({ clickSelector: "#stall", savePath: path.join(out, "stall.bin"), timeoutMs: 15000 });
+  const took = Date.now() - t0;
+  assert.strictEqual(res.isError, true);
+  assert.match(text(res), /no progress/);
+  assert.strictEqual(hits.stall, 1);
+  assert.strictEqual(hits.trickle, 1, "the second download did run");
+  assert.ok(took < 3200, `cancelled at the stall limit, not after the other download (${took} ms)`);
+  assert.strictEqual(fs.existsSync(path.join(out, "stall.bin")), false);
+});
+
+test("R3-4: stallMs raises or lowers the no-progress limit for one call", REAL, async (t) => {
+  const { page, base, out, hits } = await setup(t);
+  await page.goto(`${base}/`);
+  const t0 = Date.now();
+  const res = await tool.handler({ clickSelector: "#stall", savePath: path.join(out, "s.bin"), timeoutMs: 15000, stallMs: 1000 });
+  assert.strictEqual(res.isError, true);
+  assert.match(text(res), /no progress for 1 s/);
+  assert.ok(Date.now() - t0 < 4000, "the caller's stall limit applied, not the 2-minute default");
+  assert.strictEqual(hits.stall, 1);
+});

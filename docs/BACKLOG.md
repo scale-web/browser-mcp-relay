@@ -188,7 +188,11 @@ Hit on an ephemeral clone session (`launch-project-isolated.js`). The reporter w
    unreadable reservation file. **Still open — abort signal not wired:** `download_capture`'s handler drops a queued
    call when its second argument's `signal` aborts (the MCP SDK aborts it on `notifications/cancelled` and on transport
    close), but `src/index.js` (`CallToolRequestSchema` handler) and `relay-server.js` (`own.handler(args || {})`) do not
-   pass the SDK's `extra` through — about two lines, outside that fix's scope. Item 4 below is still open. Original report:
+   pass the SDK's `extra` through — about two lines, outside that fix's scope (the coordinator wires it after merge).
+   Review round 3: a `clickSelector` call whose own dir cannot be set up is refused before the click; `newCDPSession`
+   gets 30 s; stale `relay-download-*` dirs are swept at each call's start; the stall limit follows only the captured
+   download; `stallMs` added. **Known gap:** downloads in other tabs during a call land in its dir (documented in
+   REFERENCE.md). Item 4 below is still open. Original report:
    **`saveAs` fails with ENOENT.** With `clickSelector`, the download started, then
    `download.saveAs: ENOENT … copyfile …/T/playwright-artifacts-<A>/<guid> -> <savePath>` — while a file with the SAME guid
    existed under a different `playwright-artifacts-<B>/`. *Hypothesis:* two Playwright CDP clients on one browser (the
