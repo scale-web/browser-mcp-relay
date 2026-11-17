@@ -33,6 +33,15 @@ function patchedCopy({ patched = true } = {}) {
   if (patched) {
     const r = repin.applyPatch({ distDir: dist, log: () => {} });
     if (!r.patched) throw new Error(`re-pin patch did not apply to the copy: ${r.reason}`);
+  } else {
+    // The installed bundle may already carry R1 (a relay started from this
+    // checkout patches it on disk): take __relayPin out of execute's sandbox,
+    // which is all the relay can see of a missing patch.
+    const file = repin.findSessionFile({ distDir: dist });
+    const content = fs.readFileSync(file, "utf8");
+    const out = content.replace(`,${repin.SANDBOX_NAME}:(targetId)=>${repin.HELPER_NAME}(this,targetId)`, "");
+    if (out.includes(`${repin.SANDBOX_NAME}:`)) throw new Error("could not take __relayPin out of the unpatched copy");
+    fs.writeFileSync(file, out);
   }
   process.once("exit", () => { try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* best effort */ } });
   shared[kind] = { root, entry: path.join(dist, "index.js") };

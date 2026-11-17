@@ -218,8 +218,10 @@ test("in-flight requests are counted per tab: after tabs_select, the idle wait w
 test("R1 not applied (upstream's bundle changed shape): tabs_new / tabs_select fall back to navigating upstream's own tab; relay_status says so", REAL, async (t) => {
   const { context, relay, A, B } = await launch(t, { unpatched: true });
   const ra = await tabsNew.handler({ url: A });
+  assert.strictEqual(sync.repinState().available, false, "the copy is unpatched: the first pin found no __relayPin");
   assert.strictEqual(last(ra).upstreamPropagated, true, JSON.stringify(ra));
   assert.strictEqual(await upstreamEval(relay, "return page.url();"), A, "upstream's own tab was navigated to A");
+  assert.strictEqual(open(context).filter((p) => p.url() === A).length, 2, "A in the relay's tab and in upstream's own (the pre-re-pin shape)");
   assert.strictEqual(sync.isDesynced(), false);
   const tabA = open(context).find((p) => p.url() === A);
   const rb = await tabsNew.handler({ url: B });
