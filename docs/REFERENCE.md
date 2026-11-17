@@ -101,7 +101,10 @@ the call gave up — is cancelled before the session closes, and Chrome cancels 
 download may follow a redirect to another origin (a presigned S3 URL, say). If that directory cannot be set up (its CDP
 session does not open in **30 seconds**, or setting the directory fails), a call with `clickSelector` is **refused before
 the click** and says "not clicked": without it the file would land where the relay cannot read it, after the server may
-already have charged for it. A call without `clickSelector` still falls back to Playwright's `saveAs`.
+already have charged for it. A call without `clickSelector` still falls back to Playwright's `saveAs`. If a finished download
+cannot be found in that directory and `saveAs` fails too, the directory is **kept** and its path is named in the error
+(the file may be a charged one); it is removed only once it has been idle for 24 hours. `timeoutMs` (the click, and the
+wait for the download to start) is capped at **1 hour**, so a waiting directory is never idle long enough to be swept.
 
 **Downloads in other tabs are not covered.** The directory setting is browser-wide but the tool's session belongs to one
 tab. While a call runs, a download started in **another tab** also lands in the tool's directory: if it finishes during

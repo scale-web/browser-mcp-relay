@@ -95,7 +95,11 @@ const REPEAT_CLICK_WINDOW_MS = 10 * 60 * 1000;
 // newSession: measured 0.3-7.7 ms on 2026-11-17 at load average ~29; 30 s is
 // for a machine far slower than that, since giving up now refuses the click.
 const DEFAULTS = { stall: 2 * 60 * 1000, cdpStep: 10 * 1000, newSession: 30 * 1000, queueWait: 2 * 60 * 1000 };
-const FALLBACK_FINISH_MS = 10 * 60 * 1000;
+let FALLBACK_FINISH_MS = 10 * 60 * 1000;
+// timeoutMs (the click, and the wait for the download to start) is capped, so
+// an own dir waiting for a download never sits idle long enough (STALE_DIR_MS)
+// for another relay's sweep to take it (review r4 L2).
+const TIMEOUT_MAX_MS = 60 * 60 * 1000;
 const STALL_MIN_MS = 1000;
 const STALL_MAX_MS = 30 * 60 * 1000;
 const STALE_DIR_MS = 24 * 60 * 60 * 1000;
@@ -283,6 +287,8 @@ function sweepOwnDirs() {
     const d = path.join(tmp, n);
     try {
       const st = fs.lstatSync(d);
+      // Another user's dir is never touched. Not tested: a test cannot make a
+      // dir owned by another uid without root (accepted, review r4).
       if (!st.isDirectory() || (uid !== null && st.uid !== uid)) continue;
       let newest = st.mtimeMs;
       for (const e of fs.readdirSync(d)) newest = Math.max(newest, fs.lstatSync(path.join(d, e)).mtimeMs);
@@ -387,7 +393,7 @@ module.exports = {
       timeoutMs: {
         type: "integer",
         default: 30000,
-        description: "Max wait for download to start.",
+        description: "Max wait for the click and for the download to start (capped at 3600000, 1 h; 0 means the cap).",
       },
       allowRepeatClick: {
         type: "boolean",
@@ -419,8 +425,9 @@ module.exports = {
     const st = { clickAttempted: false, download: null, finished: false };
     const maxMs = Number.isFinite(maxDownloadMs) && maxDownloadMs > 0 ? maxDownloadMs : null;
     const stall = Number.isFinite(stallMs) ? Math.min(STALL_MAX_MS, Math.max(STALL_MIN_MS, stallMs)) : STALL_MS;
+    const waitMs = timeoutMs > 0 ? Math.min(TIMEOUT_MAX_MS, timeoutMs) : TIMEOUT_MAX_MS;
     return serialized(
-      () => setUpAndCapture({ page, clickSelector, savePath, timeoutMs, limits: { maxDownloadMs: maxMs, stallMs: stall }, st, reservation, allowRepeat, signal }),
+      () => setUpAndCapture({ page, clickSelector, savePath, timeoutMs: waitMs, limits: { maxDownloadMs: maxMs, stallMs: stall }, st, reservation, allowRepeat, signal }),
       { signal },
     ).then((r) => {
       if (!r || !r.gaveUp) return r;
@@ -439,6 +446,7 @@ module.exports = {
   /** Test seams (null = the default). */
   _setStallMs(ms) { STALL_MS = ms == null ? DEFAULTS.stall : ms; },
   _setCdpStepMs(ms) { CDP_STEP_MS = ms == null ? DEFAULTS.cdpStep : ms; },
+  _setFallbackFinishMs(ms) { FALLBACK_FINISH_MS = ms == null ? 10 * 60 * 1000 : ms; },
   _setNewSessionMs(ms) { NEW_SESSION_MS = ms == null ? DEFAULTS.newSession : ms; },
   _setQueueWaitMs(ms) { QUEUE_WAIT_MS = ms == null ? DEFAULTS.queueWait : ms; },
   _reserveClick: reserveClick,
@@ -546,7 +554,14 @@ async function setUpAndCapture({ page, clickSelector, savePath, timeoutMs, limit
       }
       await bounded(() => session.detach(), CDP_STEP_MS, "detach").catch(() => { /* page closed or hung */ });
     }
-    if (dir) removeOwnDir(dir);
+    if (dir && st.keepDir) {
+      // It may hold a finished, charged file nobody could copy: kept, and out
+      // of the next call's sweep; the 24 h idle sweep still removes it later.
+      const i = madeDirs.indexOf(dir);
+      if (i >= 0) madeDirs.splice(i, 1);
+    } else if (dir) {
+      removeOwnDir(dir);
+    }
   }
 }
 
@@ -648,17 +663,38 @@ async function capture({ page, clickSelector, savePath, timeoutMs, limits, downl
     st.finished = true;
     if (failure) throw new Error(`download failed: ${failure}`);
     if (dir) {
-      try {
-        const p = path.join(dir, path.basename(await bounded(() => download.path(), CDP_STEP_MS, "download.path")));
-        if (fs.existsSync(p)) own = p;
-      } catch { /* no local path: saveAs below */ }
+      // Chrome names the file by its guid (allowAndName): when the captured
+      // download's guid is known, no CDP call is needed (review r4 L3).
+      const byGuid = progress.guid ? path.join(dir, path.basename(String(progress.guid))) : null;
+      if (byGuid && fs.existsSync(byGuid)) {
+        own = byGuid;
+      } else {
+        try {
+          const p = path.join(dir, path.basename(await bounded(() => download.path(), CDP_STEP_MS, "download.path")));
+          if (fs.existsSync(p)) own = p;
+        } catch { /* no local path: saveAs below */ }
+      }
     }
     // Ensure parent dir exists when caller passed a custom savePath. The
     // default path uses os.tmpdir() which always exists, so this only
     // matters for explicit savePath values.
     fs.mkdirSync(path.dirname(dst), { recursive: true });
-    if (own) fs.copyFileSync(own, dst);
-    else await bounded(() => download.saveAs(dst), FALLBACK_FINISH_MS, "download.saveAs");
+    if (own) {
+      fs.copyFileSync(own, dst);
+    } else {
+      try {
+        await bounded(() => download.saveAs(dst), FALLBACK_FINISH_MS, "download.saveAs");
+      } catch (e) {
+        // Never delete what may be the charged file: keep the dir, name it.
+        let held = [];
+        try { held = dir ? fs.readdirSync(dir) : []; } catch { /* gone */ }
+        if (held.length > 0) {
+          st.keepDir = true;
+          throw new Error(`${e.message}. The finished download may be in ${dir} (kept; copy it from there — it is removed once idle for 24 h)`);
+        }
+        throw e;
+      }
+    }
   } catch (e) {
     return {
       content: [{ type: "text", text: `saveAs failed: ${e.message} ${CHARGE_WARNING}` }],

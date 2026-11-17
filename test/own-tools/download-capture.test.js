@@ -498,3 +498,112 @@ test("R3-1: newCDPSession has its own, longer limit than the other CDP steps", {
   assert.doesNotMatch(textOf(r), /REFUSED/);
   assert.strictEqual(page.clicks, 1, "a slow (600 ms) session is waited for");
 });
+
+// ───── review round 4 (2026-11-17) ─────
+
+/** A session on which the captured download (guid "g") began, with progress
+ *  stuck at 1 byte (or no progress events at all), recording the dir it set. */
+function stuckSession({ events = true } = {}) {
+  const s = {
+    dirs: [],
+    send: async (m, p) => { if (p && p.downloadPath) s.dirs.push(p.downloadPath); },
+    detach: async () => {},
+    on(ev, fn) {
+      if (!events) return;
+      if (ev === "Browser.downloadWillBegin") fn({ guid: "g", url: "https://x.test/x.bin", suggestedFilename: "x.bin" });
+      if (ev === "Browser.downloadProgress") { s.iv = setInterval(() => fn({ guid: "g", receivedBytes: 1, state: "inProgress" }), 50); s.iv.unref(); }
+    },
+    off() { clearInterval(s.iv); },
+  };
+  return s;
+}
+function fakeDownload(over = {}) {
+  return {
+    suggestedFilename: () => "x.bin", url: () => "https://x.test/x.bin",
+    failure: () => sleep(600).then(() => null), cancel: async () => {},
+    path: async () => "/nonexistent", saveAs: async () => { throw new Error("ENOENT: copyfile (upstream's dir won)"); },
+    ...over,
+  };
+}
+
+for (const bad of [0, -5]) {
+  test(`R4-1: stallMs ${bad} is clamped to 1 s — a stuck download is not cancelled at once`, { timeout: 20000 }, async (t) => {
+    stateFor(t);
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), "relay-dl-out-"));
+    t.after(() => fs.rmSync(out, { recursive: true, force: true }));
+    const session = stuckSession();
+    // Finishes at 600 ms: inside the clamped 1 s limit. saveAs writes the file here.
+    fakePage(t, { session, waitForEvent: () => Promise.resolve(fakeDownload({ saveAs: async (dst) => fs.writeFileSync(dst, Buffer.alloc(55)) })) });
+    const r = await within(tool.handler({ savePath: path.join(out, "x.bin"), timeoutMs: 1000, stallMs: bad }), 5000, "the call");
+    assert.notStrictEqual(r.isError, true, textOf(r));
+    assert.strictEqual(fs.statSync(path.join(out, "x.bin")).size, 55);
+  });
+}
+
+test("R4-1: with no progress events and stallMs above the fallback limit, the limit is stallMs", { timeout: 20000 }, async (t) => {
+  stateFor(t);
+  tool._setFallbackFinishMs(300);
+  t.after(() => tool._setFallbackFinishMs(null));
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), "relay-dl-out-"));
+  t.after(() => fs.rmSync(out, { recursive: true, force: true }));
+  fakePage(t, { session: stuckSession({ events: false }), waitForEvent: () => Promise.resolve(fakeDownload({ failure: () => sleep(700).then(() => null), saveAs: async (dst) => fs.writeFileSync(dst, Buffer.alloc(66)) })) });
+  const ok = await within(tool.handler({ savePath: path.join(out, "a.bin"), timeoutMs: 1000, stallMs: 1500 }), 5000, "the call");
+  assert.notStrictEqual(ok.isError, true, `not cancelled at the 300 ms fallback: ${textOf(ok)}`);
+  assert.strictEqual(fs.statSync(path.join(out, "a.bin")).size, 66);
+  // ...and it does apply: a download that never finishes is cancelled at stallMs.
+  fakePage(t, { session: stuckSession({ events: false }), waitForEvent: () => Promise.resolve(fakeDownload({ failure: never })) });
+  const t0 = Date.now();
+  const stuck = await within(tool.handler({ savePath: path.join(out, "b.bin"), timeoutMs: 1000, stallMs: 1500 }), 5000, "the stuck call");
+  assert.match(textOf(stuck), /no progress reported/);
+  assert.ok(Date.now() - t0 >= 1400, `cancelled at stallMs, not before (${Date.now() - t0} ms)`);
+});
+
+test("R4-2: timeoutMs is capped at 1 h (a longer wait could outlive the 24 h stale-dir sweep)", { timeout: 20000 }, async (t) => {
+  stateFor(t);
+  const seen = [];
+  fakePage(t, {
+    waitForEvent: (_ev, o) => { seen.push(["wait", o.timeout]); return sleep(50).then(() => { throw new Error("Timeout"); }); },
+    click: async () => {},
+  });
+  const page = globalThis.__relayBridge.context.pages()[0];
+  const origClick = page.click;
+  page.click = async (sel, o) => { seen.push(["click", o.timeout]); return origClick(sel, o); };
+  await within(tool.handler({ clickSelector: "#buy", timeoutMs: 1e12 }), 5000, "the call");
+  assert.deepStrictEqual(seen, [["wait", 3600000], ["click", 3600000]]);
+});
+
+test("R4-3: if download.path() hangs, the finished file is copied from <own dir>/<guid>", { timeout: 20000 }, async (t) => {
+  stateFor(t);
+  tool._setCdpStepMs(200);
+  t.after(() => tool._setCdpStepMs(null));
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), "relay-dl-out-"));
+  t.after(() => fs.rmSync(out, { recursive: true, force: true }));
+  const session = stuckSession();
+  // Chrome finished writing <dir>/g; path() never answers; saveAs is the broken fallback.
+  const download = fakeDownload({ failure: async () => { await sleep(100); fs.writeFileSync(path.join(session.dirs[0], "g"), Buffer.alloc(4321)); return null; }, path: never });
+  fakePage(t, { session, waitForEvent: () => Promise.resolve(download) });
+  const savePath = path.join(out, "x.bin");
+  const r = await within(tool.handler({ savePath, timeoutMs: 1000 }), 5000, "the call");
+  assert.notStrictEqual(r.isError, true, textOf(r));
+  assert.strictEqual(fs.statSync(savePath).size, 4321);
+});
+
+test("R4-3: with no file found and saveAs failing, the own dir is kept (not swept by the next call) and its path reported", { timeout: 20000 }, async (t) => {
+  stateFor(t);
+  tool._setCdpStepMs(200);
+  t.after(() => tool._setCdpStepMs(null));
+  const session = stuckSession({ events: false }); // no guid known
+  const download = fakeDownload({ failure: async () => { await sleep(100); fs.writeFileSync(path.join(session.dirs[0], "unknown-guid"), Buffer.alloc(777)); return null; }, path: never });
+  fakePage(t, { session, waitForEvent: () => Promise.resolve(download) });
+  const r = await within(tool.handler({ timeoutMs: 1000 }), 5000, "the call");
+  const dir = session.dirs[0];
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  assert.strictEqual(r.isError, true);
+  assert.ok(textOf(r).includes(dir), `the kept dir is named: ${textOf(r)}`);
+  assert.match(textOf(r), /served \(or charged for\)/);
+  await sleep(1200); // past the 1 s removal retry
+  // The next call's sweep of this process's earlier dirs leaves it alone.
+  fakePage(t, { session: stuckSession({ events: false }) });
+  await within(tool.handler({ timeoutMs: 100 }), 5000, "the next call");
+  assert.strictEqual(fs.statSync(path.join(dir, "unknown-guid")).size, 777, "the charged file is still there");
+});
