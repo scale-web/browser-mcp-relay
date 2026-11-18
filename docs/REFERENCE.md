@@ -63,7 +63,11 @@ upstream's bundle, `scripts/patch-bdmcp-repin.js`); nothing is navigated to foll
 selecting an earlier tab gives upstream that tab with its page and typed input intact. Before each upstream call the
 relay re-pins upstream to the tab `tabs_new` / `tabs_select` last selected, if it is elsewhere (a restarted upstream),
 before any check the relay makes of upstream's page; a `tabs_new` / `tabs_select` waits for running upstream calls to
-finish, and upstream calls made meanwhile wait for it, so a check and the call it allows act on one tab.
+finish, and upstream calls sent after it (from the moment it arrives, before its own Brave and policy steps) wait for it,
+so a check and the call it allows act on one tab. That wait is bounded: after **15 seconds** the `tabs_new` /
+`tabs_select` is refused, upstream's tab is not moved, and the refusal names the running calls (a hung upstream call
+ends when upstream answers or after 180 s; cancelling it does not end it in upstream, so it keeps its hold until then).
+An upstream call whose caller cancels it while it waits for a `tabs_new` / `tabs_select` is dropped, never sent.
 Upstream's own first tab, opened when it starts, is closed by the first pin while it is still blank. `tabs_new` navigates
 a leftover blank only when it is the relay's (Brave's launch tab, or one `tabs_new` made), never an attached Brave's or
 the user's. **Console and network capture** (`o11y_*`) follow the pin: a tab records into upstream's buffers only while
@@ -124,8 +128,12 @@ session does not open in **30 seconds**, or setting the directory fails), a call
 the click** and says "not clicked": without it the file would land where the relay cannot read it, after the server may
 already have charged for it. A call without `clickSelector` still falls back to Playwright's `saveAs`. If a finished download
 cannot be found in that directory and `saveAs` fails too, the directory is **kept** and its path is named in the error
-(the file may be a charged one); it is removed only once it has been idle for 24 hours. `timeoutMs` (the click, and the
-wait for the download to start) is capped at **1 hour**, so a waiting directory is never idle long enough to be swept.
+(the file may be a charged one); it is removed only once it has been idle for 24 hours. The same holds when the file was
+found but copying it to `savePath` fails (its parent became a file, the disk is full): the directory is kept and the error
+names the file in it. A call with `clickSelector` whose `savePath` directory cannot be created or written is **refused
+before the click** ("not clicked"). `timeoutMs` (the click, and the wait for the download to start) is capped at
+**1 hour**, so a waiting directory is never idle long enough to be swept; `0` means that cap, and a null, negative or
+non-numeric value means the 30-second default.
 
 **Downloads in other tabs are not covered.** The directory setting is browser-wide but the tool's session belongs to one
 tab. While a call runs, a download started in **another tab** also lands in the tool's directory: if it finishes during

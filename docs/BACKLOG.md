@@ -190,8 +190,22 @@ Hit on an ephemeral clone session (`launch-project-isolated.js`). The reporter w
    when the MCP SDK aborts it (`notifications/cancelled`, transport close).
    Review round 3: a `clickSelector` call whose own dir cannot be set up is refused before the click; `newCDPSession`
    gets 30 s; stale `relay-download-*` dirs are swept at each call's start; the stall limit follows only the captured
-   download; `stallMs` added. **Known gap:** downloads in other tabs during a call land in its dir (documented in
-   REFERENCE.md). Item 4 below is still open. Original report:
+   download; `stallMs` added. Review round 4 (`1695519`): the stall clamp and the no-progress fallback are tested,
+   `timeoutMs` is capped at 1 h (a waiting dir is never idle long enough for the 24 h sweep), the finished file is
+   copied from `<own dir>/<guid>` when `download.path()` hangs, and a dir that may hold a charged file is kept and named
+   instead of deleted. **Re-pin review r1 fixes on the same branch:** M1 (`512b219`) in-flight requests counted per tab,
+   so the idle wait after `tabs_select` waits and never goes negative; L2 (`b0d8979`) re-pin before the policy checks
+   upstream's page, and `tabs_*` re-pins wait for running upstream calls (the pin lock); L3 (`8930a25`) R1 not applied →
+   `tabs_new` / `tabs_select` navigate upstream's own tab, and `relay_status` shows `upstreamRepin`. **Final review of
+   `140cf47`:** M1 — a `clickSelector` call whose `savePath` directory cannot be created or written is refused before
+   the click, and a failed copy to `savePath` after the download finished keeps the own dir and names the file;
+   L2 — with R1 not applied and the tab cap exceeded, `tabs_new` prunes before navigating upstream's tab (main's order),
+   so `upstreamPropagated: true` no longer hides an upstream left on `about:blank`; L3 — `tabs_new` / `tabs_select` take
+   the pin lock when they arrive, wait for it at most 15 s and are then refused naming the running upstream calls, and a
+   forwarded call cancelled while it waits for them is dropped (a granted hold is not released on cancel: the call keeps
+   running in upstream); L4 — a null, negative or non-numeric `timeoutMs` is the 30 s default, not the 1 h cap;
+   L5 — a test that a forwarded call that throws releases its pin hold. **Known gap:** downloads in other tabs during a
+   call land in its dir (documented in REFERENCE.md). Item 4 below is still open. Original report:
    **`saveAs` fails with ENOENT.** With `clickSelector`, the download started, then
    `download.saveAs: ENOENT … copyfile …/T/playwright-artifacts-<A>/<guid> -> <savePath>` — while a file with the SAME guid
    existed under a different `playwright-artifacts-<B>/`. *Hypothesis:* two Playwright CDP clients on one browser (the
