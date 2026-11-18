@@ -167,7 +167,7 @@ class RelayServer {
     return { tools: this.policy ? this.policy.filterToolsList(all) : all };
   }
 
-  async handleToolsCall({ name, arguments: args }) {
+  async handleToolsCall({ name, arguments: args }, extra) {
     const own = this.ownTools.get(name);
     const isOwn = !!own;
     const id = this.trafficEmitter.nextId();
@@ -235,7 +235,9 @@ class RelayServer {
         if (this.ensureBrave && own.needsBrave) await this.ensureBrave();
         const moverHold = PIN_MOVERS.has(name) ? await pinLock.exclusive() : null;
         try {
-          response = await own.handler(args || {});
+          // The MCP SDK's per-request abort signal (fires when the client cancels or
+          // disconnects); download_capture uses it to give up a queued call unclicked.
+          response = await own.handler(args || {}, { signal: extra && extra.signal });
         } catch (e) {
           response = {
             content: [{ type: "text", text: `[mcp-relay] tool "${name}" failed: ${e.message}` }],

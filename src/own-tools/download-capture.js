@@ -28,7 +28,7 @@
 // other's download (review r1 M2, measured). Calls queue on a module-level
 // chain. A queued call waits at most QUEUE_WAIT_MS (2 min) for its turn, or
 // until its caller's abort signal fires (the handler's second argument,
-// { signal }: relay-server.js does not pass it yet — see docs/BACKLOG.md); then
+// { signal }, passed by relay-server.js from the MCP SDK's request `extra`); then
 // it is refused without clicking and its reservation is released (review r2
 // M3). Every CDP step (setDownloadBehavior, cancel, detach, the download's path)
 // is bounded by CDP_STEP_MS (10 s), and newCDPSession by NEW_SESSION_MS (30 s),

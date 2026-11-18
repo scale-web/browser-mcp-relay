@@ -185,10 +185,9 @@ Hit on an ephemeral clone session (`launch-project-isolated.js`). The reporter w
    changes the result; the 10-min window runs from the click attempt; every CDP step is bounded (10 s); a queued call
    gives up after 2 min, and is refused if the page's origin + path changed before its turn; a started download is
    cancelled after 2 min without progress (`maxDownloadMs` for an overall limit); `allowRepeatClick` no longer resets an
-   unreadable reservation file. **Still open — abort signal not wired:** `download_capture`'s handler drops a queued
-   call when its second argument's `signal` aborts (the MCP SDK aborts it on `notifications/cancelled` and on transport
-   close), but `src/index.js` (`CallToolRequestSchema` handler) and `relay-server.js` (`own.handler(args || {})`) do not
-   pass the SDK's `extra` through — about two lines, outside that fix's scope (the coordinator wires it after merge).
+   unreadable reservation file. **Abort signal wired after the merge:** `src/index.js` passes the SDK's `extra` to `handleToolsCall`, and
+   `relay-server.js` hands `{ signal: extra.signal }` to every own-tool handler, so `download_capture` drops a queued call
+   when the MCP SDK aborts it (`notifications/cancelled`, transport close).
    Review round 3: a `clickSelector` call whose own dir cannot be set up is refused before the click; `newCDPSession`
    gets 30 s; stale `relay-download-*` dirs are swept at each call's start; the stall limit follows only the captured
    download; `stallMs` added. **Known gap:** downloads in other tabs during a call land in its dir (documented in

@@ -139,9 +139,8 @@ after another. A queued call waits at most **2 minutes** for its turn; then it i
 is not a repeat click). Each CDP step the tool takes (opening its session, setting the directory, cancelling, detaching)
 is given up after **10 seconds**, so one hung step cannot block every later download. When a queued call's turn comes,
 the page's origin + path is checked again right before the click: if the page has moved, the call is refused, not
-clicked. A queued call is also dropped when its caller cancels the request — **not yet wired:** the handler accepts the
-MCP request's abort signal, but `relay-server.js` does not pass it on (`docs/BACKLOG.md`), so today the 2-minute wait and
-the page check are what stop a call whose caller has gone. Removing the tool's directory never changes the call's
+clicked. A queued call is also dropped, unclicked, when its caller cancels the request or disconnects (the MCP request's abort
+signal, which `relay-server.js` passes to the handler); otherwise the 2-minute wait and the page check stop it. Removing the tool's directory never changes the call's
 result: a failed removal is logged, and the removal is always tried again 1 s and 5 s later.
 
 **A stalled download is given up.** Once a download has started, the tool cancels it after **2 minutes without

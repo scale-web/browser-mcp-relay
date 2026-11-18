@@ -72,6 +72,29 @@ test("RelayServer.handleToolsCall routes own-tool to its handler", async () => {
   assert.deepStrictEqual(calledWith, { url: "https://example.com" });
 });
 
+test("RelayServer.handleToolsCall hands the MCP request's abort signal to an own-tool handler", async () => {
+  const relay = makeRelay();
+  let got = null;
+  relay.registerOwnTool({
+    name: "download_capture",
+    description: "dl",
+    inputSchema: { type: "object" },
+    handler: async (_args, extra) => { got = extra; return { content: [{ type: "text", text: "ok" }] }; },
+  });
+  const ac = new AbortController();
+  await relay.handleToolsCall({ name: "download_capture", arguments: {} }, { signal: ac.signal });
+  assert.ok(got && got.signal === ac.signal, "the handler must receive the request's own AbortSignal");
+  // No extra (e.g. a direct call) still works: signal is simply undefined.
+  await relay.handleToolsCall({ name: "download_capture", arguments: {} });
+  assert.strictEqual(got.signal, undefined);
+});
+
+test("index.js passes the SDK's per-request extra (abort signal) to handleToolsCall", () => {
+  const src = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "src", "index.js"), "utf8");
+  assert.match(src, /setRequestHandler\(CallToolRequestSchema,\s*async \(req,\s*extra\)/);
+  assert.match(src, /relay\.handleToolsCall\(req\.params,\s*extra\)/);
+});
+
 test("RelayServer.handleToolsCall returns isError=true when own-tool handler throws", async () => {
   const relay = makeRelay();
   relay.registerOwnTool({

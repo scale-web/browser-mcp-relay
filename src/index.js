@@ -1274,12 +1274,12 @@ async function main() {
     inFlightRequests++;
     try { return await relay.handleToolsList(); } finally { inFlightRequests--; bumpActivity(); }
   });
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     bumpActivity();
     endReapHold("mcp-call");
     sidecar.update({ lastToolCallAt: new Date().toISOString() });
     inFlightRequests++;
-    try { return await relay.handleToolsCall(req.params); } finally { inFlightRequests--; bumpActivity(); }
+    try { return await relay.handleToolsCall(req.params, extra); } finally { inFlightRequests--; bumpActivity(); }
   });
 
   const transport = new StdioServerTransport();
