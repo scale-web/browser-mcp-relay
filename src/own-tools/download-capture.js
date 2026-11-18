@@ -36,7 +36,13 @@
 // cannot be set up, a clickSelector call is refused BEFORE its click and its
 // reservation released (review r3 M1): the saveAs fallback cannot work in the
 // relay, so clicking would risk a charged download with no file; a call without
-// clickSelector still falls back to saveAs. Before the session detaches, a download that
+// clickSelector still falls back to saveAs. A clickSelector call whose savePath's
+// directory cannot be created or written is refused before its click too, and
+// once the download has finished in the own dir, a failed copy to savePath (its
+// parent became a file, a full disk) keeps the own dir and names the file in
+// the error rather than deleting a possibly charged file (review of 140cf47,
+// M1). timeoutMs that is null, negative or not a number is the 30 s default
+// (L4). Before the session detaches, a download that
 // began on it but was never captured (it began as the wait gave up) is
 // cancelled (Browser.cancelDownload), so it cannot recreate the dir; one that
 // begins after the detach is cancelled by Chrome (measured 2026-11-17, with and
@@ -388,7 +394,7 @@ module.exports = {
       },
       savePath: {
         type: "string",
-        description: "Optional output file path. Default: OS temp dir + suggested filename.",
+        description: "Optional output file path. Default: OS temp dir + suggested filename. With clickSelector, a directory that cannot be created or written is refused before the click.",
       },
       timeoutMs: {
         type: "integer",
@@ -425,7 +431,10 @@ module.exports = {
     const st = { clickAttempted: false, download: null, finished: false };
     const maxMs = Number.isFinite(maxDownloadMs) && maxDownloadMs > 0 ? maxDownloadMs : null;
     const stall = Number.isFinite(stallMs) ? Math.min(STALL_MAX_MS, Math.max(STALL_MIN_MS, stallMs)) : STALL_MS;
-    const waitMs = timeoutMs > 0 ? Math.min(TIMEOUT_MAX_MS, timeoutMs) : TIMEOUT_MAX_MS;
+    // Only a finite timeoutMs >= 0 is used (0 = the cap); null, negative or
+    // not a number is the 30 s default, never the 1 h cap (review of 140cf47, L4).
+    const timeout = Number.isFinite(timeoutMs) && timeoutMs >= 0 ? timeoutMs : 30000;
+    const waitMs = timeout > 0 ? Math.min(TIMEOUT_MAX_MS, timeout) : TIMEOUT_MAX_MS;
     return serialized(
       () => setUpAndCapture({ page, clickSelector, savePath, timeoutMs: waitMs, limits: { maxDownloadMs: maxMs, stallMs: stall }, st, reservation, allowRepeat, signal }),
       { signal },
@@ -596,8 +605,23 @@ async function capture({ page, clickSelector, savePath, timeoutMs, limits, downl
   if (clickSelector) {
     // At the click, with no await from here to page.click (see the header).
     let refusal = null;
+    let destProblem = null;
+    if (savePath) {
+      // The destination is checked before the click (review of 140cf47, M1):
+      // a click whose file cannot be written risks a charged download with
+      // nowhere to put it. Synchronous, so still no await before page.click.
+      const parent = path.dirname(savePath);
+      try {
+        fs.mkdirSync(parent, { recursive: true });
+        fs.accessSync(parent, fs.constants.W_OK);
+      } catch (e) {
+        destProblem = `savePath's directory ${parent} cannot be created or written (${e.code || e.message})`;
+      }
+    }
     if (signal && signal.aborted) {
       refusal = refused("the caller cancelled the request before its turn — not clicked, nothing captured.");
+    } else if (destProblem) {
+      refusal = refused(`${destProblem} — not clicked, nothing captured. Pass a savePath in a writable directory; calling again is not a repeat click.`);
     } else if (reservation && clickKeyOf(page.url(), clickSelector) !== reservation.key) {
       refusal = refused("the page's address (origin + path) changed while this call waited for its turn — not clicked. "
         + "Go back to the page and call again if that click is still wanted; it is not a repeat click.");
@@ -675,25 +699,28 @@ async function capture({ page, clickSelector, savePath, timeoutMs, limits, downl
         } catch { /* no local path: saveAs below */ }
       }
     }
-    // Ensure parent dir exists when caller passed a custom savePath. The
-    // default path uses os.tmpdir() which always exists, so this only
-    // matters for explicit savePath values.
-    fs.mkdirSync(path.dirname(dst), { recursive: true });
-    if (own) {
-      fs.copyFileSync(own, dst);
-    } else {
-      try {
-        await bounded(() => download.saveAs(dst), FALLBACK_FINISH_MS, "download.saveAs");
-      } catch (e) {
-        // Never delete what may be the charged file: keep the dir, name it.
-        let held = [];
-        try { held = dir ? fs.readdirSync(dir) : []; } catch { /* gone */ }
-        if (held.length > 0) {
-          st.keepDir = true;
-          throw new Error(`${e.message}. The finished download may be in ${dir} (kept; copy it from there — it is removed once idle for 24 h)`);
-        }
-        throw e;
+    try {
+      // Ensure parent dir exists when caller passed a custom savePath. The
+      // default path uses os.tmpdir() which always exists, so this only
+      // matters for explicit savePath values.
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      if (own) fs.copyFileSync(own, dst);
+      else await bounded(() => download.saveAs(dst), FALLBACK_FINISH_MS, "download.saveAs");
+    } catch (e) {
+      // Never delete what may be the charged file: keep the dir, name it. A
+      // failed mkdir or copy (savePath's parent became a file, read-only, a
+      // full disk) keeps it too (review of 140cf47, M1).
+      if (own) {
+        st.keepDir = true;
+        throw new Error(`${e.message}. The finished download is kept at ${own} (in ${dir}; copy it from there — it is removed once idle for 24 h)`);
       }
+      let held = [];
+      try { held = dir ? fs.readdirSync(dir) : []; } catch { /* gone */ }
+      if (held.length > 0) {
+        st.keepDir = true;
+        throw new Error(`${e.message}. The finished download may be in ${dir} (kept; copy it from there — it is removed once idle for 24 h)`);
+      }
+      throw e;
     }
   } catch (e) {
     return {

@@ -417,3 +417,52 @@ test("R3-4: stallMs raises or lowers the no-progress limit for one call", REAL, 
   assert.ok(Date.now() - t0 < 4000, "the caller's stall limit applied, not the 2-minute default");
   assert.strictEqual(hits.stall, 1);
 });
+
+// ───── review of 140cf47 (2026-11-17) ─────
+
+for (const [why, prep] of [
+  ["its parent is a regular file", (out) => { fs.writeFileSync(path.join(out, "afile"), "x"); return path.join(out, "afile", "x.bin"); }],
+  ["its parent is read-only", (out, t) => { const d = path.join(out, "ro"); fs.mkdirSync(d, { mode: 0o500 }); t.after(() => { try { fs.chmodSync(d, 0o700); } catch { /* setup's teardown already removed it */ } }); return path.join(d, "x.bin"); }],
+]) {
+  test(`M1a: a clickSelector call whose savePath cannot be written (${why}) is refused before the click; the reservation is released`, REAL, async (t) => {
+    const { page, base, out, hits } = await setup(t);
+    await page.goto(`${base}/`);
+    const bad = prep(out, t);
+    const res = await tool.handler({ clickSelector: "#direct", savePath: bad, timeoutMs: 15000 });
+    assert.strictEqual(res.isError, true, text(res));
+    assert.match(text(res), /REFUSED/);
+    assert.match(text(res), /not clicked/);
+    assert.ok(text(res).includes(path.dirname(bad)), `names the dir: ${text(res)}`);
+    await sleep(300);
+    assert.strictEqual(hits.file, 0, "the refused call never reached the server");
+    // Released: the same click with a good savePath is not a repeat.
+    const ok = await tool.handler({ clickSelector: "#direct", savePath: path.join(out, "good.bin"), timeoutMs: 15000 });
+    assert.notStrictEqual(ok.isError, true, text(ok));
+    assert.strictEqual(fs.statSync(path.join(out, "good.bin")).size, BODY.length);
+    assert.strictEqual(hits.file, 1);
+  });
+}
+
+test("M1b: when the copy to savePath fails after the download finished, the file is kept in a named own dir, never deleted", REAL, async (t) => {
+  const { page, base, out, hits } = await setup(t);
+  await page.goto(`${base}/`);
+  const parent = path.join(out, "dest");
+  fs.mkdirSync(parent);
+  const savePath = path.join(parent, "a.bin");
+  const call = tool.handler({ clickSelector: "#a", savePath, timeoutMs: 15000 });
+  // The click passed the pre-click check; the server answers 400 ms after the
+  // request arrives. In that window the destination's parent becomes a file.
+  for (let i = 0; i < 200 && hits.a === 0; i++) await sleep(10);
+  assert.strictEqual(hits.a, 1, "the click reached the server");
+  fs.rmSync(parent, { recursive: true });
+  fs.writeFileSync(parent, "now a file");
+  const res = await call;
+  assert.strictEqual(res.isError, true, text(res));
+  assert.match(text(res), /served \(or charged for\)/);
+  const m = text(res).match(/kept at (\S+?relay-download-[^/\s]+\/[^\s;,)]+)/);
+  assert.ok(m, `the result names the kept file: ${text(res)}`);
+  await sleep(1500); // past the 1 s removal retry
+  assert.strictEqual(fs.statSync(m[1]).size, BODY_A.length, "the finished file survives where the result says");
+  assert.strictEqual(hits.a, 1, "one server hit");
+  t.after(() => fs.rmSync(path.dirname(m[1]), { recursive: true, force: true }));
+});

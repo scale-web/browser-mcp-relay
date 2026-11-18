@@ -607,3 +607,15 @@ test("R4-3: with no file found and saveAs failing, the own dir is kept (not swep
   await within(tool.handler({ timeoutMs: 100 }), 5000, "the next call");
   assert.strictEqual(fs.statSync(path.join(dir, "unknown-guid")).size, 777, "the charged file is still there");
 });
+
+// ───── review of 140cf47 (2026-11-17) ─────
+
+for (const [bad, want] of [[null, 30000], [-5, 30000], [Number.NaN, 30000], ["abc", 30000], [0, 3600000], [1234, 1234]]) {
+  test(`L4: timeoutMs ${String(bad)} waits ${want} ms (only a finite value >= 0 is used; 0 means the cap)`, { timeout: 20000 }, async (t) => {
+    stateFor(t);
+    const seen = [];
+    fakePage(t, { waitForEvent: (_ev, o) => { seen.push(o.timeout); return sleep(20).then(() => { throw new Error("Timeout"); }); } });
+    await within(tool.handler({ timeoutMs: bad }), 5000, "the call");
+    assert.deepStrictEqual(seen, [want]);
+  });
+}
