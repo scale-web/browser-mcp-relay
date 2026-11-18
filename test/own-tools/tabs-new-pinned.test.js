@@ -271,3 +271,24 @@ test("launch: a throw after Chromium starts still closes it (else the process ne
     if (context && !closed) await context.close().catch(() => {});
   }
 });
+
+// Review of 140cf47, L2: in R1-not-applied mode over the tab cap, the branch
+// navigated upstream's own tab and THEN pruned it — reporting
+// upstreamPropagated: true while upstream sat on a re-created about:blank.
+// What a tabs_new result says about upstream must be what upstream acts on.
+for (const unpatched of [true, false]) {
+  test(`tab cap exceeded, ${unpatched ? "R1 not applied" : "re-pin"}: upstreamPropagated matches the page upstream acts on`, REAL, async (t) => {
+    const prevCap = process.env.BROWSER_RELAY_MAX_TABS;
+    process.env.BROWSER_RELAY_MAX_TABS = "1";
+    t.after(() => { if (prevCap === undefined) delete process.env.BROWSER_RELAY_MAX_TABS; else process.env.BROWSER_RELAY_MAX_TABS = prevCap; });
+    const { context, relay, A, B } = await launch(t, { unpatched });
+    await tabsNew.handler({ url: A });
+    const rb = await tabsNew.handler({ url: B });
+    const out = last(rb);
+    assert.ok(out.prunedTabs >= 1, `the cap pruned: ${JSON.stringify(out)}`);
+    const upUrl = await upstreamEval(relay, "return page.url();");
+    assert.ok(open(context).some((p) => p.url() === B), `B is open: ${open(context).map((p) => p.url())}`);
+    if (out.upstreamPropagated) assert.strictEqual(upUrl, B, `reported propagated, but upstream acts on ${upUrl}`);
+    else assert.strictEqual(sync.isDesynced(), true, "not propagated: the desync is recorded");
+  });
+}

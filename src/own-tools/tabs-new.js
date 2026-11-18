@@ -271,6 +271,21 @@ module.exports = {
     // The relay put this page there (rule C) — even after a failed goto: the
     // tab exists, is the active one, and shows what the relay's goto left.
     if (propagation.propagated) { try { sync.claim(page.url()); } catch { /* closed mid-call */ } }
+    // Cap backstop — only a CREATE can push the count over the cap. Runs
+    // after the re-pin, so a pruned old tab is never the one upstream acts on;
+    // and, with R1 not applied, BEFORE upstream's own tab is navigated below
+    // (main's order): navigating it first and then pruning it left upstream on
+    // a re-created about:blank while the result said upstreamPropagated: true
+    // (review of 140cf47, L2). Pruned first, upstream's navigation_go-to
+    // re-creates its page and navigates it in this same call.
+    let prunedTabs = 0;
+    if (overCap) {
+      try {
+        prunedTabs = await pruneOldestTabs(bridge.context.pages(), cap, [page], pruneSpare,
+          (p, u) => logTab("tab-prune", p, read && read.url, {}, u));
+      } catch { /* best-effort */ }
+    }
+
     // R1 not applied (review r1 L3): as before the re-pin, navigate upstream's
     // own tab to the URL once this tab has loaded it (it claims what it lands on).
     if (propagation.unpatched) {
@@ -280,16 +295,6 @@ module.exports = {
       } else {
         propagation = { ...(await propagateActivePageToUpstream(url, { force })), via: "navigation" };
       }
-    }
-
-    // Cap backstop — only a CREATE can push the count over the cap. Runs
-    // after the re-pin, so a pruned old tab is never the one upstream acts on.
-    let prunedTabs = 0;
-    if (overCap) {
-      try {
-        prunedTabs = await pruneOldestTabs(bridge.context.pages(), cap, [page], pruneSpare,
-          (p, u) => logTab("tab-prune", p, read && read.url, {}, u));
-      } catch { /* best-effort */ }
     }
 
     const pages = bridge.context.pages();
