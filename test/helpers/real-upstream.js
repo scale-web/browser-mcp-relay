@@ -14,10 +14,11 @@ const repin = require("../../scripts/patch-bdmcp-repin.js");
 
 const shared = {}; // one copy per test process and kind (patched / unpatched)
 
-function patchedCopy({ patched = true } = {}) {
-  const kind = patched ? "patched" : "unpatched";
+/** `pkgDir`: the package to copy (default: the installed one) — a test seam. */
+function patchedCopy({ patched = true, pkgDir = null } = {}) {
+  const kind = `${patched ? "patched" : "unpatched"}:${pkgDir || ""}`;
   if (shared[kind]) return shared[kind];
-  const pkg = path.dirname(require.resolve("browser-devtools-mcp/package.json"));
+  const pkg = pkgDir || path.dirname(require.resolve("browser-devtools-mcp/package.json"));
   const realPkg = fs.realpathSync(pkg);
   const srcModules = path.dirname(realPkg);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-bdmcp-"));
@@ -39,8 +40,12 @@ function patchedCopy({ patched = true } = {}) {
     // which is all the relay can see of a missing patch.
     const file = repin.findSessionFile({ distDir: dist });
     const content = fs.readFileSync(file, "utf8");
-    const out = content.replace(`,${repin.SANDBOX_NAME}:(targetId)=>${repin.HELPER_NAME}(this,targetId)`, "");
-    if (out.includes(`${repin.SANDBOX_NAME}:`)) throw new Error("could not take __relayPin out of the unpatched copy");
+    const entry = `,${repin.SANDBOX_NAME}:(targetId)=>${repin.HELPER_NAME}(this,targetId)`;
+    const out = content.replace(entry, "");
+    // The sandbox ENTRY, not the bare name: the helper's own error texts say "__relayPin: …".
+    if (out.includes(entry) || !out.includes("executionContext(){return{page:this.page}}")) {
+      throw new Error("could not take __relayPin out of the unpatched copy's execute sandbox");
+    }
     fs.writeFileSync(file, out);
   }
   process.once("exit", () => { try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* best effort */ } });

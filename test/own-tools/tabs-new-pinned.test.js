@@ -30,13 +30,24 @@ require("../../src/request-body-filter.js").setSourcePatchInEffect(true);
 
 let chromium = null;
 try { ({ chromium } = require("playwright")); if (!fs.existsSync(chromium.executablePath())) chromium = null; } catch { chromium = null; }
-const REAL = { timeout: 120000, skip: chromium ? false : "Chrome for Testing not installed" };
+const REAL = { timeout: 60000, skip: chromium ? false : "Chrome for Testing not installed" };
 
-async function launch(t, { attached = false, unpatched = false } = {}) {
+async function launch(t, { attached = false, unpatched = false, start = startRealUpstream, onContext = () => {} } = {}) {
+  // Teardown is registered FIRST and each resource adds its cleanup as it is
+  // made: a throw part-way (2026-11-17: the unpatched copy's helper threw after
+  // Chromium started) must still close Chromium, or the test process never
+  // exits and the harness hangs.
+  const cleanups = [];
+  t.after(async () => {
+    for (const fn of cleanups.reverse()) { try { await fn(); } catch { /* keep cleaning */ } }
+  });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-repin-"));
+  cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
   const context = await chromium.launchPersistentContext(dir, {
     headless: true, args: ["--remote-debugging-port=0"], handleSIGINT: false, handleSIGTERM: false,
   });
+  cleanups.push(() => context.close());
+  onContext(context);
   let port = null;
   for (let i = 0; i < 100 && !port; i++) {
     try { port = Number(fs.readFileSync(path.join(dir, "DevToolsActivePort"), "utf8").split("\n")[0]); }
@@ -56,14 +67,24 @@ async function launch(t, { attached = false, unpatched = false } = {}) {
     res.end(`<title>${req.url}</title><p>PAGE ${req.url}</p><input id=d><script>console.log("loaded ${req.url}")</script>`);
   });
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  cleanups.push(() => { srv.closeAllConnections(); srv.close(); });
   // The user's own site: another host (127.0.0.1:<other port>). A user's tab on
   // the SAME host as a tabs_new URL can still be reused — register A55 MED-3,
   // unchanged here.
   const usersSrv = http.createServer((req, res) => { userHits.push(req.url); res.setHeader("content-type", "text/html"); res.end("<p>USER</p>"); });
   const userHits = [];
   await new Promise((r) => usersSrv.listen(0, "127.0.0.1", r));
-  const up = startRealUpstream(wsEndpoint, { patched: !unpatched });
+  cleanups.push(() => { usersSrv.closeAllConnections(); usersSrv.close(); });
   const prevUp = globalThis.__relayUpstream;
+  cleanups.push(() => {
+    globalThis.__relayBridge = undefined;
+    globalThis.__relayUpstream = prevUp;
+    sync.reset();
+    sync.noteRepin(null, null);
+    clearActivePage();
+  });
+  const up = start(wsEndpoint, { patched: !unpatched });
+  cleanups.push(() => up.stop());
   globalThis.__relayUpstream = async () => up.client;
   sync.reset();
   clearActivePage();
@@ -71,18 +92,6 @@ async function launch(t, { attached = false, unpatched = false } = {}) {
   tabsNew.noteLaunchedPages(handle); // what index.js does (no-op for an attached Brave)
   globalThis.__relayBridge = handle;
   const relay = new RelayServer({ getUpstream: async () => up.client });
-  t.after(async () => {
-    globalThis.__relayBridge = undefined;
-    globalThis.__relayUpstream = prevUp;
-    sync.reset();
-    sync.noteRepin(null, null);
-    clearActivePage();
-    await up.stop();
-    await context.close().catch(() => {});
-    srv.close();
-    usersSrv.close();
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
   const port2 = srv.address().port;
   return { context, relay, up, hits, userHits, slowDone, A: `http://127.0.0.1:${port2}/a`, B: `http://localhost:${port2}/b`, USER: `http://127.0.0.1:${usersSrv.address().port}/users-own` };
 }
@@ -244,4 +253,21 @@ test("R1 not applied (upstream's bundle changed shape): tabs_new / tabs_select f
     assert.strictEqual(st.upstreamRepin.available, false, JSON.stringify(st));
     assert.match(st.upstreamRepin.reason, /not (patched|applied)/);
   } finally { globalThis.__relayStatus = prev; }
+});
+
+test("launch: a throw after Chromium starts still closes it (else the process never exits: the 2026-11-17 harness hang)", REAL, async (t) => {
+  let context = null;
+  let closed = false;
+  await t.test("launch that throws", async (st) => {
+    await assert.rejects(launch(st, {
+      onContext: (c) => { context = c; c.on("close", () => { closed = true; }); },
+      start: () => { throw new Error("upstream copy failed"); },
+    }), /upstream copy failed/);
+  });
+  try {
+    assert.ok(context, "Chromium was started");
+    assert.strictEqual(closed, true, "the subtest's teardown closed Chromium");
+  } finally {
+    if (context && !closed) await context.close().catch(() => {});
+  }
 });
