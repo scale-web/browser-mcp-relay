@@ -13,9 +13,10 @@ const { fakeUpstream, fakeTab, fakeContext } = require("./fixtures/fake-upstream
 const pinLock = require("../src/own-tools/_pin-lock.js");
 require("../src/request-body-filter.js").setSourcePatchInEffect(true);
 
-const T = { timeout: 10000 }; // a leaked hold fails here instead of hanging the suite
+const T = { timeout: 10000 };
+const within = (p, ms, what) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${what}: still pending after ${ms} ms`)), ms))]); // a leaked hold fails here instead of hanging the suite
 
-function setup(t, { gate = null } = {}) {
+function setup(t, { gate = null, throwFill = false, ensureBrave = async () => {}, pinWaitMs } = {}) {
   const a = fakeTab("https://a.example/");
   const b = fakeTab("https://b.example/form");
   clearActivePage();
@@ -32,6 +33,7 @@ function setup(t, { gate = null } = {}) {
       if (params && params.name === "interaction_fill") {
         events.push(`fill-start:${up.targetId}`);
         if (gate) await gate;
+        if (throwFill) throw new Error("upstream fill failed");
         events.push(`fill-end:${up.targetId}`);
       }
       return up.client.request(method, params);
@@ -48,7 +50,7 @@ function setup(t, { gate = null } = {}) {
     },
     async afterCall(name, response) { return response; },
   };
-  const relay = new RelayServer({ getUpstream: async () => client, ensureBrave: async () => {}, policy });
+  const relay = new RelayServer({ getUpstream: async () => client, ensureBrave, policy, ...(pinWaitMs ? { pinWaitMs } : {}) });
   relay.registerOwnTool(tabsSelect);
   t.after(() => { restore(); quiet.braveIsFront = origFront; clearActivePage(); globalThis.__relayBridge = undefined; });
   return { a, b, up, relay, events, checked };
@@ -114,4 +116,101 @@ test("pin lock: shared holds run together; an exclusive waits for them and goes 
   assert.strictEqual(got, false, "the exclusive still waits for s2");
   s2();
   (await ex)();
+});
+
+// ───── review of 140cf47 (2026-11-17), L3 and L5 ─────
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** The lock is free: an exclusive is granted at once (a leaked hold rejects in 500 ms). */
+async function lockIsFree() {
+  (await pinLock.exclusive({ label: "test", waitMs: 500 }))();
+}
+
+test("L5: a forwarded call that throws still releases its pin hold", T, async (t) => {
+  const { b, relay } = setup(t, { throwFill: true });
+  setActivePage(b);
+  await assert.rejects(relay.handleToolsCall({ name: "interaction_fill", arguments: { selector: "#q", value: "x" } }), /upstream fill failed/);
+  await lockIsFree();
+});
+
+test("L3: a tabs_select behind a hung forwarded call is refused after the bound, naming that call; the pin does not move", T, async (t) => {
+  let open;
+  const gate = new Promise((r) => { open = r; });
+  const { b, up, relay, events } = setup(t, { gate, pinWaitMs: 300 });
+  setActivePage(b);
+  const fill = relay.handleToolsCall({ name: "interaction_fill", arguments: { selector: "#q", value: "x" } });
+  for (const end = Date.now() + 5000; !events.length && Date.now() < end;) await sleep(5);
+  const t0 = Date.now();
+  const rs = await relay.handleToolsCall({ name: "tabs_select", arguments: { index: 0 } });
+  assert.ok(Date.now() - t0 < 3000, `refused at the bound (${Date.now() - t0} ms)`);
+  assert.strictEqual(rs.isError, true, JSON.stringify(rs));
+  const msg = rs.content.map((c) => c.text).join("\n");
+  assert.match(msg, /REFUSED/);
+  assert.match(msg, /interaction_fill \(running \d+ s\)/, msg);
+  assert.strictEqual(up.targetId, b.tid, "the pin did not move");
+  // Upstream calls are not held back by the refused tabs_select.
+  const later = relay.handleToolsCall({ name: "content_get-as-text", arguments: {} });
+  assert.notStrictEqual((await within(later, 2000, "a later forwarded call")).isError, true);
+  open();
+  await fill;
+  const ok = await relay.handleToolsCall({ name: "tabs_select", arguments: { index: 0 } });
+  assert.notStrictEqual(ok.isError, true, JSON.stringify(ok));
+  await lockIsFree();
+});
+
+test("L3: tabs_select takes the pin when it arrives — a forwarded call sent during its ensureBrave waits and acts on the selected tab", T, async (t) => {
+  let openBrave;
+  const braveGate = new Promise((r) => { openBrave = r; });
+  let slow = false;
+  let entered = 0;
+  const { a, b, relay, events, checked } = setup(t, { ensureBrave: async () => { if (slow) { entered++; await braveGate; } } });
+  setActivePage(b);
+  slow = true;
+  const select = relay.handleToolsCall({ name: "tabs_select", arguments: { index: 0 } }); // a
+  for (const end = Date.now() + 5000; !entered && Date.now() < end;) await sleep(5);
+  assert.ok(entered, "tabs_select is in its ensureBrave step");
+  slow = false;
+  const fill = relay.handleToolsCall({ name: "interaction_fill", arguments: { selector: "#q", value: "x" } });
+  await sleep(50);
+  assert.deepStrictEqual(events, [], "the fill waits for the tabs_select sent before it");
+  openBrave();
+  const [rs, rf] = await Promise.all([select, fill]);
+  assert.notStrictEqual(rs.isError, true, JSON.stringify(rs));
+  assert.notStrictEqual(rf.isError, true, JSON.stringify(rf));
+  assert.deepStrictEqual(checked, [a.tid], "checked on the tab selected first");
+  assert.deepStrictEqual(events, [`fill-start:${a.tid}`, `fill-end:${a.tid}`]);
+  await lockIsFree();
+});
+
+test("L3: a forwarded call whose caller aborts while it waits for the pin is dropped — it never reaches upstream", T, async (t) => {
+  const { b, relay, events } = setup(t);
+  setActivePage(b);
+  const held = await pinLock.exclusive({ label: "tabs_new" }); // a tabs_* call running
+  const ac = new AbortController();
+  const fill = relay.handleToolsCall({ name: "interaction_fill", arguments: { selector: "#q", value: "x" } }, { signal: ac.signal });
+  await sleep(30);
+  ac.abort();
+  const r = await within(fill, 2000, "the aborted call");
+  assert.strictEqual(r.isError, true, JSON.stringify(r));
+  assert.match(r.content.map((c) => c.text).join("\n"), /cancel/);
+  held();
+  await sleep(50);
+  assert.deepStrictEqual(events, [], "the dropped call never ran");
+  await lockIsFree();
+});
+
+test("pin lock: a timed-out exclusive leaves the queue — shared holds queued behind it are granted", T, async () => {
+  const s1 = await pinLock.shared({ label: "interaction_click" });
+  const ex = pinLock.exclusive({ label: "tabs_new", waitMs: 100 });
+  let late = false;
+  const s2p = pinLock.shared({ label: "execute" }).then((rel) => { late = true; return rel; });
+  await sleep(20);
+  assert.strictEqual(late, false, "the later shared waits behind the exclusive");
+  const e = await ex.then(() => null, (err) => err);
+  assert.ok(e, "the exclusive gave up");
+  assert.strictEqual(e.code, "PIN_LOCK_TIMEOUT");
+  assert.deepStrictEqual(e.holders.map((h) => h.replace(/\d+ s/, "N s")), ["interaction_click (running N s)"]);
+  (await within(s2p, 1000, "the shared behind the timed-out exclusive"))();
+  s1();
+  await lockIsFree();
 });

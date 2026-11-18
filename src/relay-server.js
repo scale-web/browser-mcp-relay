@@ -32,6 +32,10 @@ const requestBodyFilter = require("./request-body-filter.js");
 
 // The own tools that move upstream's pin (_pin-lock.js: they run exclusive).
 const PIN_MOVERS = new Set(["tabs_new", "tabs_select"]);
+// How long a tabs_new / tabs_select waits for running upstream calls before it
+// is refused, naming them (review of 140cf47, L3): a hung upstream call holds
+// its shared hold until upstream answers or 180 s pass.
+const PIN_WAIT_MS = 15 * 1000;
 
 // Cap each emitted event's response body at this size (in JSON-stringified
 // chars). capture_xhr / lighthouse_audit can return MB-scale responses;
@@ -78,7 +82,7 @@ class TrafficEmitter extends EventEmitter {
 }
 
 class RelayServer {
-  constructor({ getUpstream, ensureBrave, trafficEmitter, takeNotices, policy } = {}) {
+  constructor({ getUpstream, ensureBrave, trafficEmitter, takeNotices, policy, pinWaitMs = PIN_WAIT_MS } = {}) {
     if (typeof getUpstream !== "function") {
       throw new Error("RelayServer: constructor expects { getUpstream } async function");
     }
@@ -97,6 +101,7 @@ class RelayServer {
     // The default relay (A77) passes src/default-lock.js: the secret-on-page
     // lock only — tool list and args unchanged. No policy = every path below unchanged.
     this.policy = policy || null;
+    this.pinWaitMs = pinWaitMs;
     this.ownTools = new Map(); // name → { name, description, inputSchema, handler, needsBrave }
     // Traffic emitter is always present so call sites don't need null-guards.
     // If the caller doesn't pass one, we make our own (no subscribers = no
@@ -206,10 +211,29 @@ class RelayServer {
       // Review r1 L2: a forwarded call holds the pin (shared) from its re-pin to
       // the end of its upstream call, so a tabs_new / tabs_select (exclusive)
       // cannot move it between the policy's check of upstream's page and the
-      // call that check allowed.
-      if (!blocked && !isOwn) pinHold = await pinLock.shared();
+      // call that check allowed. Both are taken when the call arrives, before
+      // the policy and ensureBrave steps, so calls keep the order they were
+      // sent in (review of 140cf47, L3). A tabs_* call waits at most
+      // pinWaitMs, then is refused naming the running calls; a forwarded call
+      // whose caller aborts while it waits is dropped, never forwarded.
+      let lockRefusal = null;
+      if (!blocked && (!isOwn || PIN_MOVERS.has(name))) {
+        try {
+          pinHold = isOwn
+            ? await pinLock.exclusive({ label: name, waitMs: this.pinWaitMs })
+            : await pinLock.shared({ label: name, signal: extra && extra.signal });
+        } catch (e) {
+          if (e.code !== "PIN_LOCK_TIMEOUT" && e.code !== "PIN_LOCK_ABORTED") throw e;
+          const text = e.code === "PIN_LOCK_TIMEOUT"
+            ? `${name} REFUSED: waited ${Math.round(this.pinWaitMs / 1000)} s for running upstream call(s) to finish: `
+              + `${e.holders.join(", ") || "(none named)"}. Upstream's tab was not moved. Such a call ends when upstream `
+              + "answers or after 180 s (cancelling it does not end it in upstream); try again then."
+            : `${name} REFUSED: the caller cancelled the request while it waited for a tabs_new / tabs_select to finish — not sent to upstream.`;
+          lockRefusal = { content: [{ type: "text", text }], isError: true };
+        }
+      }
       let pre = null;
-      if (!blocked && this.policy) {
+      if (!blocked && !lockRefusal && this.policy) {
         pre = await this.policy.beforeCall(name, args || {}, {
           ensureBrave: async () => {
             if (this.ensureBrave && (!isOwn || own.needsBrave)) await this.ensureBrave();
@@ -226,6 +250,8 @@ class RelayServer {
       }
       if (blocked) {
         response = blocked;
+      } else if (lockRefusal) {
+        response = lockRefusal;
       } else if (pre && pre.refusal) {
         response = pre.refusal;
       } else if (isOwn) {
@@ -233,7 +259,6 @@ class RelayServer {
         // populates that — except for tools that never touch the browser
         // (needsBrave: false, e.g. relay_status), which must not launch one.
         if (this.ensureBrave && own.needsBrave) await this.ensureBrave();
-        const moverHold = PIN_MOVERS.has(name) ? await pinLock.exclusive() : null;
         try {
           // The MCP SDK's per-request abort signal (fires when the client cancels or
           // disconnects); download_capture uses it to give up a queued call unclicked.
@@ -243,8 +268,6 @@ class RelayServer {
             content: [{ type: "text", text: `[mcp-relay] tool "${name}" failed: ${e.message}` }],
             isError: true,
           };
-        } finally {
-          if (moverHold) moverHold();
         }
       } else {
         // Forwarded — upstream lazily attaches via CDP. Brave must be up first.
@@ -283,7 +306,7 @@ class RelayServer {
           }
         }
       }
-      if (this.policy && !blocked && !(pre && pre.refusal)) response = await this.policy.afterCall(name, response);
+      if (this.policy && !blocked && !lockRefusal && !(pre && pre.refusal)) response = await this.policy.afterCall(name, response);
       if (response && response.isError) status = "error";
       const notices = response && Array.isArray(response.content) ? this.takeNotices() : [];
       if (notices.length > 0) {
