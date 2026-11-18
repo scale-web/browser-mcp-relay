@@ -30,10 +30,16 @@ const REAL = { timeout: 60000, skip: chromium ? false : "Chrome for Testing not 
 const BODY = Buffer.alloc(12345, 7);
 const BODY_A = Buffer.alloc(11111, 1);
 const BODY_B = Buffer.alloc(22222, 2);
+const TRICKLE = Buffer.alloc(50000, 5);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ownDirs = () => fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith("relay-download-"));
 
 async function setup(t) {
+  // A $TMPDIR of this test's own: the relay-download-* dirs counted below are
+  // this test's, never another suite's running at the same time.
+  const realTmp = process.env.TMPDIR;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "relay-dl-tmp-"));
+  process.env.TMPDIR = tmp;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-dl-"));
   const out = fs.mkdtempSync(path.join(os.tmpdir(), "relay-dl-out-"));
   const hits = { file: 0, a: 0, b: 0, slow: 0 };
@@ -55,6 +61,12 @@ async function setup(t) {
       res.writeHead(200, { "content-type": "application/octet-stream", "content-disposition": "attachment; filename=\"stall.bin\"", "content-length": 1000000 });
       res.write(Buffer.alloc(1000, 3));
       stalled.push(res);
+    } else if (req.url.startsWith("/trickle")) {
+      hits.trickle = (hits.trickle || 0) + 1; // 10 chunks, one every 300 ms: slow but progressing
+      res.writeHead(200, { "content-type": "application/octet-stream", "content-disposition": "attachment; filename=\"trickle.bin\"", "content-length": TRICKLE.length });
+      let n = 0;
+      const iv = setInterval(() => { if (res.destroyed) return clearInterval(iv); res.write(TRICKLE.subarray(n * 5000, (n + 1) * 5000)); if (++n === 10) { clearInterval(iv); res.end(); } }, 300);
+      stalled.push(res);
     } else if (req.url.startsWith("/slow")) {
       hits.slow++; // a server that answers in 3 s: the click itself times out
       setTimeout(() => attach(res, BODY, "slow.bin"), 3000);
@@ -69,7 +81,7 @@ async function setup(t) {
     } else {
       res.setHeader("content-type", "text/html");
       res.end(`<a id=direct href="/file">direct</a> <a id=redirected href="/redir">redirected</a> `
-        + `<a id=a href="/fileA">a</a> <a id=b href="/fileB">b</a> <a id=slow href="/slow">slow</a> <a id=stall href="/stall">stall</a>`);
+        + `<a id=a href="/fileA">a</a> <a id=b href="/fileB">b</a> <a id=slow href="/slow">slow</a> <a id=stall href="/stall">stall</a> <a id=trickle href="/trickle">trickle</a>`);
     }
   });
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
@@ -103,6 +115,8 @@ async function setup(t) {
     srv.close();
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(out, { recursive: true, force: true });
+    if (realTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = realTmp;
+    fs.rmSync(tmp, { recursive: true, force: true });
   });
   const base = `http://127.0.0.1:${srv.address().port}`;
   return { page, upstream, base, out, hits, port, state };
@@ -243,8 +257,8 @@ test("R1-3: the key is origin + path (another query is the same page), and it su
 
 test("R1-5: a download that starts and never finishes is given up after the bound, cancelled, and leaves no own dir", REAL, async (t) => {
   const { page, base, out } = await setup(t);
-  tool._setDownloadFinishMs(1500);
-  t.after(() => tool._setDownloadFinishMs(null));
+  tool._setStallMs(1500);
+  t.after(() => tool._setStallMs(null));
   await page.goto(`${base}/`);
   const before = new Set(ownDirs());
   const t0 = Date.now();
@@ -256,4 +270,150 @@ test("R1-5: a download that starts and never finishes is given up after the boun
   assert.strictEqual(fs.existsSync(path.join(out, "stall.bin")), false);
   await sleep(1500);
   assert.deepStrictEqual(ownDirs().filter((n) => !before.has(n)), [], "no relay-download-* dir left");
+});
+
+// ───── review round 2 (2026-11-17) ─────
+
+const crypto = require("node:crypto");
+const keyOf = (url, sel) => { const u = new URL(url); return crypto.createHash("sha256").update(`${u.origin}${u.pathname}\n${sel}`).digest("hex"); };
+
+/** The first rmSync of a relay-download-* dir throws ENOTEMPTY, as it did when
+ *  Chrome was still writing into it (review r1 re-review M1). */
+function failFirstOwnDirRm(t) {
+  const real = fs.rmSync;
+  const failed = [];
+  const older = new Set(ownDirs()); // an earlier test's one-second retry must not take the failure
+  fs.rmSync = function (p, ...rest) {
+    const name = path.basename(String(p));
+    if (failed.length === 0 && name.startsWith("relay-download-") && !older.has(name) && fs.existsSync(p)) {
+      failed.push(p);
+      const e = new Error(`ENOTEMPTY: directory not empty, rmdir '${p}'`);
+      e.code = "ENOTEMPTY";
+      throw e;
+    }
+    return real.call(this, p, ...rest);
+  };
+  t.after(() => { fs.rmSync = real; });
+  return failed;
+}
+
+test("R2-1: a failed own-dir removal does not change a successful result, and the retry removes the dir", REAL, async (t) => {
+  const { page, base, out, hits } = await setup(t);
+  await page.goto(`${base}/`);
+  const before = new Set(ownDirs());
+  const failed = failFirstOwnDirRm(t);
+  const savePath = path.join(out, "ok.bin");
+  const res = await tool.handler({ clickSelector: "#direct", savePath, timeoutMs: 15000 });
+  assert.strictEqual(failed.length, 1, "the injected failure fired");
+  assert.notStrictEqual(res.isError, true, text(res));
+  assert.strictEqual(JSON.parse(text(res)).savedTo, savePath);
+  assert.strictEqual(fs.statSync(savePath).size, BODY.length);
+  assert.strictEqual(hits.file, 1);
+  await sleep(1500);
+  assert.deepStrictEqual(ownDirs().filter((n) => !before.has(n)), [], "the one-second retry removed it");
+});
+
+test("R2-1: a failed own-dir removal after a timed-out click still returns the charge warning", REAL, async (t) => {
+  const { page, base, out, hits } = await setup(t);
+  await page.goto(`${base}/`);
+  const before = new Set(ownDirs());
+  const failed = failFirstOwnDirRm(t);
+  const res = await tool.handler({ clickSelector: "#slow", savePath: path.join(out, "s.bin"), timeoutMs: 1000 });
+  assert.strictEqual(failed.length, 1, "the injected failure fired");
+  assert.strictEqual(res.isError, true);
+  assert.match(text(res), /click failed/);
+  assert.match(text(res), /served \(or charged for\)/);
+  await sleep(3500); // the server answers at 3 s
+  assert.strictEqual(hits.slow, 1);
+  assert.deepStrictEqual(ownDirs().filter((n) => !before.has(n)), [], "no relay-download-* dir left");
+});
+
+test("R2-2: a queued call's 10-minute window starts at its click, not at its call", REAL, async (t) => {
+  const { page, base, out, state } = await setup(t);
+  await page.goto(`${base}/`);
+  const t0 = Date.now();
+  // The first call holds the queue ~3 s (the server answers at 3 s).
+  const [ra, rb] = await Promise.all([
+    tool.handler({ clickSelector: "#slow", savePath: path.join(out, "s.bin"), timeoutMs: 15000 }),
+    tool.handler({ clickSelector: "#direct", savePath: path.join(out, "d.bin"), timeoutMs: 15000 }),
+  ]);
+  assert.notStrictEqual(ra.isError, true, text(ra));
+  assert.notStrictEqual(rb.isError, true, text(rb));
+  const entries = JSON.parse(fs.readFileSync(path.join(state, ".download-clicks.json"), "utf8"));
+  const a = entries[keyOf(page.url(), "#slow")];
+  const b = entries[keyOf(page.url(), "#direct")];
+  assert.ok(a.at - t0 < 1000, `the first clicked at once (${a.at - t0} ms)`);
+  assert.ok(b.at - t0 >= 2500, `the queued call's window starts at its click (${b.at - t0} ms after the call)`);
+  assert.strictEqual(fs.statSync(path.join(state, ".download-clicks.json")).mode & 0o777, 0o600);
+});
+
+test("R2-4: a slow download that keeps progressing is not cancelled at the stall limit", REAL, async (t) => {
+  const { page, base, out, hits } = await setup(t);
+  tool._setStallMs(1000);
+  t.after(() => tool._setStallMs(null));
+  await page.goto(`${base}/`);
+  const savePath = path.join(out, "trickle.bin");
+  const res = await tool.handler({ clickSelector: "#trickle", savePath, timeoutMs: 15000 });
+  assert.notStrictEqual(res.isError, true, text(res));
+  assert.strictEqual(fs.statSync(savePath).size, TRICKLE.length);
+  assert.strictEqual(hits.trickle, 1);
+});
+
+test("R2-4: maxDownloadMs bounds a progressing download overall; it is cancelled and warned about", REAL, async (t) => {
+  const { page, base, out, hits } = await setup(t);
+  await page.goto(`${base}/`);
+  const before = new Set(ownDirs());
+  const t0 = Date.now();
+  const res = await tool.handler({ clickSelector: "#trickle", savePath: path.join(out, "t.bin"), timeoutMs: 15000, maxDownloadMs: 1000 });
+  assert.strictEqual(res.isError, true);
+  assert.match(text(res), /maxDownloadMs/);
+  assert.match(text(res), /served \(or charged for\)/);
+  assert.ok(Date.now() - t0 < 2900, "cancelled at the overall limit, before the download finished");
+  assert.strictEqual(fs.existsSync(path.join(out, "t.bin")), false);
+  assert.strictEqual(hits.trickle, 1);
+  await sleep(1500);
+  assert.deepStrictEqual(ownDirs().filter((n) => !before.has(n)), [], "no relay-download-* dir left");
+});
+
+test("R2-1: a given-up call leaves no relay-download-* dir, even after its download would have started and finished", REAL, async (t) => {
+  const { page, base, out, hits } = await setup(t);
+  await page.goto(`${base}/`);
+  const before = new Set(ownDirs());
+  const res = await tool.handler({ clickSelector: "#slow", savePath: path.join(out, "late.bin"), timeoutMs: 1000 });
+  assert.strictEqual(res.isError, true);
+  await sleep(6000); // the server answers at 3 s; the retries run at 1 s and 5 s
+  assert.strictEqual(hits.slow, 1);
+  assert.deepStrictEqual(ownDirs().filter((n) => !before.has(n)), [], "no relay-download-* dir left");
+  assert.strictEqual(fs.existsSync(path.join(out, "late.bin")), false);
+});
+
+// ───── review round 3 (2026-11-17) ─────
+
+test("R3-3: a second download in the same tab does not keep the captured, stalled one alive", REAL, async (t) => {
+  const { page, base, out, hits } = await setup(t);
+  tool._setStallMs(1500);
+  t.after(() => tool._setStallMs(null));
+  await page.goto(`${base}/`);
+  const t0 = Date.now();
+  // While the #stall download hangs, the page starts a second, progressing one.
+  setTimeout(() => { page.evaluate(() => document.getElementById("trickle").click()).catch(() => {}); }, 700);
+  const res = await tool.handler({ clickSelector: "#stall", savePath: path.join(out, "stall.bin"), timeoutMs: 15000 });
+  const took = Date.now() - t0;
+  assert.strictEqual(res.isError, true);
+  assert.match(text(res), /no progress/);
+  assert.strictEqual(hits.stall, 1);
+  assert.strictEqual(hits.trickle, 1, "the second download did run");
+  assert.ok(took < 3200, `cancelled at the stall limit, not after the other download (${took} ms)`);
+  assert.strictEqual(fs.existsSync(path.join(out, "stall.bin")), false);
+});
+
+test("R3-4: stallMs raises or lowers the no-progress limit for one call", REAL, async (t) => {
+  const { page, base, out, hits } = await setup(t);
+  await page.goto(`${base}/`);
+  const t0 = Date.now();
+  const res = await tool.handler({ clickSelector: "#stall", savePath: path.join(out, "s.bin"), timeoutMs: 15000, stallMs: 1000 });
+  assert.strictEqual(res.isError, true);
+  assert.match(text(res), /no progress for 1 s/);
+  assert.ok(Date.now() - t0 < 4000, "the caller's stall limit applied, not the 2-minute default");
+  assert.strictEqual(hits.stall, 1);
 });

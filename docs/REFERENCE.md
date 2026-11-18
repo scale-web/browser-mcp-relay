@@ -111,32 +111,61 @@ upstream's own tab to the selected tab's URL (only when it shows a page the rela
 
 | Tool | Purpose | Notable arg | Example use case |
 |---|---|---|---|
-| `download_capture` | Wait for a download, save to disk | `clickSelector`, `allowRepeatClick` | Trigger + save a CSV export |
+| `download_capture` | Wait for a download, save to disk | `clickSelector`, `allowRepeatClick`, `maxDownloadMs`, `stallMs` | Trigger + save a CSV export |
 
 **Where the file lands.** Every Playwright client on the browser sets Chrome's download directory when it attaches, and the
 last one wins — in the relay that is always upstream. So `download_capture` points the browser at a directory of its own
 (`$TMPDIR/relay-download-*`, made for the call) immediately before its click, keeps that CDP session open until the
-download has finished, copies the file to `savePath`, and removes the directory (and once more a second later, in case
-Chrome recreated it). Once the call ends, downloads that nothing captures are back in Chrome's default handling. The
-download may follow a redirect to another origin (a presigned S3 URL, say).
+download has finished, copies the file to `savePath`, and removes the directory (and again 1 s and 5 s later, in case
+Chrome recreated it). A download in the same tab that began on that session but was never captured — it started just as
+the call gave up — is cancelled before the session closes, and Chrome cancels one that starts after it closes. The
+download may follow a redirect to another origin (a presigned S3 URL, say). If that directory cannot be set up (its CDP
+session does not open in **30 seconds**, or setting the directory fails), a call with `clickSelector` is **refused before
+the click** and says "not clicked": without it the file would land where the relay cannot read it, after the server may
+already have charged for it. A call without `clickSelector` still falls back to Playwright's `saveAs`. If a finished download
+cannot be found in that directory and `saveAs` fails too, the directory is **kept** and its path is named in the error
+(the file may be a charged one); it is removed only once it has been idle for 24 hours. `timeoutMs` (the click, and the
+wait for the download to start) is capped at **1 hour**, so a waiting directory is never idle long enough to be swept.
+
+**Downloads in other tabs are not covered.** The directory setting is browser-wide but the tool's session belongs to one
+tab. While a call runs, a download started in **another tab** also lands in the tool's directory: if it finishes during
+the call, its file is deleted with the directory; if it is still running when the call ends, Chrome cancels it a few
+seconds later and may recreate the directory with an empty file. Each call therefore starts by removing every directory
+an earlier call of the same relay made, and any other `relay-download-*` directory of the same user whose newest file is
+more than **24 hours** old (its relay has gone). Avoid starting other downloads while `download_capture` runs.
 
 **One call at a time.** The download directory is browser-wide, so concurrent `download_capture` calls queue and run one
-after another; none is refused for that.
+after another. A queued call waits at most **2 minutes** for its turn; then it is refused without clicking (calling again
+is not a repeat click). Each CDP step the tool takes (opening its session, setting the directory, cancelling, detaching)
+is given up after **10 seconds**, so one hung step cannot block every later download. When a queued call's turn comes,
+the page's origin + path is checked again right before the click: if the page has moved, the call is refused, not
+clicked. A queued call is also dropped when its caller cancels the request — **not yet wired:** the handler accepts the
+MCP request's abort signal, but `relay-server.js` does not pass it on (`docs/BACKLOG.md`), so today the 2-minute wait and
+the page check are what stop a call whose caller has gone. Removing the tool's directory never changes the call's
+result: a failed removal is logged, and the removal is always tried again 1 s and 5 s later.
 
-**A stalled download is given up.** Once a download has started, the tool waits at most **10 minutes** for it to finish,
-then cancels it, removes its directory and returns an error.
+**A stalled download is given up.** Once a download has started, the tool cancels it after **2 minutes without
+progress** (Chrome's download-progress events on the tool's own CDP session, for the captured download only — matched by
+URL and suggested filename, so another download in the tab cannot keep it alive), removes its directory and returns an
+error. Pass `stallMs` (1 s to 30 min) to change that limit for a slow export. A large download that keeps progressing is
+not cancelled; pass `maxDownloadMs` for an overall limit from the download's start. If Chrome reports no progress at all
+for the download, a fixed limit applies instead: **10 minutes**, or `stallMs` if that is longer.
 
-**Repeat clicks are refused.** A second `clickSelector` click on the same page — the **origin + path** of the page's URL
-when the call starts, so another query string or fragment is the same page — and the same selector within **10 minutes** is
-refused unless the call passes `allowRepeatClick: true`: a retry of a paid download can buy it again (2026-11-16: each
-retry re-licensed an Adobe Stock asset). The click is reserved when the call starts, before anything else happens, in
-`.download-clicks.json` in the relay's cache root (`~/Library/Caches/browser-mcp-relay/` on macOS; a hash of page +
-selector, never the URL; locked like the other cache files), so a concurrent call, a restarted or resumed relay, and
-another relay of the same user all see it. Once the click has been **attempted**, the reservation stands whatever
-happened — a click Playwright dispatched can still time out waiting for the navigation it started. It is released only
-when the call ends before the click is attempted. An unreadable reservation file refuses the click (remove the file to
-reset). Every failure after a click is attempted (the click itself, no download, a failed or stalled download, a failed
-save) says the server may already have served or charged for the file: check before clicking again.
+**Repeat clicks are refused.** A second `clickSelector` click on the same page — the **origin + path** of the page's URL,
+so another query string or fragment is the same page — and the same selector within **10 minutes of the earlier click
+attempt** is refused unless the call passes `allowRepeatClick: true`: a retry of a paid download can buy it again
+(2026-11-16: each retry re-licensed an Adobe Stock asset). The click is reserved when the call starts, before anything
+else happens, in `.download-clicks.json` in the relay's cache root (`~/Library/Caches/browser-mcp-relay/` on macOS; a hash
+of page + selector, never the URL; mode 0600, locked like the other cache files), so a concurrent call, a restarted or
+resumed relay, and another relay of the same user (another session or browser profile) all see it; the refusal says
+whether this relay or another one reserved or made the earlier click (a queued call may not have clicked yet). Right before the click the reservation's time is rewritten to
+that moment, so a call that waited in the queue is still covered for the full 10 minutes after its click. Once the click
+has been **attempted**, the reservation stands whatever happened — a click Playwright dispatched can still time out
+waiting for the navigation it started. It is released only when the call ends before the click is attempted.
+`allowRepeatClick` overrides that one page + selector only. An unreadable reservation file refuses every `clickSelector`
+call, `allowRepeatClick` included; removing the file resets it, which also clears every other relay's reservations.
+Every failure after a click is attempted (the click itself, no download, a failed, stalled or over-limit download, a
+failed save) says the server may already have served or charged for the file: check before clicking again.
 **Not covered:** a different selector for the same button, and an `interaction_click` (or `execute`) followed by
 `download_capture` without `clickSelector` — the guard sees only `download_capture`'s own clicks.
 

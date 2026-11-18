@@ -181,7 +181,18 @@ Hit on an ephemeral clone session (`launch-project-isolated.js`). The reporter w
    10 min is refused without `allowRepeatClick: true` (docs/REFERENCE.md). Review round 1 (same branch): calls are
    queued (the download dir is browser-wide), a download that never finishes is given up after 10 min, and the click is
    reserved at call start in `<cache root>/.download-clicks.json` (origin + path + selector, kept once the click is
-   attempted, seen across restarts and relays). Item 4 below is still open. Original report:
+   attempted, seen across restarts and relays). Review round 2 (`fix/download-r2`): a failed own-dir removal no longer
+   changes the result; the 10-min window runs from the click attempt; every CDP step is bounded (10 s); a queued call
+   gives up after 2 min, and is refused if the page's origin + path changed before its turn; a started download is
+   cancelled after 2 min without progress (`maxDownloadMs` for an overall limit); `allowRepeatClick` no longer resets an
+   unreadable reservation file. **Still open — abort signal not wired:** `download_capture`'s handler drops a queued
+   call when its second argument's `signal` aborts (the MCP SDK aborts it on `notifications/cancelled` and on transport
+   close), but `src/index.js` (`CallToolRequestSchema` handler) and `relay-server.js` (`own.handler(args || {})`) do not
+   pass the SDK's `extra` through — about two lines, outside that fix's scope (the coordinator wires it after merge).
+   Review round 3: a `clickSelector` call whose own dir cannot be set up is refused before the click; `newCDPSession`
+   gets 30 s; stale `relay-download-*` dirs are swept at each call's start; the stall limit follows only the captured
+   download; `stallMs` added. **Known gap:** downloads in other tabs during a call land in its dir (documented in
+   REFERENCE.md). Item 4 below is still open. Original report:
    **`saveAs` fails with ENOENT.** With `clickSelector`, the download started, then
    `download.saveAs: ENOENT … copyfile …/T/playwright-artifacts-<A>/<guid> -> <savePath>` — while a file with the SAME guid
    existed under a different `playwright-artifacts-<B>/`. *Hypothesis:* two Playwright CDP clients on one browser (the
