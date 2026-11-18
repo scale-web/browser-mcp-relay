@@ -214,3 +214,61 @@ test("pin lock: a timed-out exclusive leaves the queue — shared holds queued b
   s1();
   await lockIsFree();
 });
+
+// ───── final review of 5ec97f6 (2026-11-17), LOWs 1 and 3 ─────
+
+test("5ec97f6 L1: a tabs_select refused behind another tabs_* call names running calls, without the forwarded-call 180 s note", T, async (t) => {
+  const { b, up, relay } = setup(t, { pinWaitMs: 300 });
+  setActivePage(b);
+  const pinned = up.targetId;
+  const held = await pinLock.exclusive({ label: "tabs_new" }); // another tabs_* call running
+  t.after(() => held());
+  const rs = await relay.handleToolsCall({ name: "tabs_select", arguments: { index: 0 } });
+  held();
+  assert.strictEqual(rs.isError, true, JSON.stringify(rs));
+  const msg = rs.content.map((c) => c.text).join("\n");
+  assert.match(msg, /REFUSED/);
+  assert.match(msg, /running call\(s\)/, msg);
+  assert.match(msg, /tabs_new \(running \d+ s\)/, msg);
+  assert.doesNotMatch(msg, /upstream call/, msg);
+  assert.doesNotMatch(msg, /180 s/, msg);
+  assert.strictEqual(up.targetId, pinned, "the pin did not move");
+  await lockIsFree();
+});
+
+test("5ec97f6 L1: behind a forwarded call, the refusal keeps the 180 s / cancel note", T, async (t) => {
+  const { b, relay } = setup(t, { pinWaitMs: 300 });
+  setActivePage(b);
+  const held = await pinLock.shared({ label: "interaction_click" }); // a forwarded call running
+  t.after(() => held());
+  const rs = await relay.handleToolsCall({ name: "tabs_select", arguments: { index: 0 } });
+  held();
+  const msg = rs.content.map((c) => c.text).join("\n");
+  assert.strictEqual(rs.isError, true, msg);
+  assert.match(msg, /running call\(s\)/, msg);
+  assert.match(msg, /interaction_click \(running \d+ s\)/, msg);
+  assert.match(msg, /180 s/, msg);
+  assert.match(msg, /cancel/, msg);
+  await lockIsFree();
+});
+
+test("5ec97f6 L3: a tabs_select whose caller aborts while it waits for the pin is dropped — the pin does not move", T, async (t) => {
+  const { b, up, relay } = setup(t);
+  setActivePage(b);
+  const pinned = up.targetId;
+  const held = await pinLock.shared({ label: "interaction_click" });
+  t.after(() => held());
+  const ac = new AbortController();
+  const select = relay.handleToolsCall({ name: "tabs_select", arguments: { index: 0 } }, { signal: ac.signal });
+  await sleep(30);
+  ac.abort();
+  await sleep(30);
+  held(); // the running call ends; a waiter still queued would now be granted
+  const r = await within(select, 2000, "the aborted tabs_select");
+  assert.strictEqual(r.isError, true, JSON.stringify(r));
+  const msg = r.content.map((c) => c.text).join("\n");
+  assert.match(msg, /cancel/, msg);
+  assert.doesNotMatch(msg, /not sent to upstream/, msg);
+  assert.strictEqual(up.targetId, pinned, "the cancelled tabs_select never moved the pin");
+  await lockIsFree();
+});

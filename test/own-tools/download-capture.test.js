@@ -619,3 +619,39 @@ for (const [bad, want] of [[null, 30000], [-5, 30000], [Number.NaN, 30000], ["ab
     assert.deepStrictEqual(seen, [want]);
   });
 }
+
+// ───── final review of 5ec97f6 (2026-11-17), LOWs 2 and 4 ─────
+
+test("5ec97f6 L2: a clickSelector call whose savePath is an existing directory is refused before the click; the reservation is released", { timeout: 20000 }, async (t) => {
+  const { file } = stateFor(t);
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), "relay-dl-out-"));
+  t.after(() => fs.rmSync(out, { recursive: true, force: true }));
+  const page = fakePage(t, { waitForEvent: () => sleep(200).then(() => { throw new Error("Timeout 200ms exceeded"); }) });
+  const r = await within(tool.handler({ clickSelector: "#buy", savePath: out, timeoutMs: 200 }), 5000, "the call");
+  assert.strictEqual(r.isError, true, textOf(r));
+  assert.match(textOf(r), /REFUSED/);
+  assert.match(textOf(r), /not clicked/);
+  assert.match(textOf(r), /directory/);
+  assert.ok(textOf(r).includes(out), `names the path: ${textOf(r)}`);
+  assert.strictEqual(page.clicks, 0, "never clicked");
+  const entries = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+  assert.strictEqual(entries[keyOf(page.href, "#buy")], undefined, "the unused reservation is released");
+  assert.deepStrictEqual(fs.readdirSync(out), [], "the directory is left as it was");
+});
+
+test("5ec97f6 L4: a queued call refused because the page moved creates no directories under its savePath", { timeout: 20000 }, async (t) => {
+  stateFor(t);
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), "relay-dl-out-"));
+  t.after(() => fs.rmSync(out, { recursive: true, force: true }));
+  const page = fakePage(t, { waitForEvent: () => sleep(600).then(() => { throw new Error("Timeout 600ms exceeded"); }) });
+  const first = tool.handler({ timeoutMs: 600 });
+  const queued = tool.handler({ clickSelector: "#buy", savePath: path.join(out, "new", "deeper", "x.bin"), timeoutMs: 600 });
+  await sleep(100);
+  page.href = "https://shop.example.test/other-item";
+  const r = await within(queued, 5000, "the queued call");
+  await first;
+  assert.match(textOf(r), /REFUSED/);
+  assert.match(textOf(r), /changed/);
+  assert.strictEqual(page.clicks, 0);
+  assert.deepStrictEqual(fs.readdirSync(out), [], "no empty directories left in the chosen path");
+});

@@ -37,7 +37,9 @@
 // reservation released (review r3 M1): the saveAs fallback cannot work in the
 // relay, so clicking would risk a charged download with no file; a call without
 // clickSelector still falls back to saveAs. A clickSelector call whose savePath's
-// directory cannot be created or written is refused before its click too, and
+// directory cannot be created or written, or whose savePath is an existing
+// directory, is refused before its click too (checked after the other pre-click
+// refusals, so those create no directories — final review of 5ec97f6), and
 // once the download has finished in the own dir, a failed copy to savePath (its
 // parent became a file, a full disk) keeps the own dir and names the file in
 // the error rather than deleting a possibly charged file (review of 140cf47,
@@ -394,7 +396,7 @@ module.exports = {
       },
       savePath: {
         type: "string",
-        description: "Optional output file path. Default: OS temp dir + suggested filename. With clickSelector, a directory that cannot be created or written is refused before the click.",
+        description: "Optional output file path. Default: OS temp dir + suggested filename. With clickSelector, a directory that cannot be created or written, or a savePath that is an existing directory, is refused before the click.",
       },
       timeoutMs: {
         type: "integer",
@@ -600,28 +602,28 @@ function finishOrGiveUp(download, progress, { maxDownloadMs, stallMs }) {
   return Promise.race([download.failure(), watchdog]).finally(() => clearTimeout(timer));
 }
 
+/** Why `savePath` cannot take the file (synchronous; creates its parent), or null. */
+function savePathProblem(savePath) {
+  let st = null;
+  try { st = fs.statSync(savePath, { throwIfNoEntry: false }); } catch { /* checked below via its parent */ }
+  if (st && st.isDirectory()) return `savePath ${savePath} is an existing directory, not a file path`;
+  const parent = path.dirname(savePath);
+  try {
+    fs.mkdirSync(parent, { recursive: true });
+    fs.accessSync(parent, fs.constants.W_OK);
+  } catch (e) {
+    return `savePath's directory ${parent} cannot be created or written (${e.code || e.message})`;
+  }
+  return null;
+}
+
 /** The click, the wait and the copy; the caller owns `dir` and its CDP session. */
 async function capture({ page, clickSelector, savePath, timeoutMs, limits, downloadPromise, closePromise, onClose, dir, st, reservation, allowRepeat, signal, progress }) {
   if (clickSelector) {
     // At the click, with no await from here to page.click (see the header).
     let refusal = null;
-    let destProblem = null;
-    if (savePath) {
-      // The destination is checked before the click (review of 140cf47, M1):
-      // a click whose file cannot be written risks a charged download with
-      // nowhere to put it. Synchronous, so still no await before page.click.
-      const parent = path.dirname(savePath);
-      try {
-        fs.mkdirSync(parent, { recursive: true });
-        fs.accessSync(parent, fs.constants.W_OK);
-      } catch (e) {
-        destProblem = `savePath's directory ${parent} cannot be created or written (${e.code || e.message})`;
-      }
-    }
     if (signal && signal.aborted) {
       refusal = refused("the caller cancelled the request before its turn — not clicked, nothing captured.");
-    } else if (destProblem) {
-      refusal = refused(`${destProblem} — not clicked, nothing captured. Pass a savePath in a writable directory; calling again is not a repeat click.`);
     } else if (reservation && clickKeyOf(page.url(), clickSelector) !== reservation.key) {
       refusal = refused("the page's address (origin + path) changed while this call waited for its turn — not clicked. "
         + "Go back to the page and call again if that click is still wanted; it is not a repeat click.");
@@ -630,6 +632,16 @@ async function capture({ page, clickSelector, savePath, timeoutMs, limits, downl
       if (c.error) refusal = refused(`${c.error}. A click could not be checked against recent clicks, so it was not made.`);
       else if (c.prevAt !== undefined) refusal = repeatRefusal(clickSelector, c.prevAt, c.prevPid);
       else reservation.at = c.at;
+    }
+    // The destination is checked before the click (review of 140cf47, M1): a
+    // click whose file cannot be written risks a charged download with nowhere
+    // to put it. Last, so a call refused for another reason makes no
+    // directories in the caller's path (final review of 5ec97f6, L4); a
+    // savePath that is an existing directory is refused too (L2). Synchronous,
+    // so still no await before page.click.
+    const destProblem = !refusal && savePath ? savePathProblem(savePath) : null;
+    if (destProblem) {
+      refusal = refused(`${destProblem} — not clicked, nothing captured. Pass a file path in a writable directory; calling again is not a repeat click.`);
     }
     if (refusal) {
       if (onClose) page.off("close", onClose);

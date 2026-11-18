@@ -16,8 +16,8 @@
 // hold until upstream answers or its 180 s request timeout. An acquire with
 // `waitMs` gives up after that long, and one with `signal` when it aborts; it
 // rejects with an Error (code PIN_LOCK_TIMEOUT / PIN_LOCK_ABORTED) whose
-// `holders` names what held the lock, and leaves the queue as if it had never
-// asked. A hold already granted is NOT released when its caller aborts: the
+// `holders` names what held the lock (and `sharedHeld` says whether a shared
+// hold was among them), and leaves the queue as if it had never asked. A hold already granted is NOT released when its caller aborts: the
 // upstream call keeps running in upstream (a cancel is not forwarded), and
 // moving the pin under it could send the rest of it to another tab.
 
@@ -45,6 +45,11 @@ function describeHolders(now = Date.now()) {
   return [...holders].map((h) => `${h.label} (running ${Math.round((now - h.since) / 1000)} s)`);
 }
 
+/** Whether a shared hold (a forwarded upstream call) is among the holders. */
+function sharedHeld() {
+  return [...holders].some((h) => !h.exclusive);
+}
+
 /** Resolves to release(); a second release() is a no-op. Rejects when `waitMs`
  *  passes or `signal` aborts before the hold is granted (see the header). */
 function acquire(exclusive, { label = "(unnamed)", waitMs = null, signal = null } = {}) {
@@ -59,6 +64,7 @@ function acquire(exclusive, { label = "(unnamed)", waitMs = null, signal = null 
       const e = new Error(why);
       e.code = code;
       e.holders = describeHolders(); // what it waited for, before the grant below
+      e.sharedHeld = sharedHeld();
       queue.splice(i, 1);
       done();
       grant(); // a removed exclusive may have held back shared holds behind it
@@ -66,7 +72,7 @@ function acquire(exclusive, { label = "(unnamed)", waitMs = null, signal = null 
     }
     entry.resolve = () => {
       done();
-      const h = { label, since: Date.now() };
+      const h = { label, since: Date.now(), exclusive };
       holders.add(h);
       let released = false;
       resolve(() => {
@@ -81,6 +87,7 @@ function acquire(exclusive, { label = "(unnamed)", waitMs = null, signal = null 
       const e = new Error("the caller cancelled the request before it ran");
       e.code = "PIN_LOCK_ABORTED";
       e.holders = describeHolders();
+      e.sharedHeld = sharedHeld();
       return reject(e);
     }
     queue.push(entry);

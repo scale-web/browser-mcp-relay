@@ -65,9 +65,10 @@ relay re-pins upstream to the tab `tabs_new` / `tabs_select` last selected, if i
 before any check the relay makes of upstream's page; a `tabs_new` / `tabs_select` waits for running upstream calls to
 finish, and upstream calls sent after it (from the moment it arrives, before its own Brave and policy steps) wait for it,
 so a check and the call it allows act on one tab. That wait is bounded: after **15 seconds** the `tabs_new` /
-`tabs_select` is refused, upstream's tab is not moved, and the refusal names the running calls (a hung upstream call
-ends when upstream answers or after 180 s; cancelling it does not end it in upstream, so it keeps its hold until then).
-An upstream call whose caller cancels it while it waits for a `tabs_new` / `tabs_select` is dropped, never sent.
+`tabs_select` is refused, upstream's tab is not moved, and the refusal names the running calls (tool names only; when one
+is an upstream call, it adds that such a call ends when upstream answers or after 180 s — cancelling it does not end it
+in upstream, so it keeps its hold until then). A call whose caller cancels it while it waits is dropped: an upstream call
+is never sent, and a `tabs_new` / `tabs_select` never moves upstream's tab.
 Upstream's own first tab, opened when it starts, is closed by the first pin while it is still blank. `tabs_new` navigates
 a leftover blank only when it is the relay's (Brave's launch tab, or one `tabs_new` made), never an attached Brave's or
 the user's. **Console and network capture** (`o11y_*`) follow the pin: a tab records into upstream's buffers only while
@@ -130,8 +131,9 @@ already have charged for it. A call without `clickSelector` still falls back to 
 cannot be found in that directory and `saveAs` fails too, the directory is **kept** and its path is named in the error
 (the file may be a charged one); it is removed only once it has been idle for 24 hours. The same holds when the file was
 found but copying it to `savePath` fails (its parent became a file, the disk is full): the directory is kept and the error
-names the file in it. A call with `clickSelector` whose `savePath` directory cannot be created or written is **refused
-before the click** ("not clicked"). `timeoutMs` (the click, and the wait for the download to start) is capped at
+names the file in it. A call with `clickSelector` whose `savePath` directory cannot be created or written, or whose
+`savePath` is an existing directory, is **refused before the click** ("not clicked"); that check runs after the other
+pre-click refusals, so a call refused for another reason creates no directories in `savePath`. `timeoutMs` (the click, and the wait for the download to start) is capped at
 **1 hour**, so a waiting directory is never idle long enough to be swept; `0` means that cap, and a null, negative or
 non-numeric value means the 30-second default.
 

@@ -32,7 +32,7 @@ const requestBodyFilter = require("./request-body-filter.js");
 
 // The own tools that move upstream's pin (_pin-lock.js: they run exclusive).
 const PIN_MOVERS = new Set(["tabs_new", "tabs_select"]);
-// How long a tabs_new / tabs_select waits for running upstream calls before it
+// How long a tabs_new / tabs_select waits for running calls before it
 // is refused, naming them (review of 140cf47, L3): a hung upstream call holds
 // its shared hold until upstream answers or 180 s pass.
 const PIN_WAIT_MS = 15 * 1000;
@@ -214,21 +214,31 @@ class RelayServer {
       // call that check allowed. Both are taken when the call arrives, before
       // the policy and ensureBrave steps, so calls keep the order they were
       // sent in (review of 140cf47, L3). A tabs_* call waits at most
-      // pinWaitMs, then is refused naming the running calls; a forwarded call
-      // whose caller aborts while it waits is dropped, never forwarded.
+      // pinWaitMs, then is refused naming the running calls (tool names only;
+      // the 180 s note only when one is a forwarded call — final review of
+      // 5ec97f6, L1). Any call whose caller aborts while it waits is dropped:
+      // a forwarded one is never forwarded, a tabs_* one never moves the pin
+      // (L3).
       let lockRefusal = null;
       if (!blocked && (!isOwn || PIN_MOVERS.has(name))) {
         try {
           pinHold = isOwn
-            ? await pinLock.exclusive({ label: name, waitMs: this.pinWaitMs })
+            ? await pinLock.exclusive({ label: name, waitMs: this.pinWaitMs, signal: extra && extra.signal })
             : await pinLock.shared({ label: name, signal: extra && extra.signal });
         } catch (e) {
           if (e.code !== "PIN_LOCK_TIMEOUT" && e.code !== "PIN_LOCK_ABORTED") throw e;
-          const text = e.code === "PIN_LOCK_TIMEOUT"
-            ? `${name} REFUSED: waited ${Math.round(this.pinWaitMs / 1000)} s for running upstream call(s) to finish: `
-              + `${e.holders.join(", ") || "(none named)"}. Upstream's tab was not moved. Such a call ends when upstream `
-              + "answers or after 180 s (cancelling it does not end it in upstream); try again then."
-            : `${name} REFUSED: the caller cancelled the request while it waited for a tabs_new / tabs_select to finish — not sent to upstream.`;
+          let text;
+          if (e.code === "PIN_LOCK_TIMEOUT") {
+            text = `${name} REFUSED: waited ${Math.round(this.pinWaitMs / 1000)} s for running call(s) to finish: `
+              + `${e.holders.join(", ") || "(none named)"}. Upstream's tab was not moved. `
+              + (e.sharedHeld
+                ? "A forwarded upstream call ends when upstream answers or after 180 s (cancelling it does not end it in upstream); try again then."
+                : "Try again when it finishes.");
+          } else if (isOwn) {
+            text = `${name} REFUSED: the caller cancelled the request while it waited for running call(s) to finish — upstream's tab was not moved.`;
+          } else {
+            text = `${name} REFUSED: the caller cancelled the request while it waited for a tabs_new / tabs_select to finish — not sent to upstream.`;
+          }
           lockRefusal = { content: [{ type: "text", text }], isError: true };
         }
       }

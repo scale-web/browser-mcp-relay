@@ -204,7 +204,11 @@ Hit on an ephemeral clone session (`launch-project-isolated.js`). The reporter w
    the pin lock when they arrive, wait for it at most 15 s and are then refused naming the running upstream calls, and a
    forwarded call cancelled while it waits for them is dropped (a granted hold is not released on cancel: the call keeps
    running in upstream); L4 — a null, negative or non-numeric `timeoutMs` is the 30 s default, not the 1 h cap;
-   L5 — a test that a forwarded call that throws releases its pin hold. **Known gap:** downloads in other tabs during a
+   L5 — a test that a forwarded call that throws releases its pin hold. **LOWs from the final review of `5ec97f6`
+   (branch `fix/relay-lows-r1`, ask as-ops/ask-ovq5im):** the 15 s refusal says "running call(s)" and adds the 180 s /
+   cancel note only when a forwarded call holds the pin; a `savePath` that is an existing directory is refused before the
+   click; a cancelled `tabs_new` / `tabs_select` waiting for the pin is dropped (never moves it); the `savePath` check
+   runs after the other pre-click refusals, so they leave no empty directories. **Known gap:** downloads in other tabs during a
    call land in its dir (documented in REFERENCE.md). Item 4 below is still open. Original report:
    **`saveAs` fails with ENOENT.** With `clickSelector`, the download started, then
    `download.saveAs: ENOENT … copyfile …/T/playwright-artifacts-<A>/<guid> -> <savePath>` — while a file with the SAME guid
