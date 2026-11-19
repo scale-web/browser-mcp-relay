@@ -29,7 +29,10 @@ if (isolated()) {
   process.env.BROWSER_RELAY_INSECURE_TLS = "1"; // the local server's self-signed cert
 }
 
-const { launchBrave, closeBrave, attachBrave } = require("../src/cdp-bridge.js");
+const { launchBrave, closeBrave, attachBrave, codesignCloneSwap } = require("../src/cdp-bridge.js");
+// Direct launches below take the relay's MacAppCodeSignClone swap too: a harness
+// kill would otherwise leave a code_sign_clone copy of Brave behind.
+const SWAP = codesignCloneSwap();
 const id = require("../src/cdp-identity.js");
 const pool = require("../src/pool-shared.js");
 const lock = require("../src/profile-lock.js");
@@ -200,7 +203,8 @@ test("attach-first: a legacy fixed-port Brave (pre-change relay) is attached via
   // Playwright's defaults — the mock keychain stays on.
   const ctx = await chromium.launchPersistentContext(dir, {
     headless: true, executablePath: BRAVE, handleSIGINT: false, handleSIGTERM: false,
-    args: [`--remote-debugging-port=${port}`, ...require("../src/cdp-bridge.js").TEST_LAUNCH_ARGS],
+    args: [`--remote-debugging-port=${port}`, ...require("../src/cdp-bridge.js").TEST_LAUNCH_ARGS, ...SWAP.args],
+    ignoreDefaultArgs: SWAP.ignoreDefaultArgs,
   });
   try {
     await new Promise((r) => setTimeout(r, 300));
@@ -338,7 +342,8 @@ test("Meta guard: a service-worker-served Meta navigation never shows Meta conte
   const dir = homeTmp("guard-sw-");
   const ctx = await chromium.launchPersistentContext(dir, {
     headless: true, executablePath: BRAVE, handleSIGINT: false, handleSIGTERM: false,
-    args: ["--remote-debugging-port=0", "--ignore-certificate-errors", ...require("../src/cdp-bridge.js").TEST_LAUNCH_ARGS],
+    args: ["--remote-debugging-port=0", "--ignore-certificate-errors", ...require("../src/cdp-bridge.js").TEST_LAUNCH_ARGS, ...SWAP.args],
+    ignoreDefaultArgs: SWAP.ignoreDefaultArgs,
   });
   let g;
   try {
@@ -371,7 +376,8 @@ test("Meta guard: a URL the Fetch layer just blocked, then served by a service w
   const dir = homeTmp("guard-sw2-");
   const ctx = await chromium.launchPersistentContext(dir, {
     headless: true, executablePath: BRAVE, handleSIGINT: false, handleSIGTERM: false,
-    args: ["--remote-debugging-port=0", "--ignore-certificate-errors", ...require("../src/cdp-bridge.js").TEST_LAUNCH_ARGS],
+    args: ["--remote-debugging-port=0", "--ignore-certificate-errors", ...require("../src/cdp-bridge.js").TEST_LAUNCH_ARGS, ...SWAP.args],
+    ignoreDefaultArgs: SWAP.ignoreDefaultArgs,
   });
   let g;
   try {

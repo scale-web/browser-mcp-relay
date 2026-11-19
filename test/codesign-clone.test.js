@@ -1,7 +1,7 @@
 // codesign-clone.test.js — Brave must launch with Chromium's MacAppCodeSignClone
-// feature disabled (macOS). With it on, every launch copies the whole browser app
-// under /private/var/folders/.../X/com.brave.Browser.code_sign_clone/, and a Brave
-// that is killed rather than quit leaves that copy behind (65 copies, 37 GB, by
+// feature disabled (macOS). With it on, Brave makes a copy of the whole app under
+// /private/var/folders/.../X/com.brave.Browser.code_sign_clone/ at every launch,
+// left behind on kill and, as measured, on a clean close too (65 copies, 37 GB, by
 // 2026-11-19; issues.chromium.org/379125944).
 //
 // Chromium honours only the LAST --disable-features on its command line, and
@@ -83,4 +83,99 @@ test("Playwright's default list unreadable: nothing is added, so Playwright's ow
   const df = argv.filter((a) => a.startsWith("--disable-features"));
   assert.strictEqual(df.length, 1);
   assert.deepStrictEqual(features(df[0]), await playwrightDefaultDisabled());
+});
+
+// ── the swap as one helper (the test harness's own direct launches use it too) ──
+
+test("codesignCloneSwap: macOS → one merged entry for args + Playwright's own for ignoreDefaultArgs; elsewhere or unreadable → nothing", () => {
+  const PWDF = bridge.PLAYWRIGHT_DISABLE_FEATURES;
+  assert.deepStrictEqual(bridge.codesignCloneSwap({ platform: "darwin" }), { args: [`${PWDF},MacAppCodeSignClone`], ignoreDefaultArgs: [PWDF] });
+  assert.deepStrictEqual(bridge.codesignCloneSwap({ platform: "linux" }), { args: [], ignoreDefaultArgs: [] });
+  assert.deepStrictEqual(bridge.codesignCloneSwap({ platform: "darwin", playwrightDisableFeatures: null }), { args: [], ignoreDefaultArgs: [] });
+  const already = "--disable-features=A,MacAppCodeSignClone";
+  assert.deepStrictEqual(bridge.codesignCloneSwap({ platform: "darwin", playwrightDisableFeatures: already }).args, [already], "no duplicate");
+  const b = bridge.buildLaunchArgs({ headless: true, platform: "darwin" });
+  assert.ok(b.args.includes(`${PWDF},MacAppCodeSignClone`) && b.ignoreDefaultArgs.includes(PWDF), "buildLaunchArgs carries the same swap");
+});
+
+test("the four direct test launches spread codesignCloneSwap() (they would otherwise leave a copy on every harness kill)", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  let n = 0;
+  for (const f of ["isolated-brave.test.js", "isolated-relay-e2e.test.js"]) {
+    const src = fs.readFileSync(path.join(__dirname, f), "utf8");
+    for (const m of src.matchAll(/chromium\.launchPersistentContext\(([\s\S]*?)\n  \}\);/g)) {
+      n++;
+      assert.match(m[1], /\.\.\.SWAP\.args/, `${f}: a direct launch without the swap in args`);
+      assert.match(m[1], /ignoreDefaultArgs: SWAP\.ignoreDefaultArgs/, `${f}: a direct launch without the swap in ignoreDefaultArgs`);
+    }
+  }
+  assert.strictEqual(n, 4, "four direct launches");
+});
+
+// ── the warning when Playwright's list cannot be read (stubbed launch) ────────
+
+const fsx = require("node:fs");
+const osx = require("node:os");
+const pathx = require("node:path");
+const Module = require("node:module");
+const { spawnSync } = require("node:child_process");
+const REPO = pathx.resolve(__dirname, "..");
+
+/** cdp-bridge.js SOURCE loaded with chromium stubbed (records options, never launches);
+ *  `unreadable` makes Playwright's chromiumSwitches.js fail to load. */
+function loadStubbed(source, filename, { unreadable }) {
+  const captured = [];
+  const stub = { chromium: { launchPersistentContext: async (dir, opts) => { captured.push(opts); throw new Error("STUB-NO-LAUNCH"); } } };
+  const m = new Module(filename, module);
+  m.filename = filename;
+  m.paths = Module._nodeModulePaths(pathx.join(REPO, "src"));
+  const realRequire = m.require.bind(m);
+  m.require = (id) => {
+    if (id === "playwright-core") return stub;
+    if (unreadable && id.endsWith("chromiumSwitches.js")) throw new Error("TEST: moved by an upgrade");
+    if (id.startsWith("./")) return require(pathx.join(REPO, "src", id));
+    return realRequire(id);
+  };
+  m._compile(source, filename);
+  return { mod: m.exports, captured };
+}
+
+async function launchCapturingStderr(mod, opts) {
+  const lines = [];
+  const orig = process.stderr.write;
+  process.stderr.write = (chunk, ...rest) => { lines.push(String(chunk)); return true; };
+  try {
+    await assert.rejects(mod.launchBrave(opts), /STUB-NO-LAUNCH/);
+  } finally {
+    process.stderr.write = orig;
+  }
+  return lines.join("");
+}
+
+test("Playwright's list unreadable (stubbed launch): one warning line, and the launch options are IDENTICAL to main's", { skip: process.platform !== "darwin" ? "darwin" : false }, async (t) => {
+  const r = spawnSync("git", ["show", "main:src/cdp-bridge.js"], { cwd: REPO, encoding: "utf8" });
+  if (r.status !== 0) return t.skip("no git / no main ref");
+  const curSrc = fsx.readFileSync(pathx.join(REPO, "src", "cdp-bridge.js"), "utf8");
+  const cur = loadStubbed(curSrc, pathx.join(REPO, "src", "cdp-bridge.unreadable.js"), { unreadable: true });
+  const main = loadStubbed(r.stdout, pathx.join(REPO, "src", "cdp-bridge.main3.js"), { unreadable: false });
+  const ok = loadStubbed(curSrc, pathx.join(REPO, "src", "cdp-bridge.readable.js"), { unreadable: false });
+  assert.strictEqual(cur.mod.PLAYWRIGHT_DISABLE_FEATURES, null, "precondition: the list is unreadable");
+  delete process.env.BROWSER_RELAY_TEST_LAUNCH;
+  delete process.env.BROWSER_RELAY_INSECURE_TLS;
+  for (const headless of [true, false]) {
+    const dirs = [0, 1, 2].map(() => fsx.mkdtempSync(pathx.join(osx.tmpdir(), "csclone-warn-")));
+    const errCur = await launchCapturingStderr(cur.mod, { userDataDir: dirs[0], headless });
+    await launchCapturingStderr(main.mod, { userDataDir: dirs[1], headless });
+    const errOk = await launchCapturingStderr(ok.mod, { userDataDir: dirs[2], headless });
+    const warn = /could not read Playwright's default --disable-features — MacAppCodeSignClone stays on/g;
+    assert.strictEqual((errCur.match(warn) || []).length, 1, `headless=${headless}: one warning line, got: ${errCur}`);
+    assert.strictEqual((errOk.match(warn) || []).length, 0, "no warning when the list is read");
+    const a = main.captured.pop();
+    const b = cur.captured.pop();
+    for (const k of ["args", "ignoreDefaultArgs", "ignoreHTTPSErrors", "headless", "handleSIGINT", "handleSIGTERM"]) {
+      assert.deepStrictEqual(b[k], a[k], `headless=${headless} ${k}`);
+    }
+    for (const d of dirs) fsx.rmSync(d, { recursive: true, force: true });
+  }
 });

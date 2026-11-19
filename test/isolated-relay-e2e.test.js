@@ -19,6 +19,9 @@ const { isolated, SKIP_MSG, homeTmp, nodeChild, killAndWait, REPO } = require(".
 const { startRelay } = require("./helpers/mcp.js");
 const id = require("../src/cdp-identity.js");
 const lock = require("../src/profile-lock.js");
+// The direct Brave launch below takes the relay's MacAppCodeSignClone swap: it is
+// killed, which would otherwise leave a code_sign_clone copy of Brave behind.
+const SWAP = require("../src/cdp-bridge.js").codesignCloneSwap();
 
 let BRAVE = null;
 try { BRAVE = require("../src/detect-browser.js").detectBravePath(); } catch { /* skip */ }
@@ -168,7 +171,8 @@ test("attach-first across relays: a relay killed uncleanly leaves its Brave; the
   fs.mkdirSync(base, { recursive: true });
   const orphan = await chromium.launchPersistentContext(base, {
     headless: true, executablePath: BRAVE, handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false,
-    args: ["--remote-debugging-port=0", ...require("../src/cdp-bridge.js").TEST_LAUNCH_ARGS],
+    args: ["--remote-debugging-port=0", ...require("../src/cdp-bridge.js").TEST_LAUNCH_ARGS, ...SWAP.args],
+    ignoreDefaultArgs: SWAP.ignoreDefaultArgs,
   });
   let a, b;
   try {

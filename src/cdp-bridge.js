@@ -211,9 +211,9 @@ async function openFirstWindow(userDataDir, { stopped = () => false } = {}) {
 }
 
 // ── MacAppCodeSignClone off (macOS) ─────────────────────────────────────────
-// With this Chromium feature on, every launch copies the whole browser app to
-// /private/var/folders/.../X/com.brave.Browser.code_sign_clone/, and a Brave that
-// is killed rather than quit leaves the copy behind: 65 copies, 37 GB, from
+// With this Chromium feature on, Brave makes a copy of the whole app under
+// /private/var/folders/.../X/com.brave.Browser.code_sign_clone/ at every launch,
+// left behind on kill and, as measured, on a clean close too: 65 copies, 37 GB, from
 // 2026-11-13 to 11-19 (issues.chromium.org/379125944,
 // github.com/teamcapybara/capybara/issues/2795). Chromium honours only the LAST
 // --disable-features on its command line, and Playwright passes its own list by
@@ -237,6 +237,19 @@ function readPlaywrightDisableFeatures() {
   }
 }
 const PLAYWRIGHT_DISABLE_FEATURES = readPlaywrightDisableFeatures();
+
+/**
+ * The swap as launch-option pieces: `args` gets the merged --disable-features,
+ * `ignoreDefaultArgs` gets Playwright's own. Empty off macOS or when Playwright's
+ * list cannot be read. buildLaunchArgs uses it; so do the tests that launch a
+ * Brave directly, or every harness kill would leave a copy.
+ */
+function codesignCloneSwap({ platform = process.platform, playwrightDisableFeatures = PLAYWRIGHT_DISABLE_FEATURES } = {}) {
+  if (platform !== "darwin" || !playwrightDisableFeatures) return { args: [], ignoreDefaultArgs: [] };
+  const merged = playwrightDisableFeatures.slice("--disable-features=".length).split(",").filter(Boolean);
+  if (!merged.includes(CODESIGN_CLONE_FEATURE)) merged.push(CODESIGN_CLONE_FEATURE);
+  return { args: [`--disable-features=${merged.join(",")}`], ignoreDefaultArgs: [playwrightDisableFeatures] };
+}
 
 /** BROWSER_RELAY_INSECURE_TLS as launchBrave reads it (the process env). */
 function insecureTlsForced(env = process.env) {
@@ -276,12 +289,9 @@ function buildLaunchArgs({ headless = false, extensionPath = null, testLaunch = 
   // The test hook KEEPS the mock keychain (see TEST_LAUNCH_ARGS above).
   const ignoreDefaultArgs = testLaunch ? [] : ["--use-mock-keychain"];
   if (testLaunch) args.push(...TEST_LAUNCH_ARGS);
-  if (platform === "darwin" && playwrightDisableFeatures) {
-    const merged = playwrightDisableFeatures.slice("--disable-features=".length).split(",").filter(Boolean);
-    if (!merged.includes(CODESIGN_CLONE_FEATURE)) merged.push(CODESIGN_CLONE_FEATURE);
-    ignoreDefaultArgs.push(playwrightDisableFeatures);
-    args.push(`--disable-features=${merged.join(",")}`);
-  }
+  const swap = codesignCloneSwap({ platform, playwrightDisableFeatures });
+  ignoreDefaultArgs.push(...swap.ignoreDefaultArgs);
+  args.push(...swap.args);
   // Headful: no startup window; openFirstWindow adds a background one (it
   // would otherwise activate Brave and steal a full-screen Space). Playwright
   // appends a positional about:blank for persistent contexts — drop it, or
@@ -563,6 +573,7 @@ module.exports = {
   assertTestLaunchAllowed,
   TEST_LAUNCH_ARGS,
   PLAYWRIGHT_DISABLE_FEATURES,
+  codesignCloneSwap,
   _clearSessionRestore: clearSessionRestore,
   _openFirstWindow: openFirstWindow,
   _cdpCall: cdpCall,
