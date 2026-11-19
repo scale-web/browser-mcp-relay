@@ -349,7 +349,7 @@ async function launchBrave({
     headless, extensionPath, testLaunch, platform: process.platform, mode: profileMode,
   });
   if (process.platform === "darwin" && !PLAYWRIGHT_DISABLE_FEATURES) {
-    process.stderr.write(`[mcp-relay] could not read Playwright's default --disable-features — ${CODESIGN_CLONE_FEATURE} stays on, so a killed Brave leaves a code_sign_clone copy behind\n`);
+    process.stderr.write(`[mcp-relay] could not read Playwright's default --disable-features — ${CODESIGN_CLONE_FEATURE} stays on: a code_sign_clone copy of Brave at every launch, left behind on kill and on a clean close too\n`);
   }
   // TLS-cert acceptance is opt-in: a configured proxy implies a MITM cert,
   // and BROWSER_RELAY_INSECURE_TLS is the explicit override for a transparent

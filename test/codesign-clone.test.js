@@ -119,7 +119,6 @@ const fsx = require("node:fs");
 const osx = require("node:os");
 const pathx = require("node:path");
 const Module = require("node:module");
-const { spawnSync } = require("node:child_process");
 const REPO = pathx.resolve(__dirname, "..");
 
 /** cdp-bridge.js SOURCE loaded with chromium stubbed (records options, never launches);
@@ -153,29 +152,39 @@ async function launchCapturingStderr(mod, opts) {
   return lines.join("");
 }
 
-test("Playwright's list unreadable (stubbed launch): one warning line, and the launch options are IDENTICAL to main's", { skip: process.platform !== "darwin" ? "darwin" : false }, async (t) => {
-  const r = spawnSync("git", ["show", "main:src/cdp-bridge.js"], { cwd: REPO, encoding: "utf8" });
-  if (r.status !== 0) return t.skip("no git / no main ref");
+// The launch options from before the swap (main at ee8a7db, macOS, test hook off) —
+// fixed here, not read from git, so the test runs in an archive copy and does not
+// move when main does.
+const PRE_SWAP = {
+  true: { args: ["--remote-debugging-port=0"], ignoreDefaultArgs: ["--use-mock-keychain"] },
+  false: { args: ["--remote-debugging-port=0", "--no-startup-window"], ignoreDefaultArgs: ["--use-mock-keychain", "about:blank"] },
+};
+
+test("Playwright's list unreadable (stubbed launch): one warning line, and the launch options are the pre-swap ones", { skip: process.platform !== "darwin" ? "darwin" : false }, async () => {
   const curSrc = fsx.readFileSync(pathx.join(REPO, "src", "cdp-bridge.js"), "utf8");
   const cur = loadStubbed(curSrc, pathx.join(REPO, "src", "cdp-bridge.unreadable.js"), { unreadable: true });
-  const main = loadStubbed(r.stdout, pathx.join(REPO, "src", "cdp-bridge.main3.js"), { unreadable: false });
   const ok = loadStubbed(curSrc, pathx.join(REPO, "src", "cdp-bridge.readable.js"), { unreadable: false });
   assert.strictEqual(cur.mod.PLAYWRIGHT_DISABLE_FEATURES, null, "precondition: the list is unreadable");
+  const saved = { t: process.env.BROWSER_RELAY_TEST_LAUNCH, i: process.env.BROWSER_RELAY_INSECURE_TLS };
   delete process.env.BROWSER_RELAY_TEST_LAUNCH;
   delete process.env.BROWSER_RELAY_INSECURE_TLS;
-  for (const headless of [true, false]) {
-    const dirs = [0, 1, 2].map(() => fsx.mkdtempSync(pathx.join(osx.tmpdir(), "csclone-warn-")));
-    const errCur = await launchCapturingStderr(cur.mod, { userDataDir: dirs[0], headless });
-    await launchCapturingStderr(main.mod, { userDataDir: dirs[1], headless });
-    const errOk = await launchCapturingStderr(ok.mod, { userDataDir: dirs[2], headless });
-    const warn = /could not read Playwright's default --disable-features — MacAppCodeSignClone stays on/g;
-    assert.strictEqual((errCur.match(warn) || []).length, 1, `headless=${headless}: one warning line, got: ${errCur}`);
-    assert.strictEqual((errOk.match(warn) || []).length, 0, "no warning when the list is read");
-    const a = main.captured.pop();
-    const b = cur.captured.pop();
-    for (const k of ["args", "ignoreDefaultArgs", "ignoreHTTPSErrors", "headless", "handleSIGINT", "handleSIGTERM"]) {
-      assert.deepStrictEqual(b[k], a[k], `headless=${headless} ${k}`);
+  try {
+    for (const headless of [true, false]) {
+      const dirs = [0, 1].map(() => fsx.mkdtempSync(pathx.join(osx.tmpdir(), "csclone-warn-")));
+      const errCur = await launchCapturingStderr(cur.mod, { userDataDir: dirs[0], headless });
+      const errOk = await launchCapturingStderr(ok.mod, { userDataDir: dirs[1], headless });
+      const warn = /could not read Playwright's default --disable-features — MacAppCodeSignClone stays on: a code_sign_clone copy of Brave at every launch, left behind on kill and on a clean close too\n/g;
+      assert.strictEqual((errCur.match(warn) || []).length, 1, `headless=${headless}: one warning line, got: ${errCur}`);
+      assert.strictEqual((errOk.match(warn) || []).length, 0, "no warning when the list is read");
+      const b = cur.captured.pop();
+      assert.deepStrictEqual(
+        { args: b.args, ignoreDefaultArgs: b.ignoreDefaultArgs, ignoreHTTPSErrors: b.ignoreHTTPSErrors, headless: b.headless, handleSIGINT: b.handleSIGINT, handleSIGTERM: b.handleSIGTERM },
+        { ...PRE_SWAP[headless], ignoreHTTPSErrors: false, headless, handleSIGINT: false, handleSIGTERM: false },
+        `headless=${headless}`,
+      );
+      for (const d of dirs) fsx.rmSync(d, { recursive: true, force: true });
     }
-    for (const d of dirs) fsx.rmSync(d, { recursive: true, force: true });
+  } finally {
+    for (const [k, v] of [["BROWSER_RELAY_TEST_LAUNCH", saved.t], ["BROWSER_RELAY_INSECURE_TLS", saved.i]]) if (v !== undefined) process.env[k] = v;
   }
 });
