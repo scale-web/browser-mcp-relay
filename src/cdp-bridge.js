@@ -210,6 +210,34 @@ async function openFirstWindow(userDataDir, { stopped = () => false } = {}) {
   }
 }
 
+// ── MacAppCodeSignClone off (macOS) ─────────────────────────────────────────
+// With this Chromium feature on, every launch copies the whole browser app to
+// /private/var/folders/.../X/com.brave.Browser.code_sign_clone/, and a Brave that
+// is killed rather than quit leaves the copy behind: 65 copies, 37 GB, from
+// 2026-11-13 to 11-19 (issues.chromium.org/379125944,
+// github.com/teamcapybara/capybara/issues/2795). Chromium honours only the LAST
+// --disable-features on its command line, and Playwright passes its own list by
+// default, so the feature is MERGED into that list: Playwright's own flag goes
+// into ignoreDefaultArgs and the merged one into args (test/codesign-clone.test.js).
+const CODESIGN_CLONE_FEATURE = "MacAppCodeSignClone";
+
+/**
+ * Playwright's default `--disable-features=...` switch, read from the installed
+ * playwright-core (chromiumSwitches.js, not in its package exports, so loaded by
+ * file path). The relay never sets assistantMode or a channel, so the call
+ * matches what launchPersistentContext passes. null when it cannot be read.
+ */
+function readPlaywrightDisableFeatures() {
+  try {
+    const file = path.join(path.dirname(require.resolve("playwright-core/package.json")), "lib", "server", "chromium", "chromiumSwitches.js");
+    const found = require(file).chromiumSwitches().filter((a) => a.startsWith("--disable-features="));
+    return found.length === 1 ? found[0] : null;
+  } catch {
+    return null;
+  }
+}
+const PLAYWRIGHT_DISABLE_FEATURES = readPlaywrightDisableFeatures();
+
 /** BROWSER_RELAY_INSECURE_TLS as launchBrave reads it (the process env). */
 function insecureTlsForced(env = process.env) {
   const v = env.BROWSER_RELAY_INSECURE_TLS;
@@ -222,9 +250,12 @@ function insecureTlsForced(env = process.env) {
  * (test/plainflags-mode.test.js pins it); plain-flags (spec v8 §5.6 (1)–(3))
  * adds `--enable-automation` to ignoreDefaultArgs and
  * `--disable-blink-features=AutomationControlled` to args, after everything
- * else, and keeps `--remote-debugging-port=0` (D23).
+ * else, and keeps `--remote-debugging-port=0` (D23). On macOS both modes swap
+ * Playwright's --disable-features for one that also holds MacAppCodeSignClone
+ * (see CODESIGN_CLONE_FEATURE); when Playwright's list cannot be read
+ * (`playwrightDisableFeatures` null) nothing is swapped.
  */
-function buildLaunchArgs({ headless = false, extensionPath = null, testLaunch = false, platform = process.platform, mode = plainflagsMode.DEFAULT } = {}) {
+function buildLaunchArgs({ headless = false, extensionPath = null, testLaunch = false, platform = process.platform, mode = plainflagsMode.DEFAULT, playwrightDisableFeatures = PLAYWRIGHT_DISABLE_FEATURES } = {}) {
   // Port 0: never a fixed port. Two Braves can no longer be handed the same
   // number, so neither can fall back to [::1] and be mistaken for the other.
   // No --remote-debugging-address: Brave binds 127.0.0.1.
@@ -245,6 +276,12 @@ function buildLaunchArgs({ headless = false, extensionPath = null, testLaunch = 
   // The test hook KEEPS the mock keychain (see TEST_LAUNCH_ARGS above).
   const ignoreDefaultArgs = testLaunch ? [] : ["--use-mock-keychain"];
   if (testLaunch) args.push(...TEST_LAUNCH_ARGS);
+  if (platform === "darwin" && playwrightDisableFeatures) {
+    const merged = playwrightDisableFeatures.slice("--disable-features=".length).split(",").filter(Boolean);
+    if (!merged.includes(CODESIGN_CLONE_FEATURE)) merged.push(CODESIGN_CLONE_FEATURE);
+    ignoreDefaultArgs.push(playwrightDisableFeatures);
+    args.push(`--disable-features=${merged.join(",")}`);
+  }
   // Headful: no startup window; openFirstWindow adds a background one (it
   // would otherwise activate Brave and steal a full-screen Space). Playwright
   // appends a positional about:blank for persistent contexts — drop it, or
@@ -301,6 +338,9 @@ async function launchBrave({
   const { args, ignoreDefaultArgs, backgroundFirstWindow } = buildLaunchArgs({
     headless, extensionPath, testLaunch, platform: process.platform, mode: profileMode,
   });
+  if (process.platform === "darwin" && !PLAYWRIGHT_DISABLE_FEATURES) {
+    process.stderr.write(`[mcp-relay] could not read Playwright's default --disable-features — ${CODESIGN_CLONE_FEATURE} stays on, so a killed Brave leaves a code_sign_clone copy behind\n`);
+  }
   // TLS-cert acceptance is opt-in: a configured proxy implies a MITM cert,
   // and BROWSER_RELAY_INSECURE_TLS is the explicit override for a transparent
   // corporate proxy. Anything else gets normal certificate validation.
@@ -522,6 +562,7 @@ module.exports = {
   testLaunchRequested,
   assertTestLaunchAllowed,
   TEST_LAUNCH_ARGS,
+  PLAYWRIGHT_DISABLE_FEATURES,
   _clearSessionRestore: clearSessionRestore,
   _openFirstWindow: openFirstWindow,
   _cdpCall: cdpCall,

@@ -124,6 +124,20 @@ test("T-port: DevToolsActivePort appears, matches /json/version, and the launch 
   }
 });
 
+test("T-codesign: the running Brave has ONE --disable-features, holding MacAppCodeSignClone and all of Playwright's defaults", ISO, async () => {
+  const { dir, h } = await launch("tcodesign-");
+  try {
+    const df = cmdline(mainBravePid(dir)).match(/--disable-features=\S+/g) || [];
+    assert.strictEqual(df.length, 1, `got ${df.length}: ${df.join(" | ")}`);
+    const got = df[0].slice("--disable-features=".length).split(",");
+    const pw = require("../src/cdp-bridge.js").PLAYWRIGHT_DISABLE_FEATURES;
+    assert.ok(pw, "Playwright's default list was read");
+    for (const f of [...pw.slice("--disable-features=".length).split(","), "MacAppCodeSignClone"]) assert.ok(got.includes(f), `${f} missing from ${df[0]}`);
+  } finally {
+    await closeBrave(h);
+  }
+});
+
 test("the profile flock is not inherited by a real launched Brave", ISO, async () => {
   const dir = homeTmp("flock-inherit-");
   const claim = lock.claimDir(dir);

@@ -292,6 +292,19 @@ upstream-restart fix (the upstream half of the same race is closed by `relayShut
 
 **When picked up:** have `ensureBrave()` refuse to launch once `relayShuttingDown` is set, with a test.
 
+### `code_sign_clone` copies: launch fix on a branch, existing copies and other launchers (2026-11-19)
+
+Branch `fix/no-codesign-clone` disables Chromium's `MacAppCodeSignClone` for every relay Brave by merging it into
+Playwright's one `--disable-features` list (REFERENCE *Launch arguments*). Not covered by it:
+
+- **The copies already on disk** (65, 37 GB at 2026-11-19, plus one made by the fix's own control measurement) — cleanup
+  is done separately, by hand; the relay deletes none.
+- **The merge reads a Playwright internal** (`lib/server/chromium/chromiumSwitches.js`, outside its package exports). A
+  Playwright upgrade that moves it turns the swap off with a stderr line; `test/codesign-clone.test.js` fails first.
+- **Other launchers** start Playwright's bundled Chromium, not Brave, and are left as they were:
+  `scripts/capture-screenshots.js` (`chromium.launch`, headless) and upstream BDMCP's standalone launch path, which the
+  relay never takes (it always sets `BROWSER_CDP_ENDPOINT_URL`).
+
 ---
 
 ## Tooling / DX

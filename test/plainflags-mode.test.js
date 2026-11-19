@@ -73,8 +73,12 @@ test("default mode: launchBrave's options are IDENTICAL to main's (args, ignoreD
     await assert.rejects(cur.mod.launchBrave({ userDataDir: dirB, ...c }), /STUB-NO-LAUNCH/); // no profileMode = default
     const a = main.captured.pop();
     const b = cur.captured.pop();
+    // The macOS MacAppCodeSignClone swap (test/codesign-clone.test.js) is the one
+    // intended difference: both --disable-features entries are set aside here.
+    const noSwap = (o) => ({ ...o, args: o.args.filter((x) => !x.startsWith("--disable-features=")), ignoreDefaultArgs: o.ignoreDefaultArgs.filter((x) => !x.startsWith("--disable-features=")) });
+    const [na, nb] = [noSwap(a), noSwap(b)];
     for (const k of ["args", "ignoreDefaultArgs", "ignoreHTTPSErrors", "headless", "handleSIGINT", "handleSIGTERM"]) {
-      assert.deepStrictEqual(b[k], a[k], `${JSON.stringify(c)} ${k}`);
+      assert.deepStrictEqual(nb[k], na[k], `${JSON.stringify(c)} ${k}`);
     }
     assert.ok(!fs.existsSync(path.join(dirB, "Default", "Preferences")), "the default mode writes no Preferences");
   }
@@ -92,15 +96,18 @@ test("default mode: own tools/list is IDENTICAL to main's (challenge_click / cf_
   assert.deepStrictEqual(plainflagsTools.map((x) => x.name), ["challenge_click", "cf_cookies_clear"]);
 });
 
-test("default mode: buildLaunchArgs adds nothing; plain-flags appends exactly the D23 flag set, port 0 kept", () => {
+test("default mode: buildLaunchArgs adds only the macOS MacAppCodeSignClone swap; plain-flags appends exactly the D23 flag set, port 0 kept", () => {
+  // PWDF: Playwright's own --disable-features, swapped on macOS for MERGED (+ MacAppCodeSignClone).
+  const PWDF = bridge.PLAYWRIGHT_DISABLE_FEATURES;
+  const MERGED = `${PWDF},MacAppCodeSignClone`;
   const d = bridge.buildLaunchArgs({ headless: false, platform: "darwin" });
-  assert.deepStrictEqual(d.args, ["--remote-debugging-port=0", "--no-startup-window"]);
-  assert.deepStrictEqual(d.ignoreDefaultArgs, ["--use-mock-keychain", "about:blank"]);
+  assert.deepStrictEqual(d.args, ["--remote-debugging-port=0", MERGED, "--no-startup-window"]);
+  assert.deepStrictEqual(d.ignoreDefaultArgs, ["--use-mock-keychain", PWDF, "about:blank"]);
   const p = bridge.buildLaunchArgs({ headless: false, platform: "darwin", mode: "plainflags" });
-  assert.deepStrictEqual(p.args, ["--remote-debugging-port=0", "--no-startup-window", "--disable-blink-features=AutomationControlled", "--no-proxy-server"]);
-  assert.deepStrictEqual(p.ignoreDefaultArgs, ["--use-mock-keychain", "about:blank", "--enable-automation"]);
-  const t1 = bridge.buildLaunchArgs({ headless: true, testLaunch: true, mode: "plainflags" });
-  assert.deepStrictEqual(t1.ignoreDefaultArgs, ["--enable-automation"], "the test hook keeps the mock keychain; the flag still goes");
+  assert.deepStrictEqual(p.args, ["--remote-debugging-port=0", MERGED, "--no-startup-window", "--disable-blink-features=AutomationControlled", "--no-proxy-server"]);
+  assert.deepStrictEqual(p.ignoreDefaultArgs, ["--use-mock-keychain", PWDF, "about:blank", "--enable-automation"]);
+  const t1 = bridge.buildLaunchArgs({ headless: true, testLaunch: true, mode: "plainflags", platform: "darwin" });
+  assert.deepStrictEqual(t1.ignoreDefaultArgs, [PWDF, "--enable-automation"], "the test hook keeps the mock keychain; the flag still goes");
   assert.ok(t1.args.includes("--remote-debugging-port=0"));
 });
 
